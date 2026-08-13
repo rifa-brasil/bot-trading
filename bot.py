@@ -143,12 +143,27 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     await start_web_server()
+    
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(boton_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensajes_texto))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
     print("🤖 Bot activo...")
-    await app.run_polling()
+
+    stop_signal = asyncio.Event()
+    try:
+        await stop_signal.wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot detenido correctamente.")
