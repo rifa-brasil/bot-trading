@@ -32,9 +32,11 @@ COMISION_RETIRO = 0.01
 
 def obtener_data():
     if not os.path.exists(DB_FILE):
-        return {"usuarios": {}, "estados_registro": {}, "estados_retiro": {}}
-    with open(DB_FILE, "r") as f:
-        return json.load(f)
+        return {"usuarios": {}, "estados_registro": {}, "estados_retiro": {}, "estados_admin_retiro": {}}
+    data = json.load(open(DB_FILE, "r"))
+    if "estados_admin_retiro" not in data:
+        data["estados_admin_retiro"] = {}
+    return data
 
 def guardar_data(data):
     with open(DB_FILE, "w") as f:
@@ -63,13 +65,43 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
+    if not update.message: return
     user_id = str(update.effective_user.id)
     data = obtener_data()
-    texto = update.message.text.strip()
+    texto = update.message.text.strip() if update.message.text else ""
     is_reg = user_id in data["usuarios"]
 
-    # 1. GESTIÓN DE REGISTRO
+    # 1. GESTIÓN DE ENVÍO DE COMPROBANTE DE RETIRO POR PARTE DEL ADMIN
+    if user_id == str(ADMIN_TELEGRAM_ID) and user_id in data.get("estados_admin_retiro", {}):
+        target_id = data["estados_admin_retiro"][user_id]
+        
+        # Verificamos si el admin mandó una foto con el comprobante
+        if update.message.photo:
+            photo_file_id = update.message.photo[-1].file_id
+            
+            # Limpiamos el estado
+            del data["estados_admin_retiro"][user_id]
+            guardar_data(data)
+            
+            # Notificamos al admin
+            await update.message.reply_text("✅ Comprobante enviado con éxito al usuario.")
+            
+            # Enviamos la foto y notificación al usuario afectado al privado
+            try:
+                await context.bot.send_photo(
+                    chat_id=int(target_id),
+                    photo=photo_file_id,
+                    caption="🎉 ¡Tu solicitud de retiro ha sido procesada con éxito! Adjuntamos el comprobante de la transferencia.",
+                    reply_markup=obtener_menu(True)
+                )
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ No se pudo enviar la foto al usuario: {e}")
+            return
+        else:
+            await update.message.reply_text("⚠️ Por favor, adjunta la **imagen/captura** del comprobante de pago.")
+            return
+
+    # 2. GESTIÓN DE REGISTRO
     if user_id in data.get("estados_registro", {}):
         paso = data["estados_registro"][user_id]["paso"]
         if paso == 1:
@@ -92,7 +124,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 
                 await update.message.reply_text(f"✅ Registro recibido. Envía el comprobante a {ADMIN_USERNAME}.\n\nWallet: `{WALLET_EMPRESA}`", parse_mode="Markdown", reply_markup=obtener_menu(True))
                 
-                # Notificar al Admin
                 keyboard = [[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"rej_{user_id}")]]
                 await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}\n💵 {deposito} USDT", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             except: 
@@ -100,7 +131,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         guardar_data(data)
         return
 
-    # 2. GESTIÓN DE RETIRO
+    # 3. GESTIÓN DE RETIRO
     if user_id in data.get("estados_retiro", {}):
         user_info = data["usuarios"][user_id]
         wallet = texto
@@ -112,6 +143,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         
         await update.message.reply_text("✅ Solicitud de retiro procesada y enviada al administrador.", reply_markup=obtener_menu(is_reg))
         
+        keyboard_admin = [[InlineKeyboardButton("📤 Retiro Enviado (Adjuntar Comprobante)", callback_data=f"ret_{user_id}")]]
         msg_admin = (
             f"🚨 *NUEVA SOLICITUD DE RETIRO*\n\n"
             f"👤 Usuario: {user_info['nombre']}\n"
@@ -119,10 +151,9 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             f"💰 Monto a retirar: {monto_retiro:.2f} USDT\n"
             f"🔗 Wallet: `{wallet}`"
         )
-        await context.bot.send_message(ADMIN_TELEGRAM_ID, msg_admin, parse_mode="Markdown")
+        await context.bot.send_message(ADMIN_TELEGRAM_ID, msg_admin, reply_markup=InlineKeyboardMarkup(keyboard_admin), parse_mode="Markdown")
         return
 
-    # Si no está en ningún proceso, devuelve el menú
     await update.message.reply_text("Usa los botones para navegar:", reply_markup=obtener_menu(is_reg))
 
 async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,7 +164,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = obtener_data()
     is_reg = user_id in data["usuarios"]
 
-    # Acción Admin
+    # Acción Admin: Activar cuenta de registro
     if data_cb.startswith("act_") or data_cb.startswith("rej_"):
         target_id = data_cb.split("_")[1]
         if data_cb.startswith("act_"):
@@ -144,6 +175,19 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del data["usuarios"][target_id]
             await query.edit_message_text(f"❌ Usuario {target_id} rechazado.")
         guardar_data(data)
+        return
+
+    # Acción Admin: Iniciar proceso de envío de comprobante de retiro
+    if data_cb.startswith("ret_"):
+        if user_id != str(ADMIN_TELEGRAM_ID): return
+        target_id = data_cb.split("_")[1]
+        
+        if "estados_admin_retiro" not in data:
+            data["estados_admin_retiro"] = {}
+        data["estados_admin_retiro"][user_id] = target_id
+        guardar_data(data)
+        
+        await query.message.reply_text("📸 Por favor, **envía ahora la captura de pantalla o foto del comprobante** de pago para este usuario:")
         return
 
     # Acciones Usuario
@@ -205,7 +249,7 @@ async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(boton_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensajes_texto))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, manejar_mensajes_texto))
 
     await app.initialize()
     await app.start()
