@@ -77,12 +77,19 @@ async def tarea_ganancias_diarias():
         guardar_data(data)
         print("📈 Ganancias diarias calculadas y sumadas a los inversores activos.")
 
-def menu_principal_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Mi Saldo y Estadísticas", callback_data="ver_saldo")],
-        [InlineKeyboardButton("📤 Solicitar Retiro", callback_data="pedir_retiro")],
-        [InlineKeyboardButton("ℹ️ Información / Reglas", callback_data="ver_info")]
-    ])
+# Menú dinámico según si está registrado o no
+def obtener_menu(registrado: bool):
+    if not registrado:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Registrarse", callback_data="iniciar_registro")],
+            [InlineKeyboardButton("ℹ️ Información / Reglas", callback_data="ver_info")]
+        ])
+    else:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Mi Saldo y Estadísticas", callback_data="ver_saldo")],
+            [InlineKeyboardButton("📤 Solicitar Retiro", callback_data="pedir_retiro")],
+            [InlineKeyboardButton("ℹ️ Información / Reglas", callback_data="ver_info")]
+        ])
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -93,14 +100,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         estado_txt = "✅ Cuenta Activa" if usuarios[user_id].get("activo") else "⏳ Cuenta Pendiente de Aprobación por el Administrador"
         await update.message.reply_text(
             f"👋 ¡Bienvenido de nuevo a tu panel de inversión!\nEstado: {estado_txt}",
-            reply_markup=menu_principal_markup()
+            reply_markup=obtener_menu(True)
         )
     else:
-        data["estados_registro"][user_id] = {"paso": 1}
-        guardar_data(data)
         await update.message.reply_text(
             "👋 *¡Bienvenido a la plataforma de inversión!* 🚀\n\n"
-            "Para comenzar tu registro, por favor escribe tu *Nombre completo*:",
+            "Para comenzar, haz clic en el botón de registro de abajo:",
+            reply_markup=obtener_menu(False),
             parse_mode="Markdown"
         )
 
@@ -162,7 +168,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 del data["estados_registro"][user_id]
                 guardar_data(data)
 
-                # Mensaje para el usuario incluyendo tu username @yordanisr
                 mensaje_final = (
                     f"✅ *¡Registro y depósito registrado en el sistema!* 🎉\n\n"
                     f"• Inversión declarada: *{deposito} USDT*\n\n"
@@ -170,9 +175,8 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                     f"`{WALLET_EMPRESA}`\n\n"
                     f"⚠️ *Importante:* Tu cuenta se encuentra en revisión. Por favor, **envía el comprobante de pago al privado del administrador {ADMIN_USERNAME}** para que verifique y active tu cuenta manualmente."
                 )
-                await update.message.reply_text(mensaje_final, reply_markup=menu_principal_markup(), parse_mode="Markdown")
+                await update.message.reply_text(mensaje_final, reply_markup=obtener_menu(True), parse_mode="Markdown")
                 
-                # Envía mensaje directo al administrador notificando el registro pendiente
                 if ADMIN_TELEGRAM_ID:
                     try:
                         await context.bot.send_message(
@@ -205,7 +209,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(
             f"✅ *Dirección de Wallet guardada:* `{wallet}`\n\n"
             "📤 Tu solicitud de retiro ha sido enviada al administrador. Recuerda que los retiros son manuales.",
-            reply_markup=menu_principal_markup(),
+            reply_markup=obtener_menu(True),
             parse_mode="Markdown"
         )
         
@@ -226,9 +230,10 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 print(f"Error al notificar retiro al admin: {e}")
         return
 
+    is_reg = user_id in usuarios
     await update.message.reply_text(
         "Usa los botones del menú para interactuar con tu cuenta:",
-        reply_markup=menu_principal_markup()
+        reply_markup=obtener_menu(is_reg)
     )
 
 async def activar_usuario_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,7 +257,7 @@ async def activar_usuario_command(update: Update, context: ContextTypes.DEFAULT_
             await context.bot.send_message(
                 chat_id=int(target_id),
                 text="🎉 ¡Excelentes noticias! El administrador ha verificado tu depósito y tu cuenta ya se encuentra **ACTIVA** generando rendimientos diarios.",
-                reply_markup=menu_principal_markup(),
+                reply_markup=obtener_menu(True),
                 parse_mode="Markdown"
             )
         except Exception as e:
@@ -268,9 +273,25 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = obtener_data()
     usuarios = data.get("usuarios", {})
 
-    if user_id not in usuarios and data_cb != "ver_info":
-        await query.message.reply_text("⚠️ Debes completar tu registro primero escribiendo /start", reply_markup=menu_principal_markup())
+    if data_cb == "iniciar_registro":
+        if user_id in usuarios:
+            await query.message.reply_text("⚠️ Ya te encuentras registrado en el sistema.", reply_markup=obtener_menu(True))
+            return
+        if "estados_registro" not in data:
+            data["estados_registro"] = {}
+        data["estados_registro"][user_id] = {"paso": 1}
+        guardar_data(data)
+        await query.message.reply_text(
+            "📝 *INICIO DE REGISTRO*\n\nPor favor, escribe tu *Nombre completo*:",
+            parse_mode="Markdown"
+        )
         return
+
+    if user_id not in usuarios and data_cb != "ver_info":
+        await query.message.reply_text("⚠️ Debes registrarte primero haciendo clic en el botón de abajo:", reply_markup=obtener_menu(False))
+        return
+
+    is_reg = user_id in usuarios
 
     if data_cb == "ver_saldo":
         info = usuarios[user_id]
@@ -286,19 +307,19 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📈 Ganancias Acumuladas: *${ganancias:.2f} USDT* (Calculadas al {PORCENTAJE_DIARIO}% diario)\n"
             f"💎 *Saldo Total Disponible:* *${total:.2f} USDT*\n"
         )
-        await query.message.reply_text(texto_saldo, reply_markup=menu_principal_markup(), parse_mode="Markdown")
+        await query.message.reply_text(texto_saldo, reply_markup=obtener_menu(is_reg), parse_mode="Markdown")
 
     elif data_cb == "pedir_retiro":
         info = usuarios[user_id]
         if not info.get("activo"):
-            await query.message.reply_text("⚠️ Tu cuenta aún está pendiente de activación por el administrador. No puedes retirar todavía.", reply_markup=menu_principal_markup())
+            await query.message.reply_text("⚠️ Tu cuenta aún está pendiente de activación por el administrador. No puedes retirar todavía.", reply_markup=obtener_menu(is_reg))
             return
 
         ganancias = info.get("ganancias_acumuladas", 0)
         if ganancias < MIN_RETIRO:
             await query.message.reply_text(
                 f"⚠️ El monto mínimo para solicitar un retiro es de *{MIN_RETIRO} USDT*. Tienes acumulado: *${ganancias:.2f} USDT*.",
-                reply_markup=menu_principal_markup(),
+                reply_markup=obtener_menu(is_reg),
                 parse_mode="Markdown"
             )
             return
@@ -313,7 +334,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Tienes disponible: *${ganancias:.2f} USDT*\n"
             f"• Comisión por retiro: *{int(COMISION_RETIRO*100)}%*\n\n"
             "Por favor, responde a este mensaje escribiendo la *dirección de tu wallet* TRC20 donde deseas recibir el pago:",
-            reply_markup=menu_principal_markup(),
+            reply_markup=obtener_menu(is_reg),
             parse_mode="Markdown"
         )
 
@@ -327,7 +348,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• *Comisión:* Todos los retiros tienen una comisión del *{int(COMISION_RETIRO*100)}%*.\n"
             "• *Procesamiento:* Los retiros y activaciones de cuentas se realizan de forma manual, por lo que pedimos a los inversores *paciencia*."
         )
-        await query.message.reply_text(texto_info, reply_markup=menu_principal_markup(), parse_mode="Markdown")
+        await query.message.reply_text(texto_info, reply_markup=obtener_menu(is_reg), parse_mode="Markdown")
 
 async def main():
     inicializar_bd()
