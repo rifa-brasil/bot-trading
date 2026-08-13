@@ -24,6 +24,7 @@ async def start_web_server():
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "0"))
 WALLET_EMPRESA = "TXXsV2612pJjoz6KrpfsPUqwGQryjGpRbE" 
+ADMIN_USERNAME = "@yordanisr"
 
 DB_FILE = "inversion_db.json"
 PORCENTAJE_DIARIO = 0.50
@@ -161,15 +162,17 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 del data["estados_registro"][user_id]
                 guardar_data(data)
 
+                # Mensaje para el usuario incluyendo tu username @yordanisr
                 mensaje_final = (
                     f"✅ *¡Registro y depósito registrado en el sistema!* 🎉\n\n"
                     f"• Inversión declarada: *{deposito} USDT*\n\n"
                     f"Para activar tu cuenta, realiza la transferencia a nuestra billetera oficial TRC20:\n\n"
                     f"`{WALLET_EMPRESA}`\n\n"
-                    f"⚠️ *Importante:* Tu cuenta se encuentra en revisión. Por favor, **envía el comprobante de pago por mensaje privado al administrador** para que verifique y active tu cuenta manualmente."
+                    f"⚠️ *Importante:* Tu cuenta se encuentra en revisión. Por favor, **envía el comprobante de pago al privado del administrador {ADMIN_USERNAME}** para que verifique y active tu cuenta manualmente."
                 )
                 await update.message.reply_text(mensaje_final, reply_markup=menu_principal_markup(), parse_mode="Markdown")
                 
+                # Envía mensaje directo al administrador notificando el registro pendiente
                 if ADMIN_TELEGRAM_ID:
                     try:
                         await context.bot.send_message(
@@ -180,7 +183,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                                  f"📧 Email: {email}\n"
                                  f"📱 Teléfono: {telefono}\n"
                                  f"💵 Monto: ${deposito:.2f} USDT\n\n"
-                                 f"👉 El usuario debe enviarte el comprobante al privado. Para activar su cuenta manualmente, usa el comando:\n"
+                                 f"👉 El usuario te enviará el comprobante al privado. Para activar su cuenta manualmente, usa el comando:\n"
                                  f"`/activar {user_id}`",
                             parse_mode="Markdown"
                         )
@@ -269,7 +272,6 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ Debes completar tu registro primero escribiendo /start", reply_markup=menu_principal_markup())
         return
 
-    # ENVÍA COMO NUEVO MENSAJE Y MANTIENE LOS BOTONES DEBAJO
     if data_cb == "ver_saldo":
         info = usuarios[user_id]
         deposito = info.get("deposito", 0)
