@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+from datetime import datetime
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -69,6 +70,20 @@ def obtener_teclado_paquetes():
         keyboard.append(fila)
     return InlineKeyboardMarkup(keyboard)
 
+# Función para verificar si una fecha (string YYYY-MM-DD) pertenece a la semana en curso (lunes a domingo)
+def es_misma_semana(fecha_str):
+    if not fecha_str:
+        return False
+    try:
+        fecha_retiro = datetime.strptime(fecha_str, "%Y-%m-%d").date()
+        hoy = datetime.now().date()
+        # Obtenemos el lunes de la semana actual y de la fecha del retiro
+        lunes_hoy = hoy - timedelta(days=hoy.weekday())
+        lunes_retiro = fecha_retiro - timedelta(days=fecha_retiro.weekday())
+        return lunes_hoy == lunes_retiro
+    except:
+        return False
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = obtener_data()
@@ -93,9 +108,14 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         if update.message.photo:
             photo_file_id = update.message.photo[-1].file_id
             del data["estados_admin_retiro"][user_id]
+            
+            # Registramos la fecha actual (YYYY-MM-DD) como último retiro confirmado de esta semana
+            if target_id in data["usuarios"]:
+                data["usuarios"][target_id]["ultimo_retiro_fecha"] = datetime.now().strftime("%Y-%m-%d")
+            
             guardar_data(data)
             
-            await update.message.reply_text("✅ Comprobante enviado con éxito al usuario.")
+            await update.message.reply_text("✅ Comprobante enviado con éxito al usuario y registrado el retiro de la semana.")
             
             try:
                 await context.bot.send_photo(
@@ -133,7 +153,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         elif paso == 3:
             estado_reg["telefono"] = texto
             guardar_data(data)
-            # El paso 4 ya no se pide por texto, ahora se eligen mediante botones de paquetes
             await update.message.reply_text(
                 "💎 Selecciona el paquete de inversión que deseas adquirir utilizando los botones de abajo:",
                 reply_markup=obtener_teclado_paquetes()
@@ -228,7 +247,8 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "telefono": reg["telefono"],
                 "deposito": monto_paquete,
                 "ganancias_acumuladas": 0.0,
-                "total_generado": 0.0,  # Para llevar la cuenta del 200%
+                "total_generado": 0.0,
+                "ultimo_retiro_fecha": "",
                 "activo": False
             }
             del data["estados_registro"][user_id]
@@ -274,7 +294,6 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_generado = u.get("total_generado", 0)
             meta_200 = deposito * 2.0
             
-            # Cálculo del porcentaje completado hacia el 200%
             porcentaje_progreso = (total_generado / meta_200) * 100 if meta_200 > 0 else 0
             if porcentaje_progreso > 200: porcentaje_progreso = 200.0
 
@@ -297,7 +316,21 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data_cb == "pedir_retiro":
         if is_reg and data["usuarios"][user_id].get("activo"):
-            ganancias_disp = data["usuarios"][user_id].get("ganancias_acumuladas", 0)
+            u_info = data["usuarios"][user_id]
+            
+            # 1. Validar si hoy es Viernes (weekday 4 en Python: Lunes=0 ... Viernes=4)
+            dia_actual = datetime.now().weekday()
+            if dia_actual != 4:
+                await query.message.reply_text("⚠️ Los retiros solo se pueden solicitar y procesar exclusivamente los días **viernes**. Por favor, regresa el próximo viernes.", reply_markup=obtener_menu(is_reg))
+                return
+
+            # 2. Validar si ya hizo un retiro confirmado esta semana
+            ultimo_retiro = u_info.get("ultimo_retiro_fecha", "")
+            if es_misma_semana(ultimo_retiro):
+                await query.message.reply_text("⚠️ Ya realizaste el retiro correspondiente a esta semana. Debes esperar hasta el **próximo viernes** para una nueva solicitud.", reply_markup=obtener_menu(is_reg))
+                return
+
+            ganancias_disp = u_info.get("ganancias_acumuladas", 0)
             if ganancias_disp < MIN_RETIRO:
                 await query.message.reply_text(f"⚠️ No cumples con el mínimo de retiro. Tienes {ganancias_disp:.2f} USDT disponibles (Mínimo requerido: {MIN_RETIRO} USDT).", reply_markup=obtener_menu(is_reg))
                 return
@@ -318,7 +351,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• *Límite del Paquete:* Cada paquete de inversión tiene validez hasta alcanzar el *200% de retorno* sobre la inversión inicial.\n\n"
             "🗓 *CRONOGRAMA DE OPERACIONES:*\n"
             "• *Activación:* Las cuentas se activan manualmente tras verificar el comprobante de pago enviado al administrador.\n"
-            "• *Retiros:* Se procesan exclusivamente los días **viernes** de cada semana.\n"
+            "• *Retiros:* Se procesan exclusivamente los días **viernes** de cada semana (1 retiro por semana por usuario).\n"
             f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n"
             f"• *Comisión de Retiro:* {int(COMISION_RETIRO * 100)}% por transacción.\n\n"
             "⚠️ *NOTAS IMPORTANTES:*\n"
@@ -342,13 +375,11 @@ async def tarea_ganancias_diarias():
                 meta_200 = deposito * 2.0
                 total_generado = info.get("total_generado", 0.0)
 
-                # Si ya alcanzó o superó el 200%, no genera más ganancias
                 if total_generado >= meta_200:
                     continue
 
                 ganancia_hoy = deposito * (PORCENTAJE_DIARIO / 100)
                 
-                # Evitar pasarse del límite exacto del 200%
                 if total_generado + ganancia_hoy > meta_200:
                     ganancia_hoy = meta_200 - total_generado
 
