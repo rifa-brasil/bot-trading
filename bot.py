@@ -67,8 +67,9 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
     user_id = str(update.effective_user.id)
     data = obtener_data()
     texto = update.message.text.strip()
+    is_reg = user_id in data["usuarios"]
 
-    # Registro
+    # 1. GESTIÓN DE REGISTRO
     if user_id in data.get("estados_registro", {}):
         paso = data["estados_registro"][user_id]["paso"]
         if paso == 1:
@@ -89,22 +90,40 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 del data["estados_registro"][user_id]
                 guardar_data(data)
                 
-                await update.message.reply_text(f"✅ Registro recibido. Envía el comprobante a {ADMIN_USERNAME}.\n\nWallet: `{WALLET_EMPRESA}`", parse_mode="Markdown")
+                await update.message.reply_text(f"✅ Registro recibido. Envía el comprobante a {ADMIN_USERNAME}.\n\nWallet: `{WALLET_EMPRESA}`", parse_mode="Markdown", reply_markup=obtener_menu(True))
                 
                 # Notificar al Admin
                 keyboard = [[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"rej_{user_id}")]]
                 await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}\n💵 {deposito} USDT", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-            except: await update.message.reply_text("⚠️ Monto no válido.")
+            except: 
+                await update.message.reply_text("⚠️ Monto no válido.")
         guardar_data(data)
         return
 
-    # Retiro
+    # 2. GESTIÓN DE RETIRO
     if user_id in data.get("estados_retiro", {}):
-        data["usuarios"][user_id]["wallet"] = texto
+        user_info = data["usuarios"][user_id]
+        wallet = texto
+        monto_retiro = user_info["ganancias_acumuladas"]
+        
+        data["usuarios"][user_id]["wallet"] = wallet
         del data["estados_retiro"][user_id]
         guardar_data(data)
-        await update.message.reply_text("✅ Solicitud de retiro enviada al admin.")
+        
+        await update.message.reply_text("✅ Solicitud de retiro procesada y enviada al administrador.", reply_markup=obtener_menu(is_reg))
+        
+        msg_admin = (
+            f"🚨 *NUEVA SOLICITUD DE RETIRO*\n\n"
+            f"👤 Usuario: {user_info['nombre']}\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"💰 Monto a retirar: {monto_retiro:.2f} USDT\n"
+            f"🔗 Wallet: `{wallet}`"
+        )
+        await context.bot.send_message(ADMIN_TELEGRAM_ID, msg_admin, parse_mode="Markdown")
         return
+
+    # Si no está en ningún proceso, devuelve el menú
+    await update.message.reply_text("Usa los botones para navegar:", reply_markup=obtener_menu(is_reg))
 
 async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -112,13 +131,14 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data_cb = query.data
     user_id = str(query.from_user.id)
     data = obtener_data()
+    is_reg = user_id in data["usuarios"]
 
     # Acción Admin
     if data_cb.startswith("act_") or data_cb.startswith("rej_"):
         target_id = data_cb.split("_")[1]
         if data_cb.startswith("act_"):
             data["usuarios"][target_id]["activo"] = True
-            await context.bot.send_message(int(target_id), "🎉 ¡Cuenta ACTIVADA!")
+            await context.bot.send_message(int(target_id), "🎉 ¡Cuenta ACTIVADA!", reply_markup=obtener_menu(True))
             await query.edit_message_text(f"✅ Usuario {target_id} activado.")
         else:
             del data["usuarios"][target_id]
@@ -133,7 +153,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("📝 Escribe tu nombre completo:")
     
     elif data_cb == "ver_saldo":
-        if user_id in data["usuarios"]:
+        if is_reg:
             u = data["usuarios"][user_id]
             deposito = u.get("deposito", 0)
             ganancias = u.get("ganancias_acumuladas", 0)
@@ -149,17 +169,35 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"💎 *TOTAL DISPONIBLE:* {total_disponible:.2f} USDT"
             )
-            await query.message.reply_text(mensaje_saldo, parse_mode="Markdown")
+            await query.message.reply_text(mensaje_saldo, parse_mode="Markdown", reply_markup=obtener_menu(True))
         else:
-            await query.message.reply_text("⚠️ No encontramos un registro activo para tu cuenta.")
+            await query.message.reply_text("⚠️ No encontramos un registro activo para tu cuenta.", reply_markup=obtener_menu(False))
 
     elif data_cb == "pedir_retiro":
-        data["estados_retiro"][user_id] = True
-        guardar_data(data)
-        await query.message.reply_text("Escribe tu wallet TRC20:")
-    
+        if is_reg and data["usuarios"][user_id].get("activo"):
+            data["estados_retiro"][user_id] = True
+            guardar_data(data)
+            await query.message.reply_text("📤 Por favor, escribe o pega la dirección de tu wallet TRC20 para el retiro:")
+        else:
+            await query.message.reply_text("⚠️ Tu cuenta debe estar activa para solicitar retiros.", reply_markup=obtener_menu(is_reg))
+
     elif data_cb == "ver_info":
-        await query.message.reply_text("Reglas: Rentabilidad 0.5% diario.")
+        texto_info = (
+            "ℹ️ *INFORMACIÓN Y REGLAS DE LA PLATAFORMA* ℹ️\n\n"
+            f"• *Rendimiento:* Generamos un {PORCENTAJE_DIARIO}% diario sobre tu capital depositado.\n"
+            f"• *Inversión Mínima:* {MIN_INVERSION} USDT (Red TRC20).\n\n"
+            "🗓 *CRONOGRAMA DE OPERACIONES:*\n"
+            "• *Activación:* Las cuentas se activan manualmente tras verificar el comprobante de pago enviado al administrador.\n"
+            "• *Retiros:* Se procesan exclusivamente los días **viernes** de cada semana.\n"
+            f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n"
+            f"• *Comisión de Retiro:* {int(COMISION_RETIRO * 100)}% por transacción.\n\n"
+            "⚠️ *NOTAS IMPORTANTES:*\n"
+            "1. Asegúrate de enviar el comprobante de depósito al privado del administrador para procesar tu activación.\n"
+            "2. Toda inversión conlleva riesgos; esta plataforma opera bajo un modelo de gestión manual.\n"
+            "3. Mantén siempre tu enlace con el bot actualizado para recibir notificaciones sobre tus retiros y estados de cuenta.\n\n"
+            f"¿Tienes dudas adicionales? Contacta a soporte a través de {ADMIN_USERNAME}"
+        )
+        await query.message.reply_text(texto_info, parse_mode="Markdown", reply_markup=obtener_menu(is_reg))
 
 async def main():
     await start_web_server()
