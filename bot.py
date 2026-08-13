@@ -39,10 +39,12 @@ PAQUETES_DISPONIBLES = [100, 120, 150, 180, 200, 250, 300, 350, 500, 1000, 1500,
 
 def obtener_data():
     if not os.path.exists(DB_FILE):
-        return {"usuarios": {}, "estados_registro": {}, "estados_retiro": {}, "estados_admin_retiro": {}}
+        return {"usuarios": {}, "estados_registro": {}, "estados_retiro": {}, "estados_admin_retiro": {}, "pendientes_referido": {}}
     data = json.load(open(DB_FILE, "r"))
     if "estados_admin_retiro" not in data:
         data["estados_admin_retiro"] = {}
+    if "pendientes_referido" not in data:
+        data["pendientes_referido"] = {}
     return data
 
 def guardar_data(data):
@@ -93,12 +95,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = obtener_data()
     
     # Capturar referido si viene en el comando (ej: /start 123456789)
-    if context.args and not user_id in data["usuarios"] and not user_id in data.get("estados_registro", {}):
+    if context.args and user_id not in data["usuarios"] and user_id not in data.get("estados_registro", {}):
         referidor_id = context.args[0]
         if referidor_id in data["usuarios"] and referidor_id != user_id:
-            if "pendientes_referido" not in data:
-                data["pendientes_referido"] = {}
-            data["pendientes_referido"] = referidor_id
+            data["pendientes_referido"][user_id] = referidor_id
             guardar_data(data)
 
     is_reg = user_id in data["usuarios"]
@@ -197,7 +197,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 estado_ret["fase"] = "wallet"
                 guardar_data(data)
 
-                # Indicar la comisión según el tipo de retiro
                 tipo_comision = f"{int(COMISION_RETIRO_GANANCIAS * 100)}%" if ganancias_disp > 0 else f"{int(COMISION_RETIRO_DEPOSITO * 100)}%"
                 await update.message.reply_text(f"📤 Notado. Se aplicará una comisión del **{tipo_comision}** a esta operación.\n\nAhora, escribe o pega la dirección de tu **wallet TRC20** donde deseas recibir el pago:", parse_mode="Markdown")
                 return
@@ -260,7 +259,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["usuarios"][target_id]["activo"] = True
             
             # Verificar si vino por referido y otorgar el 2% de comisión al referidor
-            if "pendientes_referido" in data and target_id in data["pendientes_referido"]:
+            if target_id in data.get("pendientes_referido", {}):
                 ref_id = data["pendientes_referido"][target_id]
                 if ref_id in data["usuarios"]:
                     monto_paq = data["usuarios"][target_id].get("deposito", 0)
@@ -280,7 +279,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(int(target_id), "🎉 ¡Cuenta ACTIVADA!", reply_markup=obtener_menu(True))
             await query.edit_message_text(f"✅ Usuario {target_id} activado.")
         else:
-            if "pendientes_referido" in data and target_id in data["pendientes_referido"]:
+            if target_id in data.get("pendientes_referido", {}):
                 del data["pendientes_referido"][target_id]
             del data["usuarios"][target_id]
             await query.edit_message_text(f"❌ Usuario {target_id} rechazado.")
@@ -303,10 +302,6 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "activo": False
             }
             
-            # Guardar relación de referido si existe
-            if "pendientes_referido" in data and user_id in data["pendientes_referido"]:
-                pass # Se procesa al activar
-
             del data["estados_registro"][user_id]
             guardar_data(data)
 
@@ -479,7 +474,8 @@ async def main():
 
     await app.initialize()
     await app.start()
-    app.updater.start_polling(drop_pending_updates=True)
+    # CORRECCIÓN: Agregado el 'await' faltante en start_polling
+    await app.updater.start_polling(drop_pending_updates=True)
     print("🤖 Bot activo...")
 
     stop_signal = asyncio.Event()
