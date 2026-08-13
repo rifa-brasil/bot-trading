@@ -26,9 +26,11 @@ ADMIN_USERNAME = "@yordanisr"
 
 DB_FILE = "inversion_db.json"
 PORCENTAJE_DIARIO = 0.50
-MIN_INVERSION = 100.0
 MIN_RETIRO = 50.0
 COMISION_RETIRO = 0.01
+
+# Paquetes de inversión disponibles
+PAQUETES_DISPONIBLES = [100, 120, 150, 180, 200, 250, 300, 350, 500, 1000, 1500, 2000]
 
 def obtener_data():
     if not os.path.exists(DB_FILE):
@@ -54,6 +56,19 @@ def obtener_menu(registrado: bool):
         [InlineKeyboardButton("ℹ️ Información / Reglas", callback_data="ver_info")]
     ])
 
+# Teclado inline con los paquetes de inversión
+def obtener_teclado_paquetes():
+    keyboard = []
+    fila = []
+    for i, monto in enumerate(PAQUETES_DISPONIBLES):
+        fila.append(InlineKeyboardButton(f"💎 {monto} USDT", callback_data=f"paq_{monto}"))
+        if len(fila) == 3:  # 3 botones por fila
+            keyboard.append(fila)
+            fila = []
+    if fila:
+        keyboard.append(fila)
+    return InlineKeyboardMarkup(keyboard)
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = obtener_data()
@@ -75,18 +90,13 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
     if user_id == str(ADMIN_TELEGRAM_ID) and user_id in data.get("estados_admin_retiro", {}):
         target_id = data["estados_admin_retiro"][user_id]
         
-        # Verificamos si el admin mandó una foto con el comprobante
         if update.message.photo:
             photo_file_id = update.message.photo[-1].file_id
-            
-            # Limpiamos el estado
             del data["estados_admin_retiro"][user_id]
             guardar_data(data)
             
-            # Notificamos al admin
             await update.message.reply_text("✅ Comprobante enviado con éxito al usuario.")
             
-            # Enviamos la foto y notificación al usuario afectado al privado
             try:
                 await context.bot.send_photo(
                     chat_id=int(target_id),
@@ -101,58 +111,88 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("⚠️ Por favor, adjunta la **imagen/captura** del comprobante de pago.")
             return
 
-    # 2. GESTIÓN DE REGISTRO
+    # 2. GESTIÓN DE REGISTRO (Paso 1, 2 y 3: Nombre, Email, Teléfono)
     if user_id in data.get("estados_registro", {}):
-        paso = data["estados_registro"][user_id]["paso"]
-        if paso == 1:
-            data["estados_registro"][user_id].update({"nombre": texto, "paso": 2})
-            await update.message.reply_text("📧 Ingresa tu correo electrónico:")
-        elif paso == 2:
-            data["estados_registro"][user_id].update({"email": texto, "paso": 3})
-            await update.message.reply_text("📱 Ingresa tu teléfono:")
-        elif paso == 3:
-            data["estados_registro"][user_id].update({"telefono": texto, "paso": 4})
-            await update.message.reply_text(f"💵 Monto a invertir (Mínimo {MIN_INVERSION}):")
-        elif paso == 4:
-            try:
-                deposito = float(texto)
-                if deposito < MIN_INVERSION: raise ValueError
-                reg = data["estados_registro"][user_id]
-                data["usuarios"][user_id] = {"nombre": reg["nombre"], "email": reg["email"], "telefono": reg["telefono"], "deposito": deposito, "ganancias_acumuladas": 0.0, "activo": False}
-                del data["estados_registro"][user_id]
-                guardar_data(data)
-                
-                await update.message.reply_text(f"✅ Registro recibido. Envía el comprobante a {ADMIN_USERNAME}.\n\nWallet: `{WALLET_EMPRESA}`", parse_mode="Markdown", reply_markup=obtener_menu(True))
-                
-                keyboard = [[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"rej_{user_id}")]]
-                await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}\n💵 {deposito} USDT", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-            except: 
-                await update.message.reply_text("⚠️ Monto no válido.")
-        guardar_data(data)
-        return
+        estado_reg = data["estados_registro"][user_id]
+        paso = estado_reg["paso"]
 
-    # 3. GESTIÓN DE RETIRO
+        if paso == 1:
+            estado_reg["nombre"] = texto
+            estado_reg["paso"] = 2
+            guardar_data(data)
+            await update.message.reply_text("📧 Ingresa tu correo electrónico:")
+            return
+
+        elif paso == 2:
+            estado_reg["email"] = texto
+            estado_reg["paso"] = 3
+            guardar_data(data)
+            await update.message.reply_text("📱 Ingresa tu teléfono:")
+            return
+
+        elif paso == 3:
+            estado_reg["telefono"] = texto
+            guardar_data(data)
+            # El paso 4 ya no se pide por texto, ahora se eligen mediante botones de paquetes
+            await update.message.reply_text(
+                "💎 Selecciona el paquete de inversión que deseas adquirir utilizando los botones de abajo:",
+                reply_markup=obtener_teclado_paquetes()
+            )
+            return
+
+    # 3. GESTIÓN DE RETIRO (Monto que desea retirar)
     if user_id in data.get("estados_retiro", {}):
-        user_info = data["usuarios"][user_id]
-        wallet = texto
-        monto_retiro = user_info["ganancias_acumuladas"]
-        
-        data["usuarios"][user_id]["wallet"] = wallet
-        del data["estados_retiro"][user_id]
-        guardar_data(data)
-        
-        await update.message.reply_text("✅ Solicitud de retiro procesada y enviada al administrador.", reply_markup=obtener_menu(is_reg))
-        
-        keyboard_admin = [[InlineKeyboardButton("📤 Retiro Enviado (Adjuntar Comprobante)", callback_data=f"ret_{user_id}")]]
-        msg_admin = (
-            f"🚨 *NUEVA SOLICITUD DE RETIRO*\n\n"
-            f"👤 Usuario: {user_info['nombre']}\n"
-            f"🆔 ID: `{user_id}`\n"
-            f"💰 Monto a retirar: {monto_retiro:.2f} USDT\n"
-            f"🔗 Wallet: `{wallet}`"
-        )
-        await context.bot.send_message(ADMIN_TELEGRAM_ID, msg_admin, reply_markup=InlineKeyboardMarkup(keyboard_admin), parse_mode="Markdown")
-        return
+        estado_ret = data["estados_retiro"][user_id]
+        fase = estado_ret["fase"]
+
+        if fase == "monto":
+            try:
+                monto_solicitado = float(texto)
+                user_info = data["usuarios"][user_id]
+                ganancias_disp = user_info.get("ganancias_acumuladas", 0)
+
+                if monto_solicitado < MIN_RETIRO:
+                    await update.message.reply_text(f"⚠️ El monto mínimo de retiro es de {MIN_RETIRO} USDT.")
+                    return
+                if monto_solicitado > ganancias_disp:
+                    await update.message.reply_text(f"⚠️ No tienes suficiente saldo disponible. Tus ganancias acumuladas son: {ganancias_disp:.2f} USDT.")
+                    return
+
+                estado_ret["monto"] = monto_solicitado
+                estado_ret["fase"] = "wallet"
+                guardar_data(data)
+
+                await update.message.reply_text("📤 Ahora, escribe o pega la dirección de tu **wallet TRC20** donde deseas recibir el pago:")
+                return
+
+            except ValueError:
+                await update.message.reply_text("⚠️ Por favor ingresa un monto numérico válido.")
+                return
+
+        elif fase == "wallet":
+            wallet = texto
+            monto_solicitado = estado_ret["monto"]
+            user_info = data["usuarios"][user_id]
+
+            # Descontamos el monto solicitado de las ganancias acumuladas del usuario
+            user_info["ganancias_acumuladas"] -= monto_solicitado
+            user_info["wallet"] = wallet
+            
+            del data["estados_retiro"][user_id]
+            guardar_data(data)
+
+            await update.message.reply_text(f"✅ Solicitud de retiro por {monto_solicitado:.2f} USDT procesada y enviada al administrador.", reply_markup=obtener_menu(is_reg))
+
+            keyboard_admin = [[InlineKeyboardButton("📤 Retiro Enviado (Adjuntar Comprobante)", callback_data=f"ret_{user_id}")]]
+            msg_admin = (
+                f"🚨 *NUEVA SOLICITUD DE RETIRO*\n\n"
+                f"👤 Usuario: {user_info['nombre']}\n"
+                f"🆔 ID: `{user_id}`\n"
+                f"💰 Monto solicitado: {monto_solicitado:.2f} USDT\n"
+                f"🔗 Wallet: `{wallet}`"
+            )
+            await context.bot.send_message(ADMIN_TELEGRAM_ID, msg_admin, reply_markup=InlineKeyboardMarkup(keyboard_admin), parse_mode="Markdown")
+            return
 
     await update.message.reply_text("Usa los botones para navegar:", reply_markup=obtener_menu(is_reg))
 
@@ -175,6 +215,36 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del data["usuarios"][target_id]
             await query.edit_message_text(f"❌ Usuario {target_id} rechazado.")
         guardar_data(data)
+        return
+
+    # Selección de Paquete de Inversión (Durante Registro)
+    if data_cb.startswith("paq_"):
+        monto_paquete = float(data_cb.split("_")[1])
+        if user_id in data.get("estados_registro", {}):
+            reg = data["estados_registro"][user_id]
+            data["usuarios"][user_id] = {
+                "nombre": reg["nombre"],
+                "email": reg["email"],
+                "telefono": reg["telefono"],
+                "deposito": monto_paquete,
+                "ganancias_acumuladas": 0.0,
+                "total_generado": 0.0,  # Para llevar la cuenta del 200%
+                "activo": False
+            }
+            del data["estados_registro"][user_id]
+            guardar_data(data)
+
+            await query.message.edit_text(
+                f"✅ *Paquete seleccionado:* {monto_paquete} USDT\n\n"
+                f"Para activar tu cuenta, realiza la transferencia a nuestra billetera oficial TRC20:\n\n"
+                f"`{WALLET_EMPRESA}`\n\n"
+                f"⚠️ Envía el comprobante de pago al administrador {ADMIN_USERNAME}.",
+                parse_mode="Markdown"
+            )
+            await query.message.reply_text("Panel principal:", reply_markup=obtener_menu(True))
+
+            keyboard = [[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"rej_{user_id}")]]
+            await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}\n💵 Paquete: {monto_paquete} USDT", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
     # Acción Admin: Iniciar proceso de envío de comprobante de retiro
@@ -201,17 +271,25 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u = data["usuarios"][user_id]
             deposito = u.get("deposito", 0)
             ganancias = u.get("ganancias_acumuladas", 0)
-            total_disponible = deposito + ganancias
+            total_generado = u.get("total_generado", 0)
+            meta_200 = deposito * 2.0
+            
+            # Cálculo del porcentaje completado hacia el 200%
+            porcentaje_progreso = (total_generado / meta_200) * 100 if meta_200 > 0 else 0
+            if porcentaje_progreso > 200: porcentaje_progreso = 200.0
+
             estado = "✅ Activa" if u.get("activo") else "⏳ Pendiente de aprobación"
             
             mensaje_saldo = (
                 f"📊 *ESTADO DE TU CUENTA*\n\n"
                 f"👤 *Usuario:* {u.get('nombre')}\n"
                 f"📌 *Estado:* {estado}\n\n"
-                f"💵 *Depósito Inicial:* {deposito:.2f} USDT\n"
-                f"📈 *Ganancias Acumuladas:* {ganancias:.2f} USDT\n"
+                f"💵 *Paquete Activo:* {deposito:.2f} USDT\n"
+                f"📈 *Ganancias Disponibles:* {ganancias:.2f} USDT\n"
+                f"🎯 *Progreso hacia el 200%:* {porcentaje_progreso:.1f}% "
+                f"({total_generado:.2f} / {meta_200:.2f} USDT)\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"💎 *TOTAL DISPONIBLE:* {total_disponible:.2f} USDT"
+                f"💎 *SALDO DISPONIBLE PARA RETIRO:* {ganancias:.2f} USDT"
             )
             await query.message.reply_text(mensaje_saldo, parse_mode="Markdown", reply_markup=obtener_menu(True))
         else:
@@ -219,9 +297,17 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data_cb == "pedir_retiro":
         if is_reg and data["usuarios"][user_id].get("activo"):
-            data["estados_retiro"][user_id] = True
+            ganancias_disp = data["usuarios"][user_id].get("ganancias_acumuladas", 0)
+            if ganancias_disp < MIN_RETIRO:
+                await query.message.reply_text(f"⚠️ No cumples con el mínimo de retiro. Tienes {ganancias_disp:.2f} USDT disponibles (Mínimo requerido: {MIN_RETIRO} USDT).", reply_markup=obtener_menu(is_reg))
+                return
+
+            if "estados_retiro" not in data:
+                data["estados_retiro"] = {}
+            data["estados_retiro"][user_id] = {"fase": "monto"}
             guardar_data(data)
-            await query.message.reply_text("📤 Por favor, escribe o pega la dirección de tu wallet TRC20 para el retiro:")
+            
+            await query.message.reply_text(f"📤 Tienes un saldo disponible de *{ganancias_disp:.2f} USDT*.\n\nPor favor, escribe la **cantidad exacta** que deseas retirar:", parse_mode="Markdown")
         else:
             await query.message.reply_text("⚠️ Tu cuenta debe estar activa para solicitar retiros.", reply_markup=obtener_menu(is_reg))
 
@@ -229,7 +315,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto_info = (
             "ℹ️ *INFORMACIÓN Y REGLAS DE LA PLATAFORMA* ℹ️\n\n"
             f"• *Rendimiento:* Generamos un {PORCENTAJE_DIARIO}% diario sobre tu capital depositado.\n"
-            f"• *Inversión Mínima:* {MIN_INVERSION} USDT (Red TRC20).\n\n"
+            f"• *Límite del Paquete:* Cada paquete de inversión tiene validez hasta alcanzar el *200% de retorno* sobre la inversión inicial.\n\n"
             "🗓 *CRONOGRAMA DE OPERACIONES:*\n"
             "• *Activación:* Las cuentas se activan manualmente tras verificar el comprobante de pago enviado al administrador.\n"
             "• *Retiros:* Se procesan exclusivamente los días **viernes** de cada semana.\n"
@@ -243,6 +329,35 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.message.reply_text(texto_info, parse_mode="Markdown", reply_markup=obtener_menu(is_reg))
 
+# Tarea en segundo plano para sumar ganancias diarias y controlar el límite del 200%
+async def tarea_ganancias_diarias():
+    while True:
+        await asyncio.sleep(86400) # Cada 24 horas
+        data = obtener_data()
+        usuarios = data.get("usuarios", {})
+        
+        for uid, info in usuarios.items():
+            if info.get("activo", False):
+                deposito = info.get("deposito", 0)
+                meta_200 = deposito * 2.0
+                total_generado = info.get("total_generado", 0.0)
+
+                # Si ya alcanzó o superó el 200%, no genera más ganancias
+                if total_generado >= meta_200:
+                    continue
+
+                ganancia_hoy = deposito * (PORCENTAJE_DIARIO / 100)
+                
+                # Evitar pasarse del límite exacto del 200%
+                if total_generado + ganancia_hoy > meta_200:
+                    ganancia_hoy = meta_200 - total_generado
+
+                info["ganancias_acumuladas"] = info.get("ganancias_acumuladas", 0) + ganancia_hoy
+                info["total_generado"] = total_generado + ganancia_hoy
+                
+        guardar_data(data)
+        print("📈 Ganancias diarias calculadas y progreso del 200% actualizado.")
+
 async def main():
     await start_web_server()
     
@@ -250,6 +365,8 @@ async def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(boton_callback))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, manejar_mensajes_texto))
+
+    asyncio.create_task(tarea_ganancias_diarias())
 
     await app.initialize()
     await app.start()
