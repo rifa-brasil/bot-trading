@@ -28,7 +28,6 @@ ADMIN_USERNAME = "@yordanisr"
 DB_FILE = "inversion_db.json"
 PORCENTAJE_DIARIO = 0.50
 MIN_RETIRO = 50.0
-COMISION_RETIRO = 0.02  # Actualizado al 2%
 
 # Paquetes de inversión disponibles
 PAQUETES_DISPONIBLES = [100, 120, 150, 180, 200, 250, 300, 350, 500, 1000, 1500, 2000]
@@ -165,7 +164,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-    # 3. GESTIÓN DE RETIRO (Monto y Wallet)
+    # 3. GESTIÓN DE RETIRO (Monto y Wallet) - NUEVAS REGLAS DE COMISIÓN Y DEPÓSITO
     if user_id in data.get("estados_retiro", {}):
         estado_ret = data["estados_retiro"][user_id]
         fase = estado_ret["fase"]
@@ -174,17 +173,33 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             try:
                 monto_solicitado = float(texto)
                 user_info = data["usuarios"][user_id]
+                
                 ganancias_disp = user_info.get("ganancias_acumuladas", 0)
+                deposito = user_info.get("deposito", 0)
+                total_generado = user_info.get("total_generado", 0)
+
+                # Verificar si puede retirar el depósito (solo si no ha comenzado a generar ganancias)
+                puede_retirar_deposito = (total_generado == 0)
+                saldo_total_disponible = ganancias_disp + (deposito if puede_retirar_deposito else 0)
 
                 if monto_solicitado < MIN_RETIRO:
                     await update.message.reply_text(f"⚠️ El monto mínimo de retiro es de {MIN_RETIRO} USDT.", reply_markup=obtener_menu_principal(is_reg))
                     return
-                if monto_solicitado > ganancias_disp:
-                    await update.message.reply_text(f"⚠️ No tienes suficiente saldo disponible. Tus ganancias acumuladas son: {ganancias_disp:.2f} USDT.", reply_markup=obtener_menu_principal(is_reg))
+                if monto_solicitado > saldo_total_disponible:
+                    await update.message.reply_text(f"⚠️ No tienes suficiente saldo disponible. Saldo disponible: {saldo_total_disponible:.2f} USDT.", reply_markup=obtener_menu_principal(is_reg))
                     return
 
-                # Cálculo de la comisión del 2%
-                comision = monto_solicitado * COMISION_RETIRO
+                # Definición de Porcentajes de Comisión:
+                # 1% para ganancias, 2% para depósito inicial
+                if monto_solicitado <= ganancias_disp:
+                    porcentaje_aplicado = 0.01
+                elif puede_retirar_deposito:
+                    porcentaje_aplicado = 0.02
+                else:
+                    await update.message.reply_text("⚠️ No puedes retirar tu depósito inicial después de haber generado ganancias.", reply_markup=obtener_menu_principal(is_reg))
+                    return
+
+                comision = monto_solicitado * porcentaje_aplicado
                 total_neto = monto_solicitado - comision
 
                 estado_ret["monto"] = monto_solicitado
@@ -196,7 +211,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text(
                     f"📊 *Resumen de Retiro:*\n"
                     f"• Monto solicitado: {monto_solicitado:.2f} USDT\n"
-                    f"• Comisión (2%): -{comision:.2f} USDT\n"
+                    f"• Comisión aplicada ({int(porcentaje_aplicado * 100)}%): -{comision:.2f} USDT\n"
                     f"• Total a recibir: *{total_neto:.2f} USDT*\n\n"
                     f"📤 Ahora, escribe o pega la dirección de tu **wallet TRC20** donde deseas recibir el pago:",
                     parse_mode="Markdown"
@@ -214,7 +229,13 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             total_neto = estado_ret["total_neto"]
             user_info = data["usuarios"][user_id]
 
-            user_info["ganancias_acumuladas"] -= monto_solicitado
+            # Descontar saldo según corresponda (ganancias o depósito)
+            if monto_solicitado <= user_info.get("ganancias_acumuladas", 0):
+                user_info["ganancias_acumuladas"] -= monto_solicitado
+            else:
+                user_info["deposito"] = 0
+                user_info["activo"] = False
+
             user_info["wallet"] = wallet
             
             del data["estados_retiro"][user_id]
@@ -223,7 +244,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(
                 f"✅ Solicitud de retiro procesada.\n"
                 f"• Retiro: {monto_solicitado:.2f} USDT\n"
-                f"• Descuento (2%): {comision:.2f} USDT\n"
+                f"• Descuento comisión: {comision:.2f} USDT\n"
                 f"• Neto: {total_neto:.2f} USDT\n"
                 f"Enviada al administrador.",
                 reply_markup=obtener_menu_principal(is_reg)
@@ -235,7 +256,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 f"👤 Usuario: {user_info['nombre']}\n"
                 f"🆔 ID: `{user_id}`\n"
                 f"💰 Solicitado: {monto_solicitado:.2f} USDT\n"
-                f"📉 Comisión (2%): {comision:.2f} USDT\n"
+                f"📉 Comisión: {comision:.2f} USDT\n"
                 f"💵 Neto a pagar: {total_neto:.2f} USDT\n"
                 f"🔗 Wallet: `{wallet}`"
             )
@@ -273,7 +294,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 f"🎯 *Progreso hacia el 200%:* {porcentaje_progreso:.1f}% "
                 f"({total_generado:.2f} / {meta_200:.2f} USDT)\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"💎 *SALDO DISPONIBLE PARA RETIRO:* {ganancias:.2f} USDT"
+                f"💎 *GANANCIAS DISPONIBLES:* {ganancias:.2f} USDT"
             )
             await update.message.reply_text(mensaje_saldo, parse_mode="Markdown", reply_markup=obtener_menu_principal(True))
         else:
@@ -283,21 +304,22 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         if is_reg and data["usuarios"][user_id].get("activo"):
             u_info = data["usuarios"][user_id]
             
-            # 1. Validar si hoy es Jueves (3) o Viernes (4), o permitir excepciones manuales/propias
             dia_actual = datetime.now().weekday()
             if dia_actual not in [3, 4]:  # 3 = Jueves, 4 = Viernes
                 await update.message.reply_text("⚠️ Los retiros solo están habilitados los días **jueves y viernes**. Por favor, regresa el día correspondiente.", reply_markup=obtener_menu_principal(is_reg))
                 return
 
-            # 2. Validar si ya hizo un retiro confirmado esta semana
             ultimo_retiro = u_info.get("ultimo_retiro_fecha", "")
             if es_misma_semana(ultimo_retiro):
                 await update.message.reply_text("⚠️ Ya realizaste el retiro correspondiente a esta semana. Debes esperar hasta la próxima semana para una nueva solicitud.", reply_markup=obtener_menu_principal(is_reg))
                 return
 
             ganancias_disp = u_info.get("ganancias_acumuladas", 0)
-            if ganancias_disp < MIN_RETIRO:
-                await update.message.reply_text(f"⚠️ No cumples con el mínimo de retiro. Tienes {ganancias_disp:.2f} USDT disponibles (Mínimo requerido: {MIN_RETIRO} USDT).", reply_markup=obtener_menu_principal(is_reg))
+            deposito_disp = u_info.get("deposito", 0) if u_info.get("total_generado", 0) == 0 else 0
+            saldo_total_disponible = ganancias_disp + deposito_disp
+
+            if saldo_total_disponible < MIN_RETIRO:
+                await update.message.reply_text(f"⚠️ No cumples con el mínimo de retiro. Saldo disponible: {saldo_total_disponible:.2f} USDT (Mínimo requerido: {MIN_RETIRO} USDT).", reply_markup=obtener_menu_principal(is_reg))
                 return
 
             if "estados_retiro" not in data:
@@ -305,7 +327,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             data["estados_retiro"][user_id] = {"fase": "monto"}
             guardar_data(data)
             
-            await update.message.reply_text(f"📤 Tienes un saldo disponible de *{ganancias_disp:.2f} USDT*.\n\nPor favor, escribe la **cantidad exacta** que deseas retirar (Se aplicará una comisión del 2%):", parse_mode="Markdown", reply_markup=obtener_menu_principal(is_reg))
+            await update.message.reply_text(f"📤 Tienes un saldo disponible de *{saldo_total_disponible:.2f} USDT*.\n\nPor favor, escribe la **cantidad exacta** que deseas retirar:", parse_mode="Markdown", reply_markup=obtener_menu_principal(is_reg))
         else:
             await update.message.reply_text("⚠️ Tu cuenta debe estar activa para solicitar retiros.", reply_markup=obtener_menu_principal(is_reg))
 
@@ -333,15 +355,15 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             "ℹ️ *INFORMACIÓN Y REGLAS DE LA PLATAFORMA* ℹ️\n\n"
             f"• *Rendimiento:* Generamos un {PORCENTAJE_DIARIO}% diario sobre tu capital depositado.\n"
             f"• *Límite del Paquete:* Cada paquete de inversión tiene validez hasta alcanzar el *200% de retorno* sobre la inversión inicial.\n\n"
-            "🗓 *CRONOGRAMA DE OPERACIONES:*\n"
-            "• *Activación:* Las cuentas se activan manualmente tras verificar el comprobante de pago enviado al administrador.\n"
-            "• *Retiros:* Se procesan exclusivamente los días **jueves y viernes** de cada semana (1 retiro por semana por usuario).\n"
-            f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n"
-            f"• *Comisión de Retiro:* {int(COMISION_RETIRO * 100)}% por transacción.\n\n"
+            "🗓 *CRONOGRAMA Y COMISIONES DE RETIRO:*\n"
+            "• *Días:* Jueves y viernes de cada semana (1 retiro por semana).\n"
+            "• *Comisión Ganancias:* 1% por retiro de saldo generado.\n"
+            "• *Comisión Depósito:* 2% por retiro de saldo depositado.\n"
+            "• *Retiro de Depósito:* Solo permitido antes de haber comenzado a generar ganancias (al retirarlo, se cancela la participación).\n"
+            f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n\n"
             "⚠️ *NOTAS IMPORTANTES:*\n"
             "1. Asegúrate de enviar el comprobante de depósito al privado del administrador para procesar tu activación.\n"
-            "2. Toda inversión conlleva riesgos; esta plataforma opera bajo un modelo de gestión manual.\n"
-            "3. Mantén siempre tu enlace con el bot actualizado para recibir notificaciones sobre tus retiros y estados de cuenta.\n\n"
+            "2. Toda inversión conlleva riesgos.\n\n"
             f"¿Tienes dudas adicionales? Contacta a soporte a través de {ADMIN_USERNAME}"
         )
         await update.message.reply_text(texto_info, parse_mode="Markdown", reply_markup=obtener_menu_principal(is_reg))
@@ -356,7 +378,6 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = obtener_data()
     is_reg = user_id in data["usuarios"]
 
-    # Acción Admin: Activar cuenta de registro o nuevo plan
     if data_cb.startswith("act_") or data_cb.startswith("rej_"):
         target_id = data_cb.split("_")[1]
         if data_cb.startswith("act_"):
@@ -364,17 +385,14 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(int(target_id), "🎉 ¡Cuenta / Plan ACTIVADO con éxito!", reply_markup=obtener_menu_principal(True))
             await query.edit_message_text(f"✅ Usuario/Plan {target_id} activado.")
         else:
-            # Si estaba pendiente un plan nuevo y se rechaza, podríamos revertir o simplemente notificar
             await context.bot.send_message(int(target_id), "❌ Tu solicitud de plan/registro ha sido rechazada.", reply_markup=obtener_menu_principal(target_id in data["usuarios"]))
             await query.edit_message_text(f"❌ Usuario {target_id} rechazado.")
         guardar_data(data)
         return
 
-    # Selección de Paquete de Inversión (Durante Registro o Compra de Nuevo Plan)
     if data_cb.startswith("paq_"):
         monto_paquete = float(data_cb.split("_")[1])
         
-        # Caso A: Viene del flujo de registro inicial
         if user_id in data.get("estados_registro", {}):
             reg = data["estados_registro"][user_id]
             data["usuarios"][user_id] = {
@@ -403,10 +421,8 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}\n💵 Paquete: {monto_paquete} USDT", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             return
 
-        # Caso B: Usuario ya registrado que desea comprar un nuevo plan
         elif is_reg:
             data["usuarios"][user_id]["deposito"] = monto_paquete
-            # Opcional: Podrías reiniciar ganancias o acumularlas según tus reglas de negocio; aquí actualizamos el paquete activo manteniendo el sistema
             guardar_data(data)
 
             await query.message.edit_text(
@@ -423,7 +439,6 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO PLAN ADQUIRIDO*\n👤 {u_nombre}\n💵 Nuevo Paquete: {monto_paquete} USDT", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             return
 
-    # Acción Admin: Iniciar proceso de envío de comprobante de retiro
     if data_cb.startswith("ret_"):
         if user_id != str(ADMIN_TELEGRAM_ID): return
         target_id = data_cb.split("_")[1]
@@ -436,7 +451,6 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("📸 Por favor, **envía ahora la captura de pantalla o foto del comprobante** de pago para este usuario:")
         return
 
-# Tarea en segundo plano para sumar ganancias diarias y controlar el límite del 200%
 async def tarea_ganancias_diarias():
     while True:
         await asyncio.sleep(86400) # Cada 24 horas
