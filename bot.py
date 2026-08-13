@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -77,7 +77,6 @@ def es_misma_semana(fecha_str):
     try:
         fecha_retiro = datetime.strptime(fecha_str, "%Y-%m-%d").date()
         hoy = datetime.now().date()
-        # Obtenemos el lunes de la semana actual y de la fecha del retiro
         lunes_hoy = hoy - timedelta(days=hoy.weekday())
         lunes_retiro = fecha_retiro - timedelta(days=fecha_retiro.weekday())
         return lunes_hoy == lunes_retiro
@@ -109,7 +108,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             photo_file_id = update.message.photo[-1].file_id
             del data["estados_admin_retiro"][user_id]
             
-            # Registramos la fecha actual (YYYY-MM-DD) como último retiro confirmado de esta semana
             if target_id in data["usuarios"]:
                 data["usuarios"][target_id]["ultimo_retiro_fecha"] = datetime.now().strftime("%Y-%m-%d")
             
@@ -193,7 +191,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             monto_solicitado = estado_ret["monto"]
             user_info = data["usuarios"][user_id]
 
-            # Descontamos el monto solicitado de las ganancias acumuladas del usuario
             user_info["ganancias_acumuladas"] -= monto_solicitado
             user_info["wallet"] = wallet
             
@@ -318,16 +315,16 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_reg and data["usuarios"][user_id].get("activo"):
             u_info = data["usuarios"][user_id]
             
-            # 1. Validar si hoy es Viernes (weekday 4 en Python: Lunes=0 ... Viernes=4)
+            # 1. Validar si hoy es Jueves (3) o Viernes (4) para la prueba actual
             dia_actual = datetime.now().weekday()
-            if dia_actual != 4:
-                await query.message.reply_text("⚠️ Los retiros solo se pueden solicitar y procesar exclusivamente los días **viernes**. Por favor, regresa el próximo viernes.", reply_markup=obtener_menu(is_reg))
+            if dia_actual not in [3, 4]:  # 3 = Jueves, 4 = Viernes
+                await query.message.reply_text("⚠️ Los retiros solo están habilitados los días **jueves y viernes**. Por favor, regresa el día correspondiente.", reply_markup=obtener_menu(is_reg))
                 return
 
             # 2. Validar si ya hizo un retiro confirmado esta semana
             ultimo_retiro = u_info.get("ultimo_retiro_fecha", "")
             if es_misma_semana(ultimo_retiro):
-                await query.message.reply_text("⚠️ Ya realizaste el retiro correspondiente a esta semana. Debes esperar hasta el **próximo viernes** para una nueva solicitud.", reply_markup=obtener_menu(is_reg))
+                await query.message.reply_text("⚠️ Ya realizaste el retiro correspondiente a esta semana. Debes esperar hasta la próxima semana para una nueva solicitud.", reply_markup=obtener_menu(is_reg))
                 return
 
             ganancias_disp = u_info.get("ganancias_acumuladas", 0)
@@ -351,7 +348,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• *Límite del Paquete:* Cada paquete de inversión tiene validez hasta alcanzar el *200% de retorno* sobre la inversión inicial.\n\n"
             "🗓 *CRONOGRAMA DE OPERACIONES:*\n"
             "• *Activación:* Las cuentas se activan manualmente tras verificar el comprobante de pago enviado al administrador.\n"
-            "• *Retiros:* Se procesan exclusivamente los días **viernes** de cada semana (1 retiro por semana por usuario).\n"
+            "• *Retiros:* Se procesan exclusivamente los días **jueves y viernes** de cada semana (1 retiro por semana por usuario).\n"
             f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n"
             f"• *Comisión de Retiro:* {int(COMISION_RETIRO * 100)}% por transacción.\n\n"
             "⚠️ *NOTAS IMPORTANTES:*\n"
