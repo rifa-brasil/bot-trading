@@ -28,7 +28,11 @@ ADMIN_USERNAME = "@yordanisr"
 DB_FILE = "inversion_db.json"
 PORCENTAJE_DIARIO = 0.50
 MIN_RETIRO = 50.0
-COMISION_RETIRO = 0.01
+
+# Comisiones solicitadas
+COMISION_RETIRO_GANANCIAS = 0.01  # 1% para retiros de ganancias
+COMISION_RETIRO_DEPOSITO = 0.02   # 2% para retiros de saldo/depósito inicial
+COMISION_REFERIDO = 0.02          # 2% de comisión por la inversión del referido
 
 # Paquetes de inversión disponibles
 PAQUETES_DISPONIBLES = [100, 120, 150, 180, 200, 250, 300, 350, 500, 1000, 1500, 2000]
@@ -54,6 +58,7 @@ def obtener_menu(registrado: bool):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 Mi Saldo y Estadísticas", callback_data="ver_saldo")],
         [InlineKeyboardButton("📤 Solicitar Retiro", callback_data="pedir_retiro")],
+        [InlineKeyboardButton("👥 Invitar Amigos", callback_data="ver_invitacion")],
         [InlineKeyboardButton("ℹ️ Información / Reglas", callback_data="ver_info")]
     ])
 
@@ -86,6 +91,16 @@ def es_misma_semana(fecha_str):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = obtener_data()
+    
+    # Capturar referido si viene en el comando (ej: /start 123456789)
+    if context.args and not user_id in data["usuarios"] and not user_id in data.get("estados_registro", {}):
+        referidor_id = context.args[0]
+        if referidor_id in data["usuarios"] and referidor_id != user_id:
+            if "pendientes_referido" not in data:
+                data["pendientes_referido"] = {}
+            data["pendientes_referido"] = referidor_id
+            guardar_data(data)
+
     is_reg = user_id in data["usuarios"]
     
     await update.message.reply_text(
@@ -173,7 +188,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                     await update.message.reply_text(f"⚠️ El monto mínimo de retiro de ganancias es de {MIN_RETIRO} USDT.")
                     return
                 
-                # Validar que no retire más de lo disponible (ganancias o depósito si no hay ganancias)
                 max_disponible = ganancias_disp if ganancias_disp > 0 else user_info.get("deposito", 0)
                 if monto_solicitado > max_disponible:
                     await update.message.reply_text(f"⚠️ No tienes suficiente saldo disponible. Tu saldo máximo disponible es: {max_disponible:.2f} USDT.")
@@ -183,7 +197,9 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 estado_ret["fase"] = "wallet"
                 guardar_data(data)
 
-                await update.message.reply_text("📤 Ahora, escribe o pega la dirección de tu **wallet TRC20** donde deseas recibir el pago:")
+                # Indicar la comisión según el tipo de retiro
+                tipo_comision = f"{int(COMISION_RETIRO_GANANCIAS * 100)}%" if ganancias_disp > 0 else f"{int(COMISION_RETIRO_DEPOSITO * 100)}%"
+                await update.message.reply_text(f"📤 Notado. Se aplicará una comisión del **{tipo_comision}** a esta operación.\n\nAhora, escribe o pega la dirección de tu **wallet TRC20** donde deseas recibir el pago:", parse_mode="Markdown")
                 return
 
             except ValueError:
@@ -195,8 +211,12 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             monto_solicitado = estado_ret["monto"]
             user_info = data["usuarios"][user_id]
 
+            tiene_ganancias = user_info.get("ganancias_acumuladas", 0) > 0
+            comision_aplicada = monto_solicitado * (COMISION_RETIRO_GANANCIAS if tiene_ganancias else COMISION_RETIRO_DEPOSITO)
+            monto_neto = monto_solicitado - comision_aplicada
+
             # Descontar de ganancias o de depósito según corresponda
-            if user_info.get("ganancias_acumuladas", 0) > 0:
+            if tiene_ganancias:
                 user_info["ganancias_acumuladas"] -= monto_solicitado
             else:
                 user_info["deposito"] -= monto_solicitado
@@ -208,14 +228,16 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             del data["estados_retiro"][user_id]
             guardar_data(data)
 
-            await update.message.reply_text(f"✅ Solicitud de retiro por {monto_solicitado:.2f} USDT procesada y enviada al administrador.", reply_markup=obtener_menu(is_reg))
+            await update.message.reply_text(f"✅ Solicitud de retiro por {monto_solicitado:.2f} USDT procesada (Neto a recibir: {monto_neto:.2f} USDT tras comisión). Enviada al administrador.", reply_markup=obtener_menu(is_reg))
 
             keyboard_admin = [[InlineKeyboardButton("📤 Retiro Enviado (Adjuntar Comprobante)", callback_data=f"ret_{user_id}")]]
             msg_admin = (
                 f"🚨 *NUEVA SOLICITUD DE RETIRO*\n\n"
                 f"👤 Usuario: {user_info['nombre']}\n"
                 f"🆔 ID: `{user_id}`\n"
-                f"💰 Monto solicitado: {monto_solicitado:.2f} USDT\n"
+                f"💰 Solicitado: {monto_solicitado:.2f} USDT\n"
+                f"📉 Comisión: {comision_aplicada:.2f} USDT\n"
+                f"💵 Neto a pagar: {monto_neto:.2f} USDT\n"
                 f"🔗 Wallet: `{wallet}`"
             )
             await context.bot.send_message(ADMIN_TELEGRAM_ID, msg_admin, reply_markup=InlineKeyboardMarkup(keyboard_admin), parse_mode="Markdown")
@@ -231,14 +253,35 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = obtener_data()
     is_reg = user_id in data["usuarios"]
 
-    # Acción Admin: Activar cuenta de registro
+    # Acción Admin: Activar cuenta de registro y otorgar comisión por referido si aplica
     if data_cb.startswith("act_") or data_cb.startswith("rej_"):
         target_id = data_cb.split("_")[1]
         if data_cb.startswith("act_"):
             data["usuarios"][target_id]["activo"] = True
+            
+            # Verificar si vino por referido y otorgar el 2% de comisión al referidor
+            if "pendientes_referido" in data and target_id in data["pendientes_referido"]:
+                ref_id = data["pendientes_referido"][target_id]
+                if ref_id in data["usuarios"]:
+                    monto_paq = data["usuarios"][target_id].get("deposito", 0)
+                    comision_ref = monto_paq * COMISION_REFERIDO
+                    data["usuarios"][ref_id]["ganancias_acumuladas"] = data["usuarios"][ref_id].get("ganancias_acumuladas", 0) + comision_ref
+                    
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(ref_id),
+                            text=f"🎉 ¡Has recibido una comisión de referidos del **2%** ({comision_ref:.2f} USDT) debido a la activación de tu invitado!",
+                            parse_mode="Markdown"
+                        )
+                    except:
+                        pass
+                del data["pendientes_referido"][target_id]
+
             await context.bot.send_message(int(target_id), "🎉 ¡Cuenta ACTIVADA!", reply_markup=obtener_menu(True))
             await query.edit_message_text(f"✅ Usuario {target_id} activado.")
         else:
+            if "pendientes_referido" in data and target_id in data["pendientes_referido"]:
+                del data["pendientes_referido"][target_id]
             del data["usuarios"][target_id]
             await query.edit_message_text(f"❌ Usuario {target_id} rechazado.")
         guardar_data(data)
@@ -259,6 +302,11 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "ultimo_retiro_fecha": "",
                 "activo": False
             }
+            
+            # Guardar relación de referido si existe
+            if "pendientes_referido" in data and user_id in data["pendientes_referido"]:
+                pass # Se procesa al activar
+
             del data["estados_registro"][user_id]
             guardar_data(data)
 
@@ -322,6 +370,21 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text("⚠️ No encontramos un registro activo para tu cuenta.", reply_markup=obtener_menu(False))
 
+    elif data_cb == "ver_invitacion":
+        if is_reg:
+            bot_username = context.bot.username
+            link_invitacion = f"https://t.me/{bot_username}?start={user_id}"
+            
+            texto_invitar = (
+                f"👥 *PROGRAMA DE INVITADOS Y REFERIDOS*\n\n"
+                f"¡Comparte tu enlace de invitación y gana el **2% de comisión** sobre la inversión que realice cada amigo que registres!\n\n"
+                f"🔗 *Tu enlace personal:*\n`{link_invitacion}`\n\n"
+                f"Comparte este enlace para que tus referidos queden vinculados automáticamente a tu cuenta."
+            )
+            await query.message.reply_text(texto_invitar, parse_mode="Markdown", reply_markup=obtener_menu(True))
+        else:
+            await query.message.reply_text("⚠️ Debes estar registrado para obtener tu enlace de invitación.", reply_markup=obtener_menu(False))
+
     elif data_cb == "pedir_retiro":
         if is_reg and data["usuarios"][user_id].get("activo"):
             u_info = data["usuarios"][user_id]
@@ -345,13 +408,13 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ganancias_disp > 0:
                 if ganancias_disp >= MIN_RETIRO:
                     se_puede_retirar = True
-                    mensaje_retiro = f"📤 Tienes {ganancias_disp:.2f} USDT disponibles de ganancias."
+                    mensaje_retiro = f"📤 Tienes {ganancias_disp:.2f} USDT disponibles de ganancias (Comisión de retiro: 1%)."
                 else:
                     await query.message.reply_text(f"⚠️ Para retirar ganancias, el mínimo es {MIN_RETIRO} USDT.", reply_markup=obtener_menu(is_reg))
                     return
             else:
                 se_puede_retirar = True
-                mensaje_retiro = f"📤 No tienes ganancias generadas. Puedes retirar tu capital inicial ({deposito_inicial:.2f} USDT) sin mínimo."
+                mensaje_retiro = f"📤 No tienes ganancias generadas. Puedes retirar tu capital inicial ({deposito_inicial:.2f} USDT) sin mínimo (Comisión de retiro: 2%)."
 
             if se_puede_retirar:
                 if "estados_retiro" not in data:
@@ -367,14 +430,12 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ℹ️ *INFORMACIÓN Y REGLAS DE LA PLATAFORMA* ℹ️\n\n"
             f"• *Rendimiento:* Generamos un {PORCENTAJE_DIARIO}% diario sobre tu capital depositado.\n"
             f"• *Límite del Paquete:* Cada paquete de inversión tiene validez hasta alcanzar el *200% de retorno* sobre la inversión inicial.\n\n"
-            "🗓 *CRONOGRAMA DE OPERACIONES:*\n"
-            "• *Activación:* Las cuentas se activan manualmente tras verificar el comprobante de pago enviado al administrador.\n"
-            "• *Retiros:* Se procesan exclusivamente los días **jueves y viernes** de cada semana (1 retiro por semana por usuario).\n"
-            f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT (solo aplica para ganancias).\n"
-            f"• *Comisión de Retiro:* {int(COMISION_RETIRO * 100)}% por transacción.\n\n"
-            "⚠️ *NOTAS IMPORTANTES:*\n"
-            "1. Asegúrate de enviar el comprobante de depósito al privado del administrador para procesar tu activación.\n"
-            "2. Si retiras tu capital sin generar ganancias, puedes hacerlo sin mínimo de retiro.\n"
+            "🗓 *CRONOGRAMA DE OPERACIONES Y COMISIONES:*\n"
+            "• *Activación:* Las cuentas se activan manualmente tras verificar el pago.\n"
+            "• *Retiros:* Se procesan los días **jueves y viernes** (1 retiro por semana).\n"
+            f"• *Comisión Retiro Ganancias:* {int(COMISION_RETIRO_GANANCIAS * 100)}%.\n"
+            f"• *Comisión Retiro Depósito Inicial:* {int(COMISION_RETIRO_DEPOSITO * 100)}%.\n"
+            f"• *Comisión de Referidos:* {int(COMISION_REFERIDO * 100)}% de la inversión de tus invitados.\n\n"
             f"¿Tienes dudas adicionales? Contacta a soporte a través de {ADMIN_USERNAME}"
         )
         await query.message.reply_text(texto_info, parse_mode="Markdown", reply_markup=obtener_menu(is_reg))
@@ -418,7 +479,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
+    app.updater.start_polling(drop_pending_updates=True)
     print("🤖 Bot activo...")
 
     stop_signal = asyncio.Event()
