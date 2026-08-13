@@ -29,9 +29,9 @@ DB_FILE = "inversion_db.json"
 PORCENTAJE_DIARIO = 0.50
 MIN_RETIRO = 50.0
 
-COMISION_RETIRO_GANANCIAS = 0.01
-COMISION_RETIRO_DEPOSITO = 0.02
-COMISION_REFERIDO = 0.02
+COMISION_RETIRO_GANANCIAS = 0.01  # 1%
+COMISION_RETIRO_DEPOSITO = 0.02   # 2%
+COMISION_REFERIDO = 0.02          # 2%
 
 PAQUETES_DISPONIBLES = [100, 120, 150, 180, 200, 250, 300, 350, 500, 1000, 1500, 2000]
 
@@ -39,6 +39,7 @@ def obtener_data():
     if not os.path.exists(DB_FILE):
         return {"usuarios": {}, "estados_registro": {}, "estados_retiro": {}, "estados_admin_retiro": {}, "pendientes_referido": {}}
     data = json.load(open(DB_FILE, "r"))
+    # Asegurar que existan las llaves necesarias para evitar errores
     if "estados_admin_retiro" not in data: data["estados_admin_retiro"] = {}
     if "pendientes_referido" not in data: data["pendientes_referido"] = {}
     if "usuarios" not in data: data["usuarios"] = {}
@@ -64,7 +65,7 @@ def obtener_menu(registrado: bool):
 def obtener_teclado_paquetes():
     keyboard = []
     fila = []
-    for i, monto in enumerate(PAQUETES_DISPONIBLES):
+    for monto in PAQUETES_DISPONIBLES:
         fila.append(InlineKeyboardButton(f"💎 {monto} USDT", callback_data=f"paq_{monto}"))
         if len(fila) == 3:
             keyboard.append(fila)
@@ -91,10 +92,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["pendientes_referido"][user_id] = referidor_id
             guardar_data(data)
     is_reg = user_id in data["usuarios"]
-    await update.message.reply_text(
-        "👋 ¡Bienvenido a la plataforma de inversión!" if not is_reg else "👋 ¡Bienvenido de nuevo a tu panel!",
-        reply_markup=obtener_menu(is_reg)
-    )
+    await update.message.reply_text("👋 ¡Bienvenido a la plataforma de inversión!", reply_markup=obtener_menu(is_reg))
 
 async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
@@ -103,6 +101,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
     texto = update.message.text.strip() if update.message.text else ""
     is_reg = user_id in data["usuarios"]
 
+    # 1. GESTIÓN ENVÍO COMPROBANTE ADMIN
     if user_id == str(ADMIN_TELEGRAM_ID) and user_id in data.get("estados_admin_retiro", {}):
         target_id = data["estados_admin_retiro"][user_id]
         if update.message.photo:
@@ -110,21 +109,22 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             del data["estados_admin_retiro"][user_id]
             if target_id in data["usuarios"]: data["usuarios"][target_id]["ultimo_retiro_fecha"] = datetime.now().strftime("%Y-%m-%d")
             guardar_data(data)
-            await update.message.reply_text("✅ Comprobante enviado con éxito.")
+            await update.message.reply_text("✅ Comprobante enviado al usuario.")
             try:
-                await context.bot.send_photo(int(target_id), photo_file_id, caption="🎉 ¡Tu solicitud de retiro ha sido procesada con éxito!", reply_markup=obtener_menu(True))
+                await context.bot.send_photo(int(target_id), photo_file_id, caption="🎉 ¡Tu solicitud de retiro ha sido procesada con éxito! Adjuntamos el comprobante.", reply_markup=obtener_menu(True))
             except: pass
             return
         else:
-            await update.message.reply_text("⚠️ Adjunta la imagen del comprobante.")
+            await update.message.reply_text("⚠️ Adjunta la **imagen** del comprobante.")
             return
 
+    # 2. REGISTRO
     if user_id in data.get("estados_registro", {}):
         estado_reg = data["estados_registro"][user_id]
         if estado_reg["paso"] == 1:
             estado_reg.update({"nombre": texto, "paso": 2})
             guardar_data(data)
-            await update.message.reply_text("📧 Ingresa tu correo electrónico:")
+            await update.message.reply_text("📧 Ingresa tu correo:")
         elif estado_reg["paso"] == 2:
             estado_reg.update({"email": texto, "paso": 3})
             guardar_data(data)
@@ -132,9 +132,10 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         elif estado_reg["paso"] == 3:
             estado_reg["telefono"] = texto
             guardar_data(data)
-            await update.message.reply_text("💎 Selecciona el paquete de inversión:", reply_markup=obtener_teclado_paquetes())
+            await update.message.reply_text("💎 Selecciona el paquete:", reply_markup=obtener_teclado_paquetes())
         return
 
+    # 3. RETIRO
     if user_id in data.get("estados_retiro", {}):
         estado_ret = data["estados_retiro"][user_id]
         if estado_ret["fase"] == "monto":
@@ -143,28 +144,25 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 user_info = data["usuarios"][user_id]
                 ganancias_disp = user_info.get("ganancias_acumuladas", 0)
                 deposito_total = user_info.get("deposito", 0)
-
+                
                 if ganancias_disp > 0 and monto_solicitado < MIN_RETIRO:
-                    await update.message.reply_text(f"⚠️ Mínimo para retiro de ganancias: {MIN_RETIRO} USDT.")
+                    await update.message.reply_text(f"⚠️ Mínimo para ganancias: {MIN_RETIRO} USDT.")
                     return
                 
                 max_disponible = ganancias_disp if ganancias_disp > 0 else deposito_total
                 if monto_solicitado > max_disponible:
-                    await update.message.reply_text(f"⚠️ Saldo insuficiente. Máximo: {max_disponible:.2f} USDT.")
+                    await update.message.reply_text(f"⚠️ Saldo insuficiente.")
                     return
 
                 tiene_ganancias = ganancias_disp >= monto_solicitado
-                tasa_comision = COMISION_RETIRO_GANANCIAS if tiene_ganancias else COMISION_RETIRO_DEPOSITO
-                comision_calculada = monto_solicitado * tasa_comision
-                monto_neto = monto_solicitado - comision_calculada
-
+                tasa = COMISION_RETIRO_GANANCIAS if tiene_ganancias else COMISION_RETIRO_DEPOSITO
+                comision = monto_solicitado * tasa
+                monto_neto = monto_solicitado - comision
+                
                 estado_ret.update({"monto": monto_solicitado, "fase": "wallet"})
                 guardar_data(data)
-                await update.message.reply_text(
-                    f"📝 *Resumen de tu retiro:*\n\n💰 Solicitado: {monto_solicitado:.2f} USDT\n📉 Comisión ({int(tasa_comision * 100)}%): {comision_calculada:.2f} USDT\n💵 Neto a recibir: {monto_neto:.2f} USDT\n\nEscribe tu **wallet TRC20**:",
-                    parse_mode="Markdown"
-                )
-            except ValueError: await update.message.reply_text("⚠️ Ingresa un número válido.")
+                await update.message.reply_text(f"📝 *Resumen:*\nSolicitado: {monto_solicitado:.2f} USDT\nComisión ({int(tasa*100)}%): {comision:.2f} USDT\nNeto a recibir: {monto_neto:.2f} USDT\n\nEscribe tu **wallet TRC20**:", parse_mode="Markdown")
+            except: await update.message.reply_text("⚠️ Monto inválido.")
             return
 
         elif estado_ret["fase"] == "wallet":
@@ -178,11 +176,12 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             
             del data["estados_retiro"][user_id]
             guardar_data(data)
-            await update.message.reply_text("✅ Solicitud enviada al administrador.", reply_markup=obtener_menu(is_reg))
-            await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVA SOLICITUD*\n👤 {user_info.get('nombre')}\n💰 {monto_solicitado:.2f} USDT\n🔗 `{wallet}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Retiro Enviado", callback_data=f"ret_{user_id}")]]))
+            await update.message.reply_text("✅ Solicitud enviada.", reply_markup=obtener_menu(is_reg))
+            msg_admin = f"🚨 *NUEVA SOLICITUD*\n👤 {user_info.get('nombre')}\n💰 {monto_solicitado:.2f} USDT\n🔗 `{wallet}`"
+            await context.bot.send_message(ADMIN_TELEGRAM_ID, msg_admin, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Retiro Enviado", callback_data=f"ret_{user_id}")]]))
             return
 
-    await update.message.reply_text("Usa el menú para navegar:", reply_markup=obtener_menu(is_reg))
+    await update.message.reply_text("Usa el menú:", reply_markup=obtener_menu(is_reg))
 
 async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -190,6 +189,8 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data_cb = query.data
     user_id = str(query.from_user.id)
     data = obtener_data()
+    
+    # Manejo seguro de usuario no registrado
     is_reg = user_id in data["usuarios"]
 
     if data_cb.startswith("act_"):
@@ -198,82 +199,57 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["usuarios"][target_id]["activo"] = True
             if target_id in data.get("pendientes_referido", {}):
                 ref_id = data["pendientes_referido"][target_id]
-                if ref_id in data["usuarios"]:
-                    comision = data["usuarios"][target_id].get("deposito", 0) * COMISION_REFERIDO
-                    data["usuarios"][ref_id]["ganancias_acumuladas"] = data["usuarios"][ref_id].get("ganancias_acumuladas", 0) + comision
+                comision = data["usuarios"][target_id].get("deposito", 0) * COMISION_REFERIDO
+                data["usuarios"][ref_id]["ganancias_acumuladas"] += comision
                 del data["pendientes_referido"][target_id]
             guardar_data(data)
             await query.edit_message_text("✅ Usuario activado.")
-            try:
-                await context.bot.send_message(int(target_id), "🎉 ¡Cuenta ACTIVADA!", reply_markup=obtener_menu(True))
-            except: pass
         return
 
     if data_cb.startswith("paq_"):
-        monto_paquete = float(data_cb.split("_")[1])
+        monto = float(data_cb.split("_")[1])
         if user_id in data.get("estados_registro", {}):
-            reg = data["estados_registro"][user_id]
-            data["usuarios"][user_id] = {
-                "nombre": reg["nombre"],
-                "email": reg["email"],
-                "telefono": reg["telefono"],
-                "deposito": monto_paquete,
-                "ganancias_acumuladas": 0.0,
-                "total_generado": 0.0,
-                "ultimo_retiro_fecha": "",
-                "activo": False
-            }
-            del data["estados_registro"][user_id]
+            reg = data["estados_registro"].pop(user_id)
+            data["usuarios"][user_id] = {"nombre": reg["nombre"], "email": reg["email"], "telefono": reg["telefono"], "deposito": monto, "ganancias_acumuladas": 0.0, "total_generado": 0.0, "ultimo_retiro_fecha": "", "activo": False}
             guardar_data(data)
-            await query.message.edit_text(f"✅ Paquete de {monto_paquete} USDT seleccionado. Envía tu pago al admin {ADMIN_USERNAME}.", parse_mode="Markdown")
-            await query.message.reply_text("Panel:", reply_markup=obtener_menu(True))
-            await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}\n💵 Paquete: {monto_paquete} USDT", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"rej_{user_id}")]]), parse_mode="Markdown")
+            await query.message.edit_text(f"✅ Paquete de {monto} USDT seleccionado. Envía comprobante al admin.")
+            await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}")]]), parse_mode="Markdown")
+        return
+
+    if data_cb == "ret_": # Corregido para capturar el ID
+        pass
+    
+    if data_cb.startswith("ret_"):
+        target_id = data_cb.split("_")[1]
+        data["estados_admin_retiro"][user_id] = target_id
+        guardar_data(data)
+        await query.message.reply_text("📸 Envía ahora la captura del comprobante:")
         return
 
     if data_cb == "iniciar_registro":
         data["estados_registro"][user_id] = {"paso": 1}
         guardar_data(data)
-        await query.message.reply_text("📝 Escribe tu nombre completo:")
-        return
-
-    if data_cb == "ver_saldo":
-        if not is_reg:
-            await query.message.reply_text("⚠️ No estás registrado. Presiona Registrarse:", reply_markup=obtener_menu(False))
-            return
+        await query.message.reply_text("📝 Nombre completo:")
+    
+    elif data_cb == "ver_saldo":
+        if not is_reg: return
         u = data["usuarios"][user_id]
-        deposito = u.get("deposito", 0)
-        ganancias = u.get("ganancias_acumuladas", 0)
-        total_generado = u.get("total_generado", 0)
-        meta_200 = deposito * 2.0
-        progreso = (total_generado / meta_200) * 100 if meta_200 > 0 else 0
-        estado = "✅ Activa" if u.get("activo") else "⏳ Pendiente"
-        
-        msg = (
-            f"📊 *ESTADO DE CUENTA*\n\n"
-            f"👤 {u.get('nombre')}\n"
-            f"📌 Estado: {estado}\n"
-            f"💵 Paquete: {deposito:.2f} USDT\n"
-            f"📈 Ganancias: {ganancias:.2f} USDT\n"
-            f"🎯 Progreso 200%: {progreso:.1f}%\n"
-        )
-        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=obtener_menu(True))
-        return
+        msg = f"📊 *SALDO*\n💵 Paquete: {u['deposito']} USDT\n📈 Ganancias: {u['ganancias_acumuladas']:.2f} USDT"
+        await query.message.reply_text(msg, parse_mode="Markdown")
 
-    if data_cb == "pedir_retiro":
-        if not is_reg or not data["usuarios"][user_id].get("activo"):
-            await query.message.reply_text("⚠️ Tu cuenta debe estar registrada y activa para retirar.", reply_markup=obtener_menu(is_reg))
-            return
-        if datetime.now().weekday() not in [3, 4]:
-            await query.message.reply_text("⚠️ Los retiros solo están habilitados jueves y viernes.", reply_markup=obtener_menu(is_reg))
-            return
-        data["estados_retiro"][user_id] = {"fase": "monto"}
-        guardar_data(data)
-        await query.message.reply_text("📤 Escribe la cantidad que deseas retirar:")
-        return
+    elif data_cb == "ver_invitacion":
+        if is_reg:
+            link = f"https://t.me/{context.bot.username}?start={user_id}"
+            await query.message.reply_text(f"👥 *Tu enlace de invitado:*\n`{link}`", parse_mode="Markdown")
 
-    if data_cb == "ver_info":
-        await query.message.reply_text("ℹ️ *Reglas:* Rendimiento diario 0.50% hasta el 200%. Retiros jueves y viernes.", parse_mode="Markdown", reply_markup=obtener_menu(is_reg))
-        return
+    elif data_cb == "pedir_retiro":
+        if is_reg and data["usuarios"][user_id].get("activo"):
+            data["estados_retiro"][user_id] = {"fase": "monto"}
+            guardar_data(data)
+            await query.message.reply_text("📤 Escribe el monto:")
+
+    elif data_cb == "ver_info":
+        await query.message.reply_text("ℹ️ *Reglas:* Rendimiento 0.50% diario. Retiros Jueves/Viernes.", parse_mode="Markdown")
 
 async def main():
     await start_web_server()
@@ -284,10 +260,7 @@ async def main():
     
     await app.initialize()
     await app.start()
-    # drop_pending_updates=True evita conflictos de sesiones colgadas al reiniciar
     await app.updater.start_polling(drop_pending_updates=True)
-    print("🤖 Bot activo...")
-
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
