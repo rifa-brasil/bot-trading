@@ -276,7 +276,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(boton_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensajes_texto))
 
-    app.job_queue.run_once(lambda ctx: asyncio.create_task(tarea_ganancias_diarias(app)), 5)
+    asyncio.create_task(tarea_ganancias_diarias(app))
 
     print("🤖 Bot de Inversión Cripto iniciado correctamente...")
     
