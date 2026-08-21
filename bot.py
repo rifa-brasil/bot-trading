@@ -27,7 +27,7 @@ ADMIN_USERNAME = "@yordanisr"
 
 DB_FILE = "inversion_db.json"
 PORCENTAJE_DIARIO = 0.50
-MIN_RETIRO = 50.0
+MIN_RETIRO = 15.0
 
 PAQUETES_DISPONIBLES = [100, 120, 150, 180, 200, 250, 300, 350, 500, 1000, 1500, 2000]
 
@@ -300,7 +300,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             "🗓 *CRONOGRAMA Y COMISIONES DE RETIRO:*\n"
             "• *Días:* Jueves y viernes de cada semana (1 retiro por semana).\n"
             "• *Horario:* De **4:00 PM a 6:00 PM**.\n"
-            "• *Comisión de Retiro:* 2% del total de saldo a retirar (sea cual sea).\n"
+            "• *Comisión de Retiro:* 2% del total de saldo a retirar.\n"
             "• *Retiro de Depósito:* Solo permitido durante las primeras **24 horas** tras comprar el plan (al retirarlo, se cancela la participación).\n"
             f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n\n"
             "⚠️ *NOTAS IMPORTANTES:*\n"
@@ -407,7 +407,7 @@ async def tarea_corte_18pm(application):
                 f"👤 *Detalle de usuarios:*\n{detalle}"
             )
             try:
-                await application.bot.send_message(ADMIN_TELEGRAM_ID, reporte, parse_Mode="Markdown")
+                await application.bot.send_message(ADMIN_TELEGRAM_ID, reporte, parse_mode="Markdown")
             except Exception as e:
                 print(f"Error enviando reporte automático: {e}")
             
