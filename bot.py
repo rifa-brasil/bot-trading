@@ -290,23 +290,29 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
         if is_reg:
             link_bot = f"https://t.me/{context.bot.username}?start={user_id}"
             await update.message.reply_text(
-                f"👥 *INVITA Y GANA*\n\n"
-                f"Comparte tu enlace interactivo:\n[Enlace de Invitación]({link_bot})\n\n"
-                f"Gana un **2% de comisión** sobre el primer paquete que compre tu invitado.",
+                f"👥 *SISTEMA DE INVITACIONES*\n\n"
+                f"Comparte tu enlace de invitación con tus amigos:\n[Enlace de Invitación]({link_bot})\n\n"
+                f"¡Invítalos a formar parte de la plataforma!",
                 parse_mode="Markdown", reply_markup=obtener_menu_principal(True)
             )
 
     elif texto == 'ℹ️ Información':
-        info = (
-            "ℹ️ *REGLAS Y HORARIOS* ℹ️\n\n"
-            f"• *Rendimiento:* {PORCENTAJE_DIARIO}% diario.\n"
-            "• *Horario de Retiro:* Jueves y Viernes de **4:00 PM a 6:00 PM**.\n"
-            "• *Comisiones:* 1% para ganancias, 2% para depósito.\n"
-            "• *Retiro de Depósito:* Solo permitido durante las primeras **24 horas** tras comprar el plan (cancela la participación).\n"
-            "• *Referidos:* 2% de comisión por el primer paquete del invitado.\n"
-            f"• *Mínimo:* {MIN_RETIRO} USDT."
+        texto_info = (
+            "ℹ️ *INFORMACIÓN Y REGLAS DE LA PLATAFORMA* ℹ️\n\n"
+            f"• *Rendimiento:* Generamos un {PORCENTAJE_DIARIO}% diario sobre tu capital depositado.\n"
+            f"• *Límite del Paquete:* Cada paquete de inversión tiene validez hasta alcanzar el *200% de retorno* sobre la inversión inicial.\n\n"
+            "🗓 *CRONOGRAMA Y COMISIONES DE RETIRO:*\n"
+            "• *Días:* Jueves y viernes de cada semana (1 retiro per semana).\n"
+            "• *Comisión Ganancias:* 1% por retiro de saldo generado.\n"
+            "• *Comisión Depósito:* 2% por retiro de saldo depositado.\n"
+            "• *Retiro de Depósito:* Solo permitido antes de haber comenzado a generar ganancias (al retirarlo, se cancela la participación).\n"
+            f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n\n"
+            "⚠️ *NOTAS IMPORTANTES:*\n"
+            "1. Asegúrate de enviar el comprobante de depósito al privado del administrador para procesar tu activación.\n"
+            "2. Toda inversión conlleva riesgos.\n\n"
+            f"¿Tienes dudas adicionales? Contacta a soporte a través de {ADMIN_USERNAME}"
         )
-        await update.message.reply_text(info, parse_mode="Markdown", reply_markup=obtener_menu_principal(is_reg))
+        await update.message.reply_text(texto_info, parse_mode="Markdown", reply_markup=obtener_menu_principal(is_reg))
 
 async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -383,7 +389,6 @@ async def tarea_ganancias_diarias():
                     info["total_generado"] = gen + g_hoy
         guardar_data(data)
 
-# TAREA AUTOMÁTICA A LAS 6:00 PM (18:00) PARA CÁLCULO DE USDT SOLICITADOS
 async def tarea_corte_18pm(application):
     while True:
         ahora = datetime.now()
@@ -394,7 +399,6 @@ async def tarea_corte_18pm(application):
         segundos_espera = (objetivo - ahora).total_seconds()
         await asyncio.sleep(segundos_espera)
 
-        # Al llegar a las 18:00 (6 PM)
         data = obtener_data()
         solicitudes = data.get("solicitudes_hoy", [])
         
@@ -412,7 +416,6 @@ async def tarea_corte_18pm(application):
             except Exception as e:
                 print(f"Error enviando reporte automático: {e}")
             
-            # Limpiar solicitudes del día
             data["solicitudes_hoy"] = []
             guardar_data(data)
 
