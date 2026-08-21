@@ -172,15 +172,13 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                     await update.message.reply_text(f"⚠️ Saldo insuficiente. Disponible: {saldo_total_disponible:.2f} USDT.", reply_markup=obtener_menu_principal(is_reg))
                     return
 
-                # Definir comisión (1% ganancias, 2% depósito)
-                if monto_solicitado <= ganancias_disp:
-                    porcentaje_aplicado = 0.01
-                elif puede_retirar_deposito:
-                    porcentaje_aplicado = 0.02
-                else:
+                # Validar si intenta retirar parte del depósito fuera de las 24 horas
+                if monto_solicitado > ganancias_disp and not puede_retirar_deposito:
                     await update.message.reply_text("⚠️ Ya han pasado más de 24 horas desde tu depósito; no puedes retirarlo, solo tus ganancias.", reply_markup=obtener_menu_principal(is_reg))
                     return
 
+                # Comisión de retiro fija del 2% del total de saldo a retirar
+                porcentaje_aplicado = 0.02
                 comision = monto_solicitado * porcentaje_aplicado
                 total_neto = monto_solicitado - comision
 
@@ -190,7 +188,7 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text(
                     f"📊 *Resumen de Retiro:*\n"
                     f"• Solicitado: {monto_solicitado:.2f} USDT\n"
-                    f"• Comisión ({int(porcentaje_aplicado*100)}%): -{comision:.2f} USDT\n"
+                    f"• Comisión de Retiro (2%): -{comision:.2f} USDT\n"
                     f"• Neto: *{total_neto:.2f} USDT*\n\n"
                     f"📤 Escribe tu wallet TRC20:", parse_mode="Markdown"
                 )
@@ -214,7 +212,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
 
             user_info["wallet"] = wallet
             
-            # Registrar solicitud para el reporte automático de las 6:00 PM
             data.setdefault("solicitudes_hoy", []).append({
                 "usuario": user_info["nombre"],
                 "id": user_id,
@@ -257,7 +254,6 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
 
     elif texto == '📤 Solicitar Retiro':
         if is_reg and data["usuarios"][user_id].get("activo"):
-            # Validación de horario: 4:00 PM a 6:00 PM (16:00 a 18:00)
             ahora = datetime.now().time()
             inicio_horario = time(16, 0)
             fin_horario = time(18, 0)
@@ -302,10 +298,10 @@ async def manejar_mensajes_texto(update: Update, context: ContextTypes.DEFAULT_T
             f"• *Rendimiento:* Generamos un {PORCENTAJE_DIARIO}% diario sobre tu capital depositado.\n"
             f"• *Límite del Paquete:* Cada paquete de inversión tiene validez hasta alcanzar el *200% de retorno* sobre la inversión inicial.\n\n"
             "🗓 *CRONOGRAMA Y COMISIONES DE RETIRO:*\n"
-            "• *Días:* Jueves y viernes de cada semana (1 retiro per semana).\n"
-            "• *Comisión Ganancias:* 1% por retiro de saldo generado.\n"
-            "• *Comisión Depósito:* 2% por retiro de saldo depositado.\n"
-            "• *Retiro de Depósito:* Solo permitido antes de haber comenzado a generar ganancias (al retirarlo, se cancela la participación).\n"
+            "• *Días:* Jueves y viernes de cada semana (1 retiro por semana).\n"
+            "• *Horario:* De **4:00 PM a 6:00 PM**.\n"
+            "• *Comisión de Retiro:* 2% del total de saldo a retirar (sea cual sea).\n"
+            "• *Retiro de Depósito:* Solo permitido durante las primeras **24 horas** tras comprar el plan (al retirarlo, se cancela la participación).\n"
             f"• *Mínimo de Retiro:* {MIN_RETIRO} USDT.\n\n"
             "⚠️ *NOTAS IMPORTANTES:*\n"
             "1. Asegúrate de enviar el comprobante de depósito al privado del administrador para procesar tu activación.\n"
@@ -326,7 +322,6 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["usuarios"][target_id]["activo"] = True
         data["usuarios"][target_id]["fecha_activacion"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Comisión de referido (2% del primer paquete)
         if "referidos" in data and target_id in data["referidos"]:
             ref_id = data["referidos"][target_id]
             if ref_id in data["usuarios"]:
@@ -361,7 +356,7 @@ async def boton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del data["estados_registro"][user_id]
             guardar_data(data)
             await query.message.edit_text(f"✅ Paquete de {monto} USDT seleccionado. Envía el comprobante a {ADMIN_USERNAME}")
-            keyboard = [[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"rej_{user_id})")]]
+            keyboard = [[InlineKeyboardButton("✅ Activar", callback_data=f"act_{user_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"rej_{user_id}")]]
             await context.bot.send_message(ADMIN_TELEGRAM_ID, f"🚨 *NUEVO REGISTRO*\n👤 {reg['nombre']}\n💵 Paquete: {monto}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             return
 
@@ -412,7 +407,7 @@ async def tarea_corte_18pm(application):
                 f"👤 *Detalle de usuarios:*\n{detalle}"
             )
             try:
-                await application.bot.send_message(ADMIN_TELEGRAM_ID, reporte, parse_mode="Markdown")
+                await application.bot.send_message(ADMIN_TELEGRAM_ID, reporte, parse_Mode="Markdown")
             except Exception as e:
                 print(f"Error enviando reporte automático: {e}")
             
