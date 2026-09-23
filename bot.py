@@ -198,6 +198,9 @@ def init_db():
     if "comprobante_file_id" not in retiro_cols:
         cur.execute("ALTER TABLE retiros ADD COLUMN comprobante_file_id TEXT NOT NULL DEFAULT ''")
 
+    cur.execute("CREATE TABLE IF NOT EXISTS configuracion (clave TEXT PRIMARY KEY, valor TEXT NOT NULL DEFAULT '')")
+    cur.execute("INSERT OR IGNORE INTO configuracion (clave, valor) VALUES ('mantenimiento', '0')")
+
     cur.execute("UPDATE inversiones SET tasa_diaria = ? WHERE estado = 'activa'", (DAILY_RATE,))
     conn.commit()
     conn.close()
@@ -218,6 +221,38 @@ def is_admin(user_id):
 def private_only(update):
     chat = update.effective_chat
     return chat is not None and chat.type == ChatType.PRIVATE
+
+
+def maintenance_enabled():
+    try:
+        conn = db()
+        row = conn.execute("SELECT valor FROM configuracion WHERE clave='mantenimiento'").fetchone()
+        conn.close()
+        return bool(row and str(row["valor"]) == "1")
+    except Exception:
+        return False
+
+
+def set_maintenance(enabled):
+    conn = db()
+    conn.execute("INSERT INTO configuracion (clave, valor) VALUES ('mantenimiento', ?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor", ("1" if enabled else "0",))
+    conn.commit(); conn.close()
+
+
+async def maintenance_message(update, context):
+    await update.message.reply_text("🛠️ *BOT EN MANTENIMIENTO*\n\nEl bot está temporalmente bloqueado por mantenimiento. No se pueden realizar solicitudes en este momento.\n\n⏳ Intenta nuevamente cuando el administrador informe que el servicio está operativo.", parse_mode="Markdown")
+
+
+async def broadcast_maintenance(context, enabled):
+    conn = db(); rows = conn.execute("SELECT telegram_id FROM usuarios ORDER BY id ASC").fetchall(); conn.close()
+    text = ("🛠️ *BOT EN MANTENIMIENTO*\n\nEl bot ha sido bloqueado temporalmente para realizar mantenimiento y actualizaciones.\n\n🚫 Durante este período no se podrán realizar solicitudes.\nTe avisaremos por este mismo bot cuando vuelva a estar operativo." if enabled else "✅ *BOT OPERATIVO NUEVAMENTE*\n\nEl mantenimiento ha finalizado y el bot vuelve a estar disponible.\n\nYa puedes utilizar normalmente todas las funciones del bot.")
+    sent=failed=0
+    for row in rows:
+        try:
+            await context.bot.send_message(chat_id=row["telegram_id"], text=text, parse_mode="Markdown"); sent += 1
+        except Exception as e:
+            failed += 1; print(f"⚠️ No se pudo notificar mantenimiento a {row['telegram_id']}: {e}")
+    return sent, failed
 
 
 def generate_ref_code(telegram_id):
@@ -385,8 +420,9 @@ def admin_keyboard():
     return ReplyKeyboardMarkup([
         ["👥 Usuarios", "📥 Depósitos"],
         ["📤 Retiros", "📈 Inversiones"],
-        ["💾 Crear respaldo", "📊 Estado"],
-        ["💰 Pago diario 0,5%"],
+        ["💾 Crear respaldo", "♻️ Restaurar respaldo"],
+        ["📊 Estado", "🔒 Bloquear bot"],
+        ["🔓 Desbloquear bot", "💰 Pago diario 0,5%"],
         ["📢 Enviar mensaje"],
     ], resize_keyboard=True, is_persistent=True)
 
@@ -420,6 +456,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = update.effective_user
+
+    if not is_admin(user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
+        return
 
     start_ref = None
     if context.args:
@@ -586,6 +626,7 @@ async def show_info(query):
     texto = (
         "ℹ️ *INFORMACIÓN DEL SISTEMA*\n\n"
         f"📊 Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
+        "🗓️ Las ganancias se generan y acreditan únicamente de *lunes a viernes*, a las *4:15 PM*. No se generan ganancias los sábados ni domingos.\n"
         "🎯 Cada plan permanece activo hasta alcanzar un rendimiento total equivalente al *200% del capital del plan* (capital + ganancias).\n"
         f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n"
         f"💸 Retiro mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
@@ -946,63 +987,70 @@ async def confirm_investment(query):
 # GANANCIAS
 # =========================================================
 
+def _weekday_payments_due(last_utc, now_utc, tz):
+    """Cuenta las liquidaciones de 16:15 que corresponden de lunes a viernes."""
+    last_local = last_utc.astimezone(tz)
+    now_local = now_utc.astimezone(tz)
+    cutoff = (16, 15)
+
+    # La primera liquidación corresponde a la fecha de last_calculo si la inversión
+    # nació antes de las 16:15 de ese día; de lo contrario empieza el día siguiente.
+    start_date = last_local.date()
+    if (last_local.hour, last_local.minute) >= cutoff:
+        start_date += timedelta(days=1)
+
+    total = 0
+    current = start_date
+    while current <= now_local.date():
+        if current.weekday() < 5:
+            # Solo se liquida hoy cuando ya pasó la hora establecida.
+            if current < now_local.date() or (now_local.hour, now_local.minute) >= cutoff:
+                total += 1
+        current += timedelta(days=1)
+    return total
+
+
 def process_profits():
-    """
-    Calcula ganancias acumuladas desde el último cálculo.
-    El proceso se ejecuta automáticamente en segundo plano.
-    """
+    """Acredita 0,5% por día de generación, únicamente de lunes a viernes."""
     conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM inversiones
-        WHERE estado = 'activa'
-    """).fetchall()
-
+    rows = conn.execute("SELECT * FROM inversiones WHERE estado = 'activa'").fetchall()
     processed = 0
     total_profit = 0.0
-
     now = datetime.now(timezone.utc)
+    try:
+        tz = ZoneInfo(BACKUP_TIMEZONE)
+    except Exception:
+        tz = timezone.utc
 
     for inv in rows:
         try:
             last = datetime.fromisoformat(inv["ultimo_calculo"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
         except Exception:
             last = now
 
-        elapsed_seconds = max(0, (now - last).total_seconds())
-        days = elapsed_seconds / 86400.0
-
-        if days <= 0:
+        due_days = _weekday_payments_due(last, now, tz)
+        if due_days <= 0:
             continue
 
         capital = float(inv["capital"])
         accumulated = float(inv["ganancia_acumulada"])
         target_profit = capital * (float(inv["multiplicador_objetivo"]) - 1)
-
         available_target = max(0.0, target_profit - accumulated)
-
         if available_target <= 0:
-            conn.execute("""
-                UPDATE inversiones
-                SET estado = 'completada', ultimo_calculo = ?
-                WHERE id = ?
-            """, (now.isoformat(), inv["id"]))
+            conn.execute("UPDATE inversiones SET estado='completada', ultimo_calculo=? WHERE id=?", (now.isoformat(), inv["id"]))
             continue
 
-        profit = capital * float(inv["tasa_diaria"]) * days
-        profit = min(profit, available_target)
-
+        profit = min(capital * float(inv["tasa_diaria"]) * due_days, available_target)
         if profit <= 0:
             continue
 
         conn.execute("""
             UPDATE inversiones
-            SET ganancia_acumulada = ganancia_acumulada + ?,
-                ultimo_calculo = ?
+            SET ganancia_acumulada = ganancia_acumulada + ?, ultimo_calculo = ?
             WHERE id = ?
         """, (profit, now.isoformat(), inv["id"]))
-
         conn.execute("""
             UPDATE usuarios
             SET ganancias = ganancias + ?,
@@ -1010,33 +1058,19 @@ def process_profits():
                 saldo = saldo + ?
             WHERE telegram_id = ?
         """, (profit, profit, profit, inv["telegram_id"]))
-
         conn.execute("""
-            INSERT INTO movimientos (
-                telegram_id, tipo, monto, descripcion, fecha
-            )
+            INSERT INTO movimientos (telegram_id, tipo, monto, descripcion, fecha)
             VALUES (?, 'ganancia', ?, ?, ?)
-        """, (
-            inv["telegram_id"],
-            profit,
-            f"Ganancia procesada: inversión #{inv['id']}",
-            now.isoformat()
-        ))
+        """, (inv["telegram_id"], profit, f"Ganancia diaria {due_days} día(s): lunes a viernes a las 16:15", now.isoformat()))
 
         new_total = accumulated + profit
         if new_total >= target_profit:
-            conn.execute("""
-                UPDATE inversiones
-                SET estado = 'completada'
-                WHERE id = ?
-            """, (inv["id"],))
-
+            conn.execute("UPDATE inversiones SET estado='completada' WHERE id=?", (inv["id"],))
         processed += 1
         total_profit += profit
 
     conn.commit()
     conn.close()
-
     return processed, total_profit
 
 
@@ -1046,6 +1080,10 @@ def process_profits():
 
 async def start_deposit(update, context):
     if not private_only(update):
+        return ConversationHandler.END
+
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
         return ConversationHandler.END
 
     context.user_data.clear()
@@ -1061,6 +1099,10 @@ async def start_deposit(update, context):
 
 async def receive_deposit_amount(update, context):
     if not private_only(update):
+        return ConversationHandler.END
+
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
         return ConversationHandler.END
 
     try:
@@ -1086,6 +1128,10 @@ async def receive_deposit_tx(update, context):
     if not private_only(update):
         return ConversationHandler.END
 
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
+        return ConversationHandler.END
+
     tx = update.message.text.strip()
 
     if len(tx) < 5:
@@ -1108,6 +1154,10 @@ async def receive_deposit_photo(update, context):
     if not private_only(update):
         return ConversationHandler.END
 
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
+        return ConversationHandler.END
+
     photo = update.message.photo[-1]
     context.user_data["deposit_photo"] = photo.file_id
 
@@ -1116,6 +1166,10 @@ async def receive_deposit_photo(update, context):
 
 async def skip_deposit_photo(update, context):
     if not private_only(update):
+        return ConversationHandler.END
+
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
         return ConversationHandler.END
 
     context.user_data["deposit_photo"] = ""
@@ -1219,6 +1273,10 @@ async def start_withdraw(update, context):
     if not private_only(update):
         return ConversationHandler.END
 
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
+        return ConversationHandler.END
+
     row = get_user(update.effective_user.id)
     balance = float(row["ganancias_disponibles"]) if row else 0
 
@@ -1237,6 +1295,10 @@ async def start_withdraw(update, context):
 
 async def receive_withdraw_amount(update, context):
     if not private_only(update):
+        return ConversationHandler.END
+
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
         return ConversationHandler.END
 
     try:
@@ -1282,6 +1344,10 @@ async def receive_withdraw_amount(update, context):
 
 async def receive_withdraw_address(update, context):
     if not private_only(update):
+        return ConversationHandler.END
+
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
         return ConversationHandler.END
 
     address = update.message.text.strip()
@@ -1464,6 +1530,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = query.from_user.id
     data = query.data or ""
+
+    if not is_admin(user_id) and maintenance_enabled():
+        await query.answer("🛠️ Bot en mantenimiento. Intenta más tarde.", show_alert=True)
+        return
 
     print(
         f"[CALLBACK] user_id={user_id} "
@@ -1660,17 +1730,62 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "admin_lock":
+        if maintenance_enabled():
+            await query.edit_message_text("🔒 El bot ya está bloqueado.", reply_markup=back_inline())
+            return
+        set_maintenance(True)
+        sent, failed = await broadcast_maintenance(context, True)
+        await query.edit_message_text(f"🔒 *BOT BLOQUEADO PARA MANTENIMIENTO*\n\nLos usuarios no podrán realizar solicitudes hasta que lo desbloquees.\n\n📢 Notificaciones enviadas: {sent}\n⚠️ Fallidas: {failed}", parse_mode="Markdown", reply_markup=back_inline())
+        return
+
+    if data == "admin_unlock":
+        if not maintenance_enabled():
+            await query.edit_message_text("🔓 El bot ya está operativo.", reply_markup=back_inline())
+            return
+        set_maintenance(False)
+        sent, failed = await broadcast_maintenance(context, False)
+        await query.edit_message_text(f"🔓 *BOT DESBLOQUEADO*\n\nEl servicio vuelve a estar operativo.\n\n📢 Notificaciones enviadas: {sent}\n⚠️ Fallidas: {failed}", parse_mode="Markdown", reply_markup=back_inline())
+        return
+
+    if data == "admin_restore":
+        context.user_data["admin_restore_waiting"] = True
+        await query.edit_message_text("♻️ *RESTAURAR RESPALDO COMPLETO*\n\nEnvía ahora el archivo `.db` que creó el botón *Crear respaldo*.\n\n⚠️ Se restaurarán usuarios, depósitos, retiros, inversiones, ganancias, movimientos y referidos tal como estaban.\n\nAntes de reemplazar la base actual se creará automáticamente una salva de seguridad.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_restore_cancel")]]))
+        return
+
+    if data == "admin_restore_cancel":
+        path=context.user_data.pop("restore_pending_path", None)
+        context.user_data.pop("admin_restore_waiting", None)
+        if path and os.path.exists(path): os.remove(path)
+        await query.edit_message_text("❌ Restauración cancelada.", reply_markup=admin_keyboard())
+        return
+
+    if data == "restore_confirm":
+        path=context.user_data.get("restore_pending_path")
+        if not path or not os.path.exists(path):
+            context.user_data.clear(); await query.edit_message_text("❌ El archivo de respaldo ya no está disponible.", reply_markup=admin_keyboard()); return
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        safety=os.path.join(BACKUP_DIR, f"pre_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+        try:
+            conn=db(); bc=sqlite3.connect(safety); conn.backup(bc); bc.close(); conn.close()
+            os.replace(path, DB_FILE)
+            test=sqlite3.connect(DB_FILE); ok=test.execute("PRAGMA integrity_check").fetchone()[0]; test.close()
+            if str(ok).lower() != "ok": raise RuntimeError("La base restaurada no pasó la verificación de integridad.")
+            init_db()
+            context.user_data.clear()
+            await query.edit_message_text("✅ *RESPALDO RESTAURADO CORRECTAMENTE*\n\nTodos los datos históricos quedaron restaurados. También se creó una salva de seguridad de la base anterior.", parse_mode="Markdown", reply_markup=admin_keyboard())
+        except Exception as e:
+            context.user_data.clear(); await query.edit_message_text(f"❌ No se pudo restaurar el respaldo.\n\n`{e}`", parse_mode="Markdown", reply_markup=admin_keyboard())
+        return
+
     if data == "admin_backup":
-        await query.edit_message_text("💾 *PREPARANDO RESPALDO EXCEL...*", parse_mode="Markdown")
+        await query.edit_message_text("💾 *PREPARANDO RESPALDOS...*\n\nSe crearán el Excel de consulta y el archivo `.db` restaurable.", parse_mode="Markdown")
         try:
             await send_excel_backup(context.bot, "Respaldo solicitado por el administrador")
-            await send_admin_menu(ADMIN_TELEGRAM_ID, context, "✅ *RESPALDO CREADO Y ENVIADO*\n\nPanel administrativo:")
+            await send_database_backup(context.bot, "Respaldo solicitado por el administrador")
+            await send_admin_menu(ADMIN_TELEGRAM_ID, context, "✅ *RESPALDOS CREADOS Y ENVIADOS*\n\n📊 Excel para consulta\n♻️ `.db` para restaurar todos los datos\n\nPanel administrativo:")
         except Exception as e:
-            await query.edit_message_text(
-                f"❌ *ERROR AL CREAR RESPALDO*\n\n`{str(e)}`",
-                parse_mode="Markdown",
-                reply_markup=back_inline()
-            )
+            await query.edit_message_text(f"❌ *ERROR AL CREAR RESPALDO*\n\n`{str(e)}`", parse_mode="Markdown", reply_markup=back_inline())
         return
     if data == "admin_home":
         context.user_data.pop("admin_broadcast", None)
@@ -2013,6 +2128,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not private_only(update):
         return
+    if not is_admin(update.effective_user.id) and maintenance_enabled():
+        await maintenance_message(update, context)
+        return
     text = (update.message.text or "").strip()
     if not text:
         return
@@ -2087,7 +2205,9 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_actions = {
         "👥 Usuarios": "admin_users", "📥 Depósitos": "admin_deposits",
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
-        "💾 Crear respaldo": "admin_backup", "📊 Estado": "admin_status",
+        "💾 Crear respaldo": "admin_backup", "♻️ Restaurar respaldo": "admin_restore",
+        "📊 Estado": "admin_status", "🔒 Bloquear bot": "admin_lock",
+        "🔓 Desbloquear bot": "admin_unlock",
         "💰 Pago diario 0,5%": "admin_daily_payment", "📢 Enviar mensaje": "admin_broadcast",
     }
     user_actions = {
@@ -2319,7 +2439,7 @@ async def handle_text_panel_action(update, context, action):
             f"🎁 Ganancias acumuladas: *{money(profit)} USDT*\n"
             f"🏁 Planes finalizados: *{finished}*\n"
             f"📅 Ganancia diaria al 0,5%: *{money(float(active_capital)*DAILY_RATE)} USDT*\n"
-            "🎯 Objetivo por plan: 200% del capital inicial",
+            "🗓️ Ganancias: lunes a viernes a las 4:15 PM\n🎯 Objetivo por plan: 200% del capital inicial",
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
         return
@@ -2461,64 +2581,65 @@ def create_excel_backup():
             ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 12), 42)
         return ws
 
-    # Usuarios: la propia hoja ya contiene ID, username y nombre.
+    # En TODAS las hojas la identidad del usuario ocupa las primeras 3 columnas,
+    # siempre en este orden: Nombre, Nombre de usuario, ID Telegram.
     rows = conn.execute("SELECT * FROM usuarios ORDER BY id").fetchall()
-    cols = [d[1] for d in conn.execute("PRAGMA table_info(usuarios)").fetchall()]
+    base_cols = [d[1] for d in conn.execute("PRAGMA table_info(usuarios)").fetchall()]
+    rest = [c for c in base_cols if c not in ("nombre", "username", "telegram_id")]
+    cols = ["nombre", "username", "telegram_id"] + rest
     add_sheet("usuarios", cols, [[r[c] for c in cols] for r in rows])
 
-    # Todas las hojas operativas llevan siempre ID de Telegram, username y nombre.
-    rows = conn.execute("""SELECT d.*, u.username, u.nombre
-                          FROM depositos d LEFT JOIN usuarios u ON u.telegram_id=d.telegram_id
-                          ORDER BY d.id""").fetchall()
-    cols = [d[1] for d in conn.execute("PRAGMA table_info(depositos)").fetchall()] + ["username", "nombre"]
-    add_sheet("depositos", cols, [[r[c] for c in cols] for r in rows])
+    def joined_sheet(table, order_col="id"):
+        rows = conn.execute(
+            f"SELECT t.*, u.nombre AS _nombre_usuario, u.username AS _username_usuario "
+            f"FROM {table} t LEFT JOIN usuarios u ON u.telegram_id=t.telegram_id "
+            f"ORDER BY t.{order_col}"
+        ).fetchall()
+        base_cols = [d[1] for d in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        rest = [c for c in base_cols if c != "telegram_id"]
+        cols = ["_nombre_usuario", "_username_usuario", "telegram_id"] + rest
+        return cols, [[r[c] for c in cols] for r in rows]
 
-    rows = conn.execute("""SELECT r.*, u.username, u.nombre
-                          FROM retiros r LEFT JOIN usuarios u ON u.telegram_id=r.telegram_id
-                          ORDER BY r.id""").fetchall()
-    cols = [d[1] for d in conn.execute("PRAGMA table_info(retiros)").fetchall()] + ["username", "nombre"]
-    add_sheet("retiros", cols, [[r[c] for c in cols] for r in rows])
+    for table in ("depositos", "retiros", "inversiones", "movimientos"):
+        cols, data = joined_sheet(table)
+        display_cols = ["Nombre", "Nombre de usuario", "ID Telegram"] + [c for c in cols[3:]]
+        add_sheet(table, display_cols, data)
 
-    rows = conn.execute("""SELECT i.*, u.username, u.nombre
-                          FROM inversiones i LEFT JOIN usuarios u ON u.telegram_id=i.telegram_id
-                          ORDER BY i.id""").fetchall()
-    cols = [d[1] for d in conn.execute("PRAGMA table_info(inversiones)").fetchall()] + ["username", "nombre"]
-    add_sheet("inversiones", cols, [[r[c] for c in cols] for r in rows])
+    # Referidos: las primeras 3 columnas identifican al referido de cada registro.
+    rows = conn.execute("""
+        SELECT r.*,
+               uf.nombre AS referido_nombre,
+               uf.username AS referido_username
+        FROM referidos r
+        LEFT JOIN usuarios uf ON uf.telegram_id=r.referido_id
+        ORDER BY r.id
+    """).fetchall()
+    base_cols = [d[1] for d in conn.execute("PRAGMA table_info(referidos)").fetchall()]
+    rest = [c for c in base_cols if c != "referido_id"]
+    cols = ["referido_nombre", "referido_username", "referido_id"] + rest
+    add_sheet("referidos", ["Nombre", "Nombre de usuario", "ID Telegram"] + cols[3:], [[r[c] for c in cols] for r in rows])
 
-    rows = conn.execute("""SELECT m.*, u.username, u.nombre
-                          FROM movimientos m LEFT JOIN usuarios u ON u.telegram_id=m.telegram_id
-                          ORDER BY m.id""").fetchall()
-    cols = [d[1] for d in conn.execute("PRAGMA table_info(movimientos)").fetchall()] + ["username", "nombre"]
-    add_sheet("movimientos", cols, [[r[c] for c in cols] for r in rows])
-
-    rows = conn.execute("""SELECT r.*,
-                                 ur.username AS referidor_username, ur.nombre AS referidor_nombre,
-                                 uf.username AS referido_username, uf.nombre AS referido_nombre
-                          FROM referidos r
-                          LEFT JOIN usuarios ur ON ur.telegram_id=r.referidor_id
-                          LEFT JOIN usuarios uf ON uf.telegram_id=r.referido_id
-                          ORDER BY r.id""").fetchall()
-    cols = [d[1] for d in conn.execute("PRAGMA table_info(referidos)").fetchall()] + [
-        "referidor_username", "referidor_nombre", "referido_username", "referido_nombre"
-    ]
-    add_sheet("referidos", cols, [[r[c] for c in cols] for r in rows])
-
-    # Resumen: también contiene una ficha general por usuario.
+    # Resumen: también empieza con la identidad de cada usuario.
     ws = wb.create_sheet("resumen")
-    ws.append(["Indicador", "Valor"])
+    ws.append(["Nombre", "Nombre de usuario", "ID Telegram", "Saldo", "Ganancias disponibles", "Capital invertido", "Ganancias acumuladas"])
+    users = conn.execute("""
+        SELECT nombre, username, telegram_id, saldo, ganancias_disponibles, invertido, ganancias
+        FROM usuarios ORDER BY id
+    """).fetchall()
+    for u in users:
+        ws.append([u["nombre"], u["username"], u["telegram_id"], u["saldo"], u["ganancias_disponibles"], u["invertido"], u["ganancias"]])
+
+    ws.append([])
+    ws.append(["RESUMEN GENERAL"])
     approved = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()["s"]
     active = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
     daily = float(active) * DAILY_RATE
     ws.append(["Fecha UTC", now_iso()])
     ws.append(["Tasa diaria", DAILY_RATE])
+    ws.append(["Días de generación", "Lunes a viernes, 4:15 PM"])
     ws.append(["Total depósitos aprobados (USDT)", float(approved)])
     ws.append(["Capital activo invertido (USDT)", float(active)])
     ws.append(["Pago diario estimado sobre capital activo (USDT)", daily])
-    ws.append([])
-    ws.append(["ID Telegram", "Username", "Nombre", "Saldo", "Ganancias disponibles", "Capital invertido", "Ganancias acumuladas"])
-    users = conn.execute("SELECT telegram_id, username, nombre, saldo, ganancias_disponibles, invertido, ganancias FROM usuarios ORDER BY id").fetchall()
-    for u in users:
-        ws.append([u["telegram_id"], u["username"], u["nombre"], u["saldo"], u["ganancias_disponibles"], u["invertido"], u["ganancias"]])
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     for col_cells in ws.columns:
@@ -2532,6 +2653,19 @@ def create_excel_backup():
     return output
 
 
+async def send_database_backup(bot, reason="Respaldo completo"):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    filename = f"respaldo_inversion_completo_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.db"
+    path = os.path.join(BACKUP_DIR, filename)
+    conn = db(); backup_conn = sqlite3.connect(path); conn.backup(backup_conn); backup_conn.close(); conn.close()
+    try:
+        with open(path, "rb") as f:
+            await bot.send_document(chat_id=ADMIN_TELEGRAM_ID, document=InputFile(f, filename=filename), caption=f"🗄️ {reason}\n♻️ Respaldo completo de la base de datos (.db), restaurable desde el panel.")
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+
 async def send_excel_backup(bot, reason="Respaldo automático"):
     filename = f"respaldo_inversion_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"
     output = create_excel_backup()
@@ -2543,14 +2677,30 @@ async def send_excel_backup(bot, reason="Respaldo automático"):
 
 
 async def automatic_profit_loop(application):
+    """Ejecuta la liquidación a las 16:15, únicamente de lunes a viernes."""
+    try:
+        tz = ZoneInfo(BACKUP_TIMEZONE)
+    except Exception:
+        print(f"⚠️ Zona horaria inválida: {BACKUP_TIMEZONE}. Se usará UTC.")
+        tz = timezone.utc
+
     while True:
+        now = datetime.now(tz)
+        target = now.replace(hour=16, minute=15, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        while target.weekday() >= 5:
+            target += timedelta(days=1)
+
+        wait_seconds = max(1, (target - now).total_seconds())
+        print(f"💰 Próxima generación de ganancias: {target.isoformat()} (lunes a viernes, 16:15)")
+        await asyncio.sleep(wait_seconds)
+
         try:
             processed, total = process_profits()
-            if processed:
-                print(f"💰 Ganancias automáticas: {processed} inversiones, {total:.2f} USDT")
+            print(f"💰 Ganancias de las 16:15: {processed} inversiones, {total:.2f} USDT")
         except Exception as e:
-            print(f"❌ Error procesando ganancias automáticas: {e}")
-        await asyncio.sleep(3600)
+            print(f"❌ Error procesando ganancias de las 16:15: {e}")
 
 
 async def automatic_backup_loop(application):
@@ -2572,7 +2722,7 @@ async def automatic_backup_loop(application):
         print(f"💾 Próximo respaldo automático: {target.isoformat()}")
         await asyncio.sleep(wait_seconds)
         try:
-            await send_excel_backup(application.bot, "Respaldo automático diario de las 06:00")
+            await send_excel_backup(application.bot, "Respaldo automático diario")
             await send_admin_menu(ADMIN_TELEGRAM_ID, application, "✅ *RESPALDO AUTOMÁTICO ENVIADO*\\n\\nPanel administrativo:")
         except Exception as e:
             print(f"❌ Error en respaldo automático: {e}")
@@ -2581,6 +2731,30 @@ async def automatic_backup_loop(application):
 # =========================================================
 # COMANDOS ADMIN
 # =========================================================
+
+async def admin_restore_document(update, context):
+    if not private_only(update) or not is_admin(update.effective_user.id):
+        return
+    if not context.user_data.get("admin_restore_waiting"):
+        return
+    document=update.message.document
+    if not document: return
+    if not (document.file_name or "").lower().endswith(".db"):
+        await update.message.reply_text("❌ Solo se acepta un archivo `.db` creado por el botón de respaldo.", parse_mode="Markdown"); return
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    temp=os.path.join(BACKUP_DIR, f"restore_upload_{uuid.uuid4().hex}.db")
+    try:
+        tg_file=await document.get_file(); await tg_file.download_to_drive(temp)
+        test=sqlite3.connect(temp); ok=test.execute("PRAGMA integrity_check").fetchone()[0]; tables={r[0] for r in test.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}; test.close()
+        required={"usuarios","depositos","retiros","inversiones","movimientos","referidos"}
+        if str(ok).lower()!="ok" or not required.issubset(tables):
+            os.remove(temp); await update.message.reply_text("❌ El archivo no es un respaldo válido de este bot o está dañado."); return
+        context.user_data["restore_pending_path"]=temp; context.user_data["admin_restore_waiting"]=False
+        await update.message.reply_text(f"⚠️ *RESPALDO VALIDADO*\n\nArchivo: `{document.file_name}`\nLa base contiene las tablas históricas necesarias.\n\nConfirma para reemplazar la base actual. Antes se creará una salva de seguridad de la base actual.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("♻️ Confirmar restauración", callback_data="restore_confirm")],[InlineKeyboardButton("❌ Cancelar", callback_data="admin_restore_cancel")]]))
+    except Exception as e:
+        if os.path.exists(temp): os.remove(temp)
+        await update.message.reply_text(f"❌ Error leyendo el respaldo: `{e}`", parse_mode="Markdown")
+
 
 async def manual_admin_withdraw_photo(update, context):
     if not private_only(update) or not is_admin(update.effective_user.id):
@@ -2823,6 +2997,7 @@ async def main():
     app.add_handler(withdraw_handler)
 
     app.add_handler(CommandHandler("skip", skip_manual_deposit_photo, filters=filters.ChatType.PRIVATE))
+    app.add_handler(MessageHandler(filters.DOCUMENT & filters.ChatType.PRIVATE, admin_restore_document))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, manual_admin_withdraw_photo))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, manual_deposit_photo))
 
