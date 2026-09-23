@@ -53,7 +53,7 @@ TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
-PROFIT_TIME = os.getenv("PROFIT_TIME", "20:00").strip()
+PROFIT_TIME = os.getenv("PROFIT_TIME", "20:10").strip()
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
@@ -642,7 +642,7 @@ async def show_info(query):
         f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n"
         f"💸 Retiro mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
         "🗓️ Frecuencia de retiros: *1 solicitud cada 7 días*\n"
-        "📅 Ganancias generadas: *lunes a viernes a las 20:00*\n\n"
+        "📅 Ganancias generadas: *lunes a viernes a las 20:10*\n\n"
         "🌐 Red de depósitos y retiros: *TRC20*\n"
         "📥 Los depósitos son revisados manualmente por el administrador.\n"
         "📤 Los retiros también son revisados manualmente."
@@ -1758,7 +1758,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
             f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
-            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *20:00*.\n"
+            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *20:10*.\n"
             "Este botón es solamente informativo; no acredita las ganancias manualmente.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -2470,12 +2470,23 @@ async def handle_text_panel_action(update, context, action):
         return
 
     if action == "admin_profit":
-        processed, total = process_profits(force=True)
+        conn = db()
+        active_capital = conn.execute(
+            "SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'"
+        ).fetchone()["s"]
+        active_investments = conn.execute(
+            "SELECT COUNT(*) c FROM inversiones WHERE estado='activa'"
+        ).fetchone()["c"]
+        conn.close()
+        daily_due = float(active_capital) * DAILY_RATE
         await update.message.reply_text(
             "💰 *PAGO DIARIO 0,5%*\n\n"
-            f"Inversiones procesadas: *{processed}*\n"
-            f"Ganancia acreditada: *{money(total)} USDT*\n\n"
-            "El proceso automático está programado de lunes a viernes a las 20:00.",
+            f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
+            f"👥 Inversiones activas: *{active_investments}*\n"
+            f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
+            f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
+            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *20:10*.\n"
+            "Este botón es solamente informativo; no acredita las ganancias manualmente.",
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
         return
