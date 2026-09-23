@@ -54,6 +54,9 @@ MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
+# Planes de inversión disponibles. El monto del plan queda definido por el botón.
+INVESTMENT_PLANS = [50, 100, 120, 150, 200, 250, 300, 350, 500, 650, 1000, 1500, 2000]
+
 # Estados de conversación
 DEP_AMOUNT, DEP_TX, DEP_PHOTO = range(3)
 WITHDRAW_AMOUNT, WITHDRAW_ADDRESS = range(3, 5)
@@ -305,12 +308,16 @@ def add_movement(telegram_id, tipo, amount, description):
 
 
 def withdrawal_wait_info(telegram_id):
-    """Devuelve (puede_retirar, restante_segundos) según el último retiro solicitado."""
+    """Devuelve (puede_retirar, segundos_restantes) usando retiros pendientes/aprobados."""
     conn = db()
-    row = conn.execute(
-        "SELECT fecha FROM retiros WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
-        (telegram_id,)
-    ).fetchone()
+    row = conn.execute("""
+        SELECT fecha
+        FROM retiros
+        WHERE telegram_id = ?
+          AND estado IN ('pendiente', 'aprobado')
+        ORDER BY id DESC
+        LIMIT 1
+    """, (telegram_id,)).fetchone()
     conn.close()
     if not row or not row["fecha"]:
         return True, 0
@@ -324,12 +331,17 @@ def withdrawal_wait_info(telegram_id):
     remaining = max(0, WITHDRAWAL_INTERVAL_DAYS * 86400 - elapsed)
     return remaining <= 0, int(remaining)
 
+
 def withdrawal_wait_text(seconds):
     days = seconds // 86400
     hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
     if days > 0:
         return f"{days} día(s) y {hours} hora(s)"
-    return f"{hours} hora(s)"
+    if hours > 0:
+        return f"{hours} hora(s) y {minutes} minuto(s)"
+    return f"{minutes} minuto(s)"
+
 
 def user_balance(telegram_id):
     row = get_user(telegram_id)
@@ -345,6 +357,7 @@ def user_balance(telegram_id):
 def user_keyboard():
     return ReplyKeyboardMarkup([
         ["👤 Mi cuenta", "📈 Inversiones"],
+        ["💎 Planes de Inversión"],
         ["💰 Depositar", "💸 Retirar"],
         ["🤝 Referidos", "📜 Historial"],
         ["ℹ️ Información"],
@@ -437,29 +450,52 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_account(query):
     user_id = query.from_user.id
+    # Reparación: si por alguna razón el registro no existe, se crea/actualiza aquí.
     row = get_user(user_id)
+    if not row:
+        ensure_user(query.from_user)
+        row = get_user(user_id)
 
     if not row:
         return await query.edit_message_text(
-            "⚠️ No se encontró tu cuenta. Usa /start."
+            "⚠️ No se pudo cargar tu cuenta. Pulsa /start y vuelve a intentarlo.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]])
         )
+
+    conn = db()
+    total_depositado_db = conn.execute(
+        "SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
+        (user_id,)
+    ).fetchone()["s"]
+    total_retirado_db = conn.execute(
+        "SELECT COALESCE(SUM(monto), 0) AS s FROM retiros WHERE telegram_id=? AND estado='aprobado'",
+        (user_id,)
+    ).fetchone()["s"]
+    conn.close()
+    total_depositado = max(float(row["total_depositado"] or 0), float(total_depositado_db or 0))
+    total_retirado = max(float(row["total_retirado"] or 0), float(total_retirado_db or 0))
+    ganancias = float(row["ganancias"] or 0)
+    porcentaje = (ganancias / total_depositado * 100) if total_depositado > 0 else 0.0
 
     texto = (
         "👤 *MI CUENTA*\n\n"
         f"🆔 ID: `{row['telegram_id']}`\n"
         f"👤 Nombre: {row['nombre'] or '-'}\n"
         f"💰 Saldo disponible: *{money(row['saldo'])} USDT*\n"
+        f"📥 Total depositado: *{money(total_depositado)} USDT*\n"
         f"📈 Capital invertido: *{money(row['invertido'])} USDT*\n"
-        f"💵 Ganancias acumuladas: *{money(row['ganancias'])} USDT*\n"
-        f"📥 Total depositado: *{money(row['total_depositado'])} USDT*\n"
-        f"📤 Total retirado: *{money(row['total_retirado'])} USDT*\n"
+        f"💵 Ganancias acumuladas: *{money(ganancias)} USDT*\n"
+        f"📊 Ganancia de la cuenta: *{porcentaje:.2f}%*\n"
+        f"📤 Total retirado: *{money(total_retirado)} USDT*\n\n"
+        "El saldo disponible es el dinero acreditado que todavía no está invertido y puede utilizarse según los planes disponibles."
     )
 
     await query.edit_message_text(
         texto,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Volver", callback_data="user_home")]
+            [InlineKeyboardButton("💎 Planes de Inversión", callback_data="user_plans")],
+            [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
     )
 
@@ -508,7 +544,7 @@ async def show_referrals(query, context):
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Compartir mi enlace", url=share_url)],
-        [InlineKeyboardButton("⬅️ Volver", callback_data="user_home")],
+        [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
     ])
 
     texto = (
@@ -534,13 +570,12 @@ async def show_referrals(query, context):
 async def show_info(query):
     texto = (
         "ℹ️ *INFORMACIÓN DEL SISTEMA*\n\n"
-        f"📌 Plan disponible: *{PLAN_NAME}*\n"
-        f"📊 Tasa configurada: *{DAILY_RATE * 100:.4g}% diaria*\n"
-        f"🎯 Multiplicador máximo configurado: *{TARGET_MULTIPLIER:.2f}x*\n"
-        f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n\n"
-        "⚠️ Los parámetros anteriores son configuraciones del sistema y "
-        "no constituyen una garantía de rentabilidad.\n\n"
-        "🌐 Red de depósitos: *TRC20*\n"
+        f"📊 Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
+        "🎯 Cada plan permanece activo hasta alcanzar un rendimiento total equivalente al *200% del capital del plan* (capital + ganancias).\n"
+        f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n"
+        f"💸 Retiro mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
+        "🗓️ Frecuencia de retiros: *1 solicitud cada 7 días*\n\n"
+        "🌐 Red de depósitos y retiros: *TRC20*\n"
         "📥 Los depósitos son revisados manualmente por el administrador.\n"
         "📤 Los retiros también son revisados manualmente."
     )
@@ -549,7 +584,149 @@ async def show_info(query):
         texto,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Volver", callback_data="user_home")]
+            [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+        ])
+    )
+
+
+# =========================================================
+# PLANES DE INVERSIÓN
+# =========================================================
+
+async def show_plans(query):
+    user_id = query.from_user.id
+    row = get_user(user_id)
+    if not row:
+        ensure_user(query.from_user)
+        row = get_user(user_id)
+    balance = float(row["saldo"]) if row else 0.0
+
+    buttons = []
+    for amount in INVESTMENT_PLANS:
+        buttons.append([InlineKeyboardButton(
+            f"💎 Plan {money(amount)} USDT",
+            callback_data=f"plan_{amount}"
+        )])
+
+    buttons.append([
+        InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"),
+        InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")
+    ])
+
+    texto = (
+        "💎 *PLANES DE INVERSIÓN*\n\n"
+        f"Saldo disponible: *{money(balance)} USDT*\n"
+        f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
+        "Selecciona el plan que deseas contratar."
+    )
+    await query.edit_message_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def select_plan(query, amount):
+    user_id = query.from_user.id
+    row = get_user(user_id)
+    if not row:
+        ensure_user(query.from_user)
+        row = get_user(user_id)
+    balance = float(row["saldo"]) if row else 0.0
+
+    if amount not in INVESTMENT_PLANS:
+        await query.answer("Plan no disponible.", show_alert=True)
+        return
+
+    if balance >= amount:
+        await query.edit_message_text(
+            "🚀 *PLAN DISPONIBLE PARA INVERTIR*\n\n"
+            f"Plan seleccionado: *{money(amount)} USDT*\n"
+            f"Saldo disponible: *{money(balance)} USDT*\n"
+            f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
+            "El plan permanecerá activo hasta alcanzar el 200% del capital del plan.\n\n"
+            "Puedes invertir ahora usando exactamente el monto de este plan.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Invertir {money(amount)} USDT", callback_data=f"confirm_plan_{amount}")],
+                [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+            ])
+        )
+    else:
+        faltante = amount - balance
+        await query.edit_message_text(
+            "💰 *DEPÓSITO PARA ESTE PLAN*\n\n"
+            f"Plan seleccionado: *{money(amount)} USDT*\n"
+            f"Saldo disponible: *{money(balance)} USDT*\n"
+            f"Falta depositar: *{money(faltante)} USDT*\n\n"
+            "Al pulsar el botón de abajo, el monto del depósito queda fijado al valor del plan. No tendrás que escribir la cantidad.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"💰 Depositar {money(faltante)} USDT", callback_data=f"deposit_plan_{amount}")],
+                [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+            ])
+        )
+
+
+async def confirm_plan_investment(query, amount):
+    user_id = query.from_user.id
+    conn = db()
+    row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id = ?", (user_id,)).fetchone()
+    if not row:
+        conn.close()
+        await query.answer("Cuenta no encontrada.", show_alert=True)
+        return
+    balance = float(row["saldo"])
+    if balance < amount:
+        conn.close()
+        await query.answer("El saldo disponible ya no alcanza para este plan.", show_alert=True)
+        return
+
+    now = now_iso()
+    conn.execute("""
+        UPDATE usuarios SET saldo = saldo - ?, invertido = invertido + ?
+        WHERE telegram_id = ?
+    """, (amount, amount, user_id))
+    conn.execute("""
+        INSERT INTO inversiones (
+            telegram_id, plan, capital, ganancia_acumulada,
+            tasa_diaria, multiplicador_objetivo, estado,
+            fecha_inicio, ultimo_calculo
+        ) VALUES (?, ?, ?, 0, ?, 2.0, 'activa', ?, ?)
+    """, (user_id, f"Plan {money(amount)} USDT", amount, DAILY_RATE, now, now))
+    conn.commit()
+    conn.close()
+
+    add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT")
+
+    await query.edit_message_text(
+        "✅ *INVERSIÓN CREADA*\n\n"
+        f"Plan: *{money(amount)} USDT*\n"
+        f"Capital invertido: *{money(amount)} USDT*\n"
+        f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
+        "Objetivo del plan: alcanzar el 200% del capital total del plan.\n\n"
+        "Tu saldo disponible se actualizó correctamente.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_invest")],
+            [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+        ])
+    )
+
+
+async def start_plan_deposit(query, context, plan_amount):
+    row = get_user(query.from_user.id)
+    balance = float(row["saldo"]) if row else 0.0
+    deposit_amount = max(0.0, float(plan_amount) - balance)
+    context.user_data.clear()
+    context.user_data["manual_flow"] = "deposit_tx_fixed"
+    context.user_data["deposit_amount"] = deposit_amount
+    await query.edit_message_text(
+        "💰 *DEPÓSITO DEL PLAN*\n\n"
+        f"Plan seleccionado: *{money(plan_amount)} USDT*\n"
+        f"Saldo disponible actual: *{money(balance)} USDT*\n"
+        f"Monto exacto a depositar: *{money(deposit_amount)} USDT*\n\n"
+        f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
+        "Realiza el depósito por el monto indicado y después envía aquí el TXID. No necesitas escribir el monto.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
     )
 
@@ -573,49 +750,62 @@ def investment_summary(telegram_id):
 async def show_investments(query):
     user_id = query.from_user.id
     row = get_user(user_id)
+    if not row:
+        ensure_user(query.from_user)
+        row = get_user(user_id)
     rows = investment_summary(user_id)
     conn = db()
-    total_deposited = conn.execute(
-        "SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
-        (user_id,)
-    ).fetchone()["s"]
-    active_invested = conn.execute(
-        "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'",
-        (user_id,)
-    ).fetchone()["s"]
-    daily = float(active_invested) * DAILY_RATE
+    total_deposited = conn.execute("SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'", (user_id,)).fetchone()["s"]
+    active_invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'", (user_id,)).fetchone()["s"]
+    total_gains = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?", (user_id,)).fetchone()["s"]
     conn.close()
+    daily = float(active_invested) * DAILY_RATE
+    balance = float(row["saldo"]) if row else 0.0
+    pct = (float(total_gains) / float(total_deposited) * 100) if float(total_deposited) > 0 else 0.0
 
     lines = [
-        "📈 *MIS INVERSIONES*",
-        "",
+        "📈 *MIS INVERSIONES*", "",
         f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
-        f"📊 Total actualmente invertido: *{money(active_invested)} USDT*",
-        f"💵 Ganancia diaria al {DAILY_RATE * 100:.4g}%: *{money(daily)} USDT*",
-        f"💳 Saldo disponible: *{money(row['saldo'] if row else 0)} USDT*",
-        "",
+        f"💳 Saldo disponible para invertir: *{money(balance)} USDT*",
+        f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*",
+        f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
+        f"📈 Rendimiento de la cuenta: *{pct:.2f}%*",
+        f"💵 Ganancia diaria estimada al {DAILY_RATE * 100:.1f}%: *{money(daily)} USDT*", ""
     ]
     if rows:
         for inv in rows:
+            capital = float(inv["capital"])
+            gain = float(inv["ganancia_acumulada"])
+            target_profit = capital
+            progress = min(100.0, gain / target_profit * 100) if target_profit else 0.0
+            total_value = capital + gain
             lines.append(
-                f"#{inv['id']} — {inv['plan']}\n"
-                f"Capital: {money(inv['capital'])} USDT\n"
-                f"Ganancia acumulada: {money(inv['ganancia_acumulada'])} USDT\n"
+                f"💎 *{inv['plan']}*\n"
+                f"Capital: {money(capital)} USDT\n"
+                f"Ganancia: {money(gain)} USDT\n"
+                f"Total generado: {money(total_value)} USDT\n"
+                f"Progreso hacia el 200%: {progress:.2f}%\n"
                 f"Estado: {inv['estado']}\n"
             )
     else:
         lines.append("No tienes inversiones registradas todavía.")
-        lines.append("Puedes invertir el saldo disponible desde el botón inferior.")
 
-    keyboard = [[InlineKeyboardButton("🚀 Invertir saldo", callback_data="user_new_investment")],
-                [InlineKeyboardButton("⬅️ Menú principal", callback_data="user_home")]]
-    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    buttons = []
+    if balance >= MIN_INVESTMENT:
+        buttons.append([InlineKeyboardButton("🚀 Invertir saldo disponible", callback_data="user_new_investment")])
+    buttons.append([InlineKeyboardButton("💎 Planes de Inversión", callback_data="user_plans")])
+    buttons.append([InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")])
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def create_investment(query):
     user_id = query.from_user.id
     row = get_user(user_id)
 
     if not row:
+        ensure_user(query.from_user)
+        row = get_user(user_id)
+    if not row:
+        await query.edit_message_text("⚠️ No se pudo cargar tu cuenta.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]]))
         return
 
     balance = float(row["saldo"])
@@ -637,7 +827,7 @@ async def create_investment(query):
     # Para evitar inversiones accidentales, mostramos confirmación.
     await query.edit_message_text(
         "🚀 *CONFIRMAR INVERSIÓN*\n\n"
-        f"Plan: *{PLAN_NAME}*\n"
+        f"Plan: *Saldo disponible completo*\n"
         f"Saldo disponible: *{money(balance)} USDT*\n"
         f"Tasa configurada: *{DAILY_RATE * 100:.4g}% diaria*\n"
         f"Objetivo configurado: *{TARGET_MULTIPLIER:.2f}x*\n\n"
@@ -1071,6 +1261,19 @@ async def receive_withdraw_address(update, context):
     amount = float(context.user_data.get("withdraw_amount", 0))
     user_id = update.effective_user.id
 
+    if amount < MIN_WITHDRAWAL:
+        await update.message.reply_text(f"⚠️ El retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT*.", parse_mode="Markdown")
+        return WITHDRAW_AMOUNT
+
+    can_withdraw, remaining = withdrawal_wait_info(user_id)
+    if not can_withdraw:
+        await update.message.reply_text(
+            "⏳ *RETIRO SEMANAL*\n\n"
+            f"Ya realizaste una solicitud de retiro.\nPodrás solicitar otro en aproximadamente *{withdrawal_wait_text(remaining)}*.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
     if len(address) < 20:
         await update.message.reply_text(
             "⚠️ La dirección parece inválida. Envíala nuevamente."
@@ -1175,35 +1378,42 @@ async def cancel_withdraw(update, context):
 
 async def show_history(query):
     user_id = query.from_user.id
-
     conn = db()
     rows = conn.execute("""
         SELECT tipo, monto, descripcion, fecha
         FROM movimientos
         WHERE telegram_id = ?
-        ORDER BY id DESC
-        LIMIT 15
+        ORDER BY id ASC
     """, (user_id,)).fetchall()
     conn.close()
 
     if not rows:
-        texto = "📜 *HISTORIAL*\n\nTodavía no tienes movimientos."
+        texto = "📜 *HISTORIAL COMPLETO*\n\nTodavía no tienes movimientos."
     else:
-        texto = "📜 *HISTORIAL*\n\n"
-
+        texto = "📜 *HISTORIAL COMPLETO*\n\n"
         for r in rows:
+            try:
+                fecha = datetime.fromisoformat(r["fecha"]).astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                fecha = r["fecha"]
             texto += (
-                f"• {r['tipo']} — {money(r['monto'])} USDT\n"
+                f"🕒 {fecha} UTC\n"
+                f"• *{r['tipo']}* — {money(r['monto'])} USDT\n"
                 f"  {r['descripcion']}\n\n"
             )
 
+    # Telegram tiene límite de 4096 caracteres; si hay mucho historial, enviamos por páginas.
+    chunks = [texto[i:i+3800] for i in range(0, len(texto), 3800)]
+    if not chunks:
+        chunks = [texto]
     await query.edit_message_text(
-        texto,
-        parse_mode="Markdown",
+        chunks[0], parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Volver", callback_data="user_home")]
+            [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
     )
+    for extra in chunks[1:]:
+        await query.message.reply_text(extra, parse_mode="Markdown")
 
 
 # =========================================================
@@ -1237,7 +1447,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ADMIN
     # -----------------------------------------------------
 
-    if data.startswith("admin_") or data.startswith("dep_") or data.startswith("wd_"):
+    if (data.startswith("admin_") or data.startswith("dep_approve_") or
+            data.startswith("dep_reject_") or data.startswith("wd_approve_") or
+            data.startswith("wd_reject_")):
         if not is_admin(user_id):
             await query.answer(
                 "⛔ No autorizado.",
@@ -1748,6 +1960,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_investments(query)
         return
 
+    if data == "user_plans":
+        await show_plans(query)
+        return
+
+    if data.startswith("plan_"):
+        try:
+            amount = float(data.split("_", 1)[1])
+        except ValueError:
+            await query.answer("Plan inválido.", show_alert=True)
+            return
+        await select_plan(query, amount)
+        return
+
+    if data.startswith("confirm_plan_"):
+        try:
+            amount = float(data.split("_", 2)[2])
+        except ValueError:
+            await query.answer("Plan inválido.", show_alert=True)
+            return
+        await confirm_plan_investment(query, amount)
+        return
+
+    if data.startswith("deposit_plan_"):
+        try:
+            amount = float(data.split("_", 2)[2])
+        except ValueError:
+            await query.answer("Plan inválido.", show_alert=True)
+            return
+        await start_plan_deposit(query, context, amount)
+        return
+
     if data == "user_new_investment":
         await create_investment(query)
         return
@@ -1772,11 +2015,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "💰 *NUEVO DEPÓSITO*\n\n"
             f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
-            "Escribe ahora el monto que deseas depositar.",
-            parse_mode="Markdown"
+            "Puedes elegir un plan para que el monto quede fijado automáticamente.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Ver Planes de Inversión", callback_data="user_plans")],
+                [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+            ])
         )
         context.user_data.clear()
-        context.user_data["manual_flow"] = "deposit_amount"
         return
 
     if data == "user_withdraw":
@@ -1801,6 +2047,8 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    ensure_user(update.effective_user)
+
     admin_actions = {
         "👥 Usuarios": "admin_users", "📥 Depósitos": "admin_deposits",
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
@@ -1810,7 +2058,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_actions = {
         "👤 Mi cuenta": "user_account", "📈 Inversiones": "user_invest",
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
-        "ℹ️ Información": "user_info",
+        "ℹ️ Información": "user_info", "💎 Planes de Inversión": "user_plans",
     }
 
     # El teclado inferior funciona como panel fijo.
@@ -1822,15 +2070,27 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "💰 Depositar":
         context.user_data.clear()
-        context.user_data["manual_flow"] = "deposit_amount"
         await update.message.reply_text(
             "💰 *NUEVO DEPÓSITO*\n\n"
             f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
-            "Escribe ahora el monto que deseas depositar.",
-            parse_mode="Markdown"
+            "Selecciona un plan y el monto del depósito quedará fijado automáticamente.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Ver Planes de Inversión", callback_data="user_plans")],
+                [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+            ])
         )
         return
     if text == "💸 Retirar":
+        can_withdraw, remaining = withdrawal_wait_info(update.effective_user.id)
+        if not can_withdraw:
+            await update.message.reply_text(
+                "⏳ *RETIRO SEMANAL*\n\n"
+                f"Ya realizaste una solicitud de retiro.\nPodrás solicitar otro en aproximadamente *{withdrawal_wait_text(remaining)}*.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]])
+            )
+            return
         context.user_data.clear()
         context.user_data["manual_flow"] = "withdraw_amount"
         row = get_user(update.effective_user.id)
@@ -1846,6 +2106,17 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     flow = context.user_data.get("manual_flow")
+    if flow == "deposit_tx_fixed":
+        if len(text) < 5:
+            await update.message.reply_text("⚠️ El TXID parece demasiado corto. Envíalo nuevamente.")
+            return
+        context.user_data["deposit_tx"] = text
+        context.user_data["manual_flow"] = "deposit_photo"
+        await update.message.reply_text(
+            "📸 Ahora envía una *captura del comprobante*.\n\nSi no puedes enviar captura, escribe /skip.",
+            parse_mode="Markdown"
+        )
+        return
     if flow == "deposit_amount":
         context.user_data["deposit_amount"] = None
         try:
@@ -1933,6 +2204,7 @@ async def handle_text_panel_action(update, context, action):
     elif action == "admin_user_menu": await send_user_menu(update.effective_chat.id, context, "👤 *MENÚ DE USUARIO*")
     elif action == "user_account": await show_account(fake)
     elif action == "user_invest": await show_investments(fake)
+    elif action == "user_plans": await show_plans(fake)
     elif action == "user_referrals": await show_referrals(fake, context)
     elif action == "user_history": await show_history(fake)
     elif action == "user_info": await show_info(fake)
@@ -1941,21 +2213,46 @@ async def handle_text_panel_action(update, context, action):
 async def finish_withdraw_manual(update, context, address):
     user_id = update.effective_user.id
     amount = float(context.user_data.get("withdraw_amount", 0))
+    if amount < MIN_WITHDRAWAL:
+        context.user_data["manual_flow"] = "withdraw_amount"
+        await update.message.reply_text(f"⚠️ El retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT*.", parse_mode="Markdown")
+        return
+    can_withdraw, remaining = withdrawal_wait_info(user_id)
+    if not can_withdraw:
+        context.user_data.clear()
+        await update.message.reply_text(
+            "⏳ *RETIRO SEMANAL*\n\n"
+            f"Ya realizaste una solicitud de retiro.\nPodrás solicitar otro en aproximadamente *{withdrawal_wait_text(remaining)}*.",
+            parse_mode="Markdown"
+        )
+        return
     if len(address) < 20:
         context.user_data["manual_flow"] = "withdraw_address"
         await update.message.reply_text("⚠️ La dirección parece inválida. Envíala nuevamente.")
         return
-    conn=db(); row=conn.execute("SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+    conn = db()
+    row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
     if not row or float(row["saldo"]) < amount:
-        conn.close(); await update.message.reply_text("⚠️ El saldo ya no es suficiente para esta solicitud."); return
+        conn.close()
+        await update.message.reply_text("⚠️ El saldo ya no es suficiente para esta solicitud.")
+        return
     conn.execute("UPDATE usuarios SET saldo=saldo-? WHERE telegram_id=?", (amount,user_id))
-    cur=conn.execute("INSERT INTO retiros (telegram_id,monto,direccion,estado,fecha) VALUES (?,?,?,'pendiente',?)", (user_id,amount,address,now_iso()))
-    wid=cur.lastrowid; conn.commit(); conn.close()
+    cur = conn.execute("INSERT INTO retiros (telegram_id,monto,direccion,estado,fecha) VALUES (?,?,?,'pendiente',?)", (user_id,amount,address,now_iso()))
+    wid = cur.lastrowid
+    conn.commit()
+    conn.close()
     add_movement(user_id,"retiro_pendiente",amount,f"Retiro #{wid} enviado para revisión")
-    await update.message.reply_text("⏳ *RETIRO SOLICITADO*\n\n" f"ID: `{wid}`\nMonto: *{money(amount)} USDT*\nRed: *TRC20*\nDirección: `{address}`\n\nEl administrador revisará y procesará la solicitud.", parse_mode="Markdown")
+    await update.message.reply_text(
+        "⏳ *RETIRO SOLICITADO*\n\n"
+        f"ID: `{wid}`\nMonto: *{money(amount)} USDT*\nRed: *TRC20*\nDirección: `{address}`\n\n"
+        "El administrador revisará y procesará la solicitud.", parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]])
+    )
     kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Aprobar",callback_data=f"wd_approve_{wid}"),InlineKeyboardButton("❌ Rechazar",callback_data=f"wd_reject_{wid}")]])
-    try: await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID,text=("📤 *NUEVO RETIRO PENDIENTE*\n\n" f"ID: `{wid}`\nUsuario: `{user_id}`\nMonto: *{money(amount)} USDT*\nDirección TRC20:\n`{address}`"),parse_mode="Markdown",reply_markup=kb)
-    except Exception as e: print(f"Error notificando retiro: {e}")
+    try:
+        await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID,text=("📤 *NUEVO RETIRO PENDIENTE*\n\n" f"ID: `{wid}`\nUsuario: `{user_id}`\nMonto: *{money(amount)} USDT*\nDirección TRC20:\n`{address}`"),parse_mode="Markdown",reply_markup=kb)
+    except Exception as e:
+        print(f"Error notificando retiro: {e}")
     context.user_data.clear()
 
 # =========================================================
