@@ -53,7 +53,7 @@ TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
-PROFIT_TIME = os.getenv("PROFIT_TIME", "20:25").strip()
+PROFIT_TIME = os.getenv("PROFIT_TIME", "20:30").strip()
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
