@@ -3,6 +3,10 @@ import sqlite3
 import shutil
 import uuid
 import asyncio
+from io import BytesIO
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+from openpyxl import Workbook
 from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
@@ -10,6 +14,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     InputFile,
 )
 from telegram.constants import ChatType
@@ -40,7 +45,9 @@ BACKUP_DIR = "backups"
 # Plan de prueba/configurable.
 # No representa una promesa de rentabilidad: son parámetros del sistema.
 PLAN_NAME = os.getenv("PLAN_NAME", "Plan Inicial")
-DAILY_RATE = float(os.getenv("DAILY_RATE", "0.01"))          # 1% diario
+DAILY_RATE = 0.005  # 0,5% diario
+BACKUP_TIME = os.getenv("BACKUP_TIME", "06:00").strip()
+BACKUP_TIMEZONE = os.getenv("BACKUP_TIMEZONE", "America/Sao_Paulo").strip()
 TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = float(os.getenv("MIN_INVESTMENT", "10"))
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
@@ -170,6 +177,7 @@ def init_db():
         )
     """)
 
+    cur.execute("UPDATE inversiones SET tasa_diaria = ? WHERE estado = 'activa'", (DAILY_RATE,))
     conn.commit()
     conn.close()
 
@@ -306,75 +314,41 @@ def user_balance(telegram_id):
 # =========================================================
 
 def user_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👤 Mi cuenta", callback_data="user_account"),
-            InlineKeyboardButton("📈 Inversiones", callback_data="user_invest"),
-        ],
-        [
-            InlineKeyboardButton("💰 Depositar", callback_data="user_deposit"),
-            InlineKeyboardButton("💸 Retirar", callback_data="user_withdraw"),
-        ],
-        [
-            InlineKeyboardButton("🤝 Referidos", callback_data="user_referrals"),
-            InlineKeyboardButton("📜 Historial", callback_data="user_history"),
-        ],
-        [
-            InlineKeyboardButton("ℹ️ Información", callback_data="user_info"),
-        ],
-    ])
+    return ReplyKeyboardMarkup([
+        ["👤 Mi cuenta", "📈 Inversiones"],
+        ["💰 Depositar", "💸 Retirar"],
+        ["🤝 Referidos", "📜 Historial"],
+        ["ℹ️ Información"],
+    ], resize_keyboard=True, is_persistent=True)
 
 
 def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👥 Usuarios", callback_data="admin_users"),
-            InlineKeyboardButton("📥 Depósitos", callback_data="admin_deposits"),
-        ],
-        [
-            InlineKeyboardButton("📤 Retiros", callback_data="admin_withdrawals"),
-            InlineKeyboardButton("📈 Inversiones", callback_data="admin_investments"),
-        ],
-        [
-            InlineKeyboardButton("💾 Crear respaldo", callback_data="admin_backup"),
-            InlineKeyboardButton("📊 Estado", callback_data="admin_status"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Procesar ganancias", callback_data="admin_profit"),
-        ],
-        [
-            InlineKeyboardButton("👤 Menú usuario", callback_data="admin_user_menu"),
-        ],
-    ])
+    return ReplyKeyboardMarkup([
+        ["👥 Usuarios", "📥 Depósitos"],
+        ["📤 Retiros", "📈 Inversiones"],
+        ["💾 Crear respaldo", "📊 Estado"],
+        ["⚙️ Procesar ganancias"],
+        ["👤 Menú usuario"],
+    ], resize_keyboard=True, is_persistent=True)
+
+
+def back_inline(callback="admin_home"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data=callback)]])
 
 
 async def send_user_menu(chat_id, context, text=None):
     if text is None:
-        text = (
-            "🏦 *MENÚ PRINCIPAL*\n\n"
-            "Selecciona una opción:"
-        )
-
+        text = "🏦 *MENÚ PRINCIPAL*\n\nSelecciona una opción:"
     await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=user_keyboard(),
-        parse_mode="Markdown"
+        chat_id=chat_id, text=text, reply_markup=user_keyboard(), parse_mode="Markdown"
     )
 
 
 async def send_admin_menu(chat_id, context, text=None):
     if text is None:
-        text = (
-            "👑 *PANEL DE ADMINISTRACIÓN*\n\n"
-            "Selecciona una opción:"
-        )
-
+        text = "👑 *PANEL DE ADMINISTRACIÓN*\n\nSelecciona una opción:"
     await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=admin_keyboard(),
-        parse_mode="Markdown"
+        chat_id=chat_id, text=text, reply_markup=admin_keyboard(), parse_mode="Markdown"
     )
 
 
@@ -569,44 +543,44 @@ def investment_summary(telegram_id):
 
 async def show_investments(query):
     user_id = query.from_user.id
+    row = get_user(user_id)
     rows = investment_summary(user_id)
+    conn = db()
+    total_deposited = conn.execute(
+        "SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
+        (user_id,)
+    ).fetchone()["s"]
+    active_invested = conn.execute(
+        "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'",
+        (user_id,)
+    ).fetchone()["s"]
+    daily = float(active_invested) * DAILY_RATE
+    conn.close()
 
-    if not rows:
-        texto = (
-            "📈 *INVERSIONES*\n\n"
-            "No tienes inversiones activas todavía.\n\n"
-            f"Plan: *{PLAN_NAME}*\n"
-            f"Mínimo: *{money(MIN_INVESTMENT)} USDT*\n"
-            f"Tasa configurada: *{DAILY_RATE * 100:.4g}% diaria*\n\n"
-            "Puedes depositar saldo y después seleccionar invertir."
-        )
-    else:
-        lines = ["📈 *MIS INVERSIONES*\n"]
-
+    lines = [
+        "📈 *MIS INVERSIONES*",
+        "",
+        f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
+        f"📊 Total actualmente invertido: *{money(active_invested)} USDT*",
+        f"💵 Ganancia diaria al {DAILY_RATE * 100:.4g}%: *{money(daily)} USDT*",
+        f"💳 Saldo disponible: *{money(row['saldo'] if row else 0)} USDT*",
+        "",
+    ]
+    if rows:
         for inv in rows:
             lines.append(
                 f"#{inv['id']} — {inv['plan']}\n"
                 f"Capital: {money(inv['capital'])} USDT\n"
-                f"Ganancia: {money(inv['ganancia_acumulada'])} USDT\n"
+                f"Ganancia acumulada: {money(inv['ganancia_acumulada'])} USDT\n"
                 f"Estado: {inv['estado']}\n"
             )
+    else:
+        lines.append("No tienes inversiones registradas todavía.")
+        lines.append("Puedes invertir el saldo disponible desde el botón inferior.")
 
-        texto = "\n".join(lines)
-
-    keyboard = [
-        [InlineKeyboardButton(
-            "🚀 Invertir saldo",
-            callback_data="user_new_investment"
-        )],
-        [InlineKeyboardButton("⬅️ Volver", callback_data="user_home")]
-    ]
-
-    await query.edit_message_text(
-        texto,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
+    keyboard = [[InlineKeyboardButton("🚀 Invertir saldo", callback_data="user_new_investment")],
+                [InlineKeyboardButton("⬅️ Menú principal", callback_data="user_home")]]
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def create_investment(query):
     user_id = query.from_user.id
@@ -1379,72 +1353,58 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "admin_profit":
-        processed, total = process_profits()
-
+        conn = db()
+        total_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()["s"]
+        active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        pending_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='pendiente'").fetchone()["s"]
+        conn.close()
+        daily_general = float(total_deposits) * DAILY_RATE
         await query.edit_message_text(
-            "⚙️ *GANANCIAS PROCESADAS*\n\n"
-            f"Inversiones procesadas: *{processed}*\n"
-            f"Ganancia acreditada: *{money(total)} USDT*",
+            "⚙️ *PROCESAR GANANCIAS*\n\n"
+            f"💰 Total de depósitos aprobados: *{money(total_deposits)} USDT*\n"
+            f"📈 Capital actualmente invertido: *{money(active_capital)} USDT*\n"
+            f"⏳ Depósitos pendientes: *{money(pending_deposits)} USDT*\n"
+            f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
+            f"💵 Ganancia general diaria según depósitos aprobados: *{money(daily_general)} USDT*\n\n"
+            "El botón de abajo ejecuta el cálculo de las inversiones activas desde su último cálculo.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ Procesar ahora", callback_data="admin_profit_execute")],
                 [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
             ])
         )
         return
 
-    if data == "admin_backup":
+    if data == "admin_profit_execute":
+        processed, total = process_profits()
+        conn = db()
+        total_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()["s"]
+        conn.close()
+        daily_general = float(total_deposits) * DAILY_RATE
         await query.edit_message_text(
-            "💾 *PREPARANDO RESPALDO...*",
-            parse_mode="Markdown"
+            "✅ *GANANCIAS PROCESADAS*\n\n"
+            f"💰 Capital total depositado aprobado: *{money(total_deposits)} USDT*\n"
+            f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
+            f"💵 Referencia de ganancia diaria general: *{money(daily_general)} USDT*\n"
+            f"📈 Inversiones procesadas: *{processed}*\n"
+            f"💵 Ganancia acreditada en esta ejecución: *{money(total)} USDT*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
         )
+        return
 
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        filename = (
-            f"database_backup_"
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        )
-        path = os.path.join(BACKUP_DIR, filename)
-
+    if data == "admin_backup":
+        await query.edit_message_text("💾 *PREPARANDO RESPALDO EXCEL...*", parse_mode="Markdown")
         try:
-            conn = db()
-            backup_conn = sqlite3.connect(path)
-            conn.backup(backup_conn)
-            backup_conn.close()
-            conn.close()
-
-            with open(path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=ADMIN_TELEGRAM_ID,
-                    document=InputFile(f, filename=filename),
-                    caption="💾 Respaldo de la base de datos."
-                )
-
-            await query.edit_message_text(
-                "✅ *RESPALDO CREADO CORRECTAMENTE*\n\n"
-                f"Archivo: `{filename}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "⬅️ Panel administrativo",
-                        callback_data="admin_home"
-                    )]
-                ])
-            )
-
+            await send_excel_backup(context.bot, "Respaldo solicitado por el administrador")
+            await send_admin_menu(ADMIN_TELEGRAM_ID, context, "✅ *RESPALDO CREADO Y ENVIADO*\n\nPanel administrativo:")
         except Exception as e:
-            print(f"Error backup: {e}")
             await query.edit_message_text(
                 f"❌ *ERROR AL CREAR RESPALDO*\n\n`{str(e)}`",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "⬅️ Panel",
-                        callback_data="admin_home"
-                    )]
-                ])
+                reply_markup=back_inline()
             )
         return
-
     if data == "admin_user_menu":
         await send_user_menu(
             ADMIN_TELEGRAM_ID,
@@ -1766,51 +1726,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "user_deposit":
         await query.edit_message_text(
-            "💰 *DEPÓSITO*\n\n"
-            f"Wallet USDT TRC20:\n"
-            f"`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
-            "Para enviar un depósito pulsa el botón inferior.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "📥 Iniciar depósito",
-                    callback_data="start_deposit"
-                )],
-                [InlineKeyboardButton(
-                    "⬅️ Volver",
-                    callback_data="user_home"
-                )]
-            ])
-        )
-        return
-
-    if data == "start_deposit":
-        await query.edit_message_text(
             "💰 *NUEVO DEPÓSITO*\n\n"
             f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
-            "Escribe `/depositar` para iniciar el registro del depósito.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "⬅️ Volver",
-                    callback_data="user_home"
-                )]
-            ])
+            "Escribe ahora el monto que deseas depositar.",
+            parse_mode="Markdown"
         )
+        context.user_data.clear()
+        context.user_data["manual_flow"] = "deposit_amount"
         return
 
     if data == "user_withdraw":
         await query.edit_message_text(
             "💸 *RETIRO*\n\n"
-            "Escribe `/retirar` para solicitar un retiro.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "⬅️ Volver",
-                    callback_data="user_home"
-                )]
-            ])
+            "Escribe ahora el monto que deseas retirar.",
+            parse_mode="Markdown"
         )
+        context.user_data.clear()
+        context.user_data["manual_flow"] = "withdraw_amount"
         return
 
 
@@ -1821,15 +1753,252 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not private_only(update):
         return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
 
-    # No respondemos automáticamente a textos normales para evitar
-    # mensajes inesperados durante los formularios.
-    pass
+    admin_actions = {
+        "👥 Usuarios": "admin_users", "📥 Depósitos": "admin_deposits",
+        "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
+        "💾 Crear respaldo": "admin_backup", "📊 Estado": "admin_status",
+        "⚙️ Procesar ganancias": "admin_profit", "👤 Menú usuario": "admin_user_menu",
+    }
+    user_actions = {
+        "👤 Mi cuenta": "user_account", "📈 Inversiones": "user_invest",
+        "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
+        "ℹ️ Información": "user_info",
+    }
+
+    # El teclado inferior funciona como panel fijo.
+    if is_admin(update.effective_user.id) and text in admin_actions:
+        await handle_text_panel_action(update, context, admin_actions[text])
+        return
+    if text in user_actions:
+        await handle_text_panel_action(update, context, user_actions[text])
+        return
+    if text == "💰 Depositar":
+        context.user_data.clear()
+        context.user_data["manual_flow"] = "deposit_amount"
+        await update.message.reply_text(
+            "💰 *NUEVO DEPÓSITO*\n\n"
+            f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
+            "Escribe ahora el monto que deseas depositar.",
+            parse_mode="Markdown"
+        )
+        return
+    if text == "💸 Retirar":
+        context.user_data.clear()
+        context.user_data["manual_flow"] = "withdraw_amount"
+        row = get_user(update.effective_user.id)
+        balance = float(row["saldo"]) if row else 0
+        await update.message.reply_text(
+            "💸 *SOLICITAR RETIRO*\n\n"
+            f"Saldo disponible: *{money(balance)} USDT*\n\n"
+            "Escribe ahora el monto que deseas retirar.",
+            parse_mode="Markdown"
+        )
+        return
+
+    flow = context.user_data.get("manual_flow")
+    if flow == "deposit_amount":
+        context.user_data["deposit_amount"] = None
+        try:
+            amount = float(text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("⚠️ Introduce solamente un número.")
+            return
+        if amount <= 0:
+            await update.message.reply_text("⚠️ El monto debe ser mayor que 0.")
+            return
+        context.user_data["deposit_amount"] = amount
+        context.user_data["manual_flow"] = "deposit_tx"
+        await update.message.reply_text("🔗 Ahora envía el *hash de la transacción (TXID)*.", parse_mode="Markdown")
+        return
+    if flow == "deposit_tx":
+        if len(text) < 5:
+            await update.message.reply_text("⚠️ El TXID parece demasiado corto. Envíalo nuevamente.")
+            return
+        context.user_data["deposit_tx"] = text
+        context.user_data["manual_flow"] = "deposit_photo"
+        await update.message.reply_text(
+            "📸 Ahora envía una *captura del comprobante*.\n\nSi no puedes enviar captura, escribe /skip.",
+            parse_mode="Markdown"
+        )
+        # La captura será atendida por el ConversationHandler cuando se use /depositar;
+        # para el flujo del teclado aceptamos también la siguiente foto en photo_text_handler.
+        return
+    if flow == "withdraw_amount":
+        try:
+            amount = float(text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("⚠️ Introduce un monto válido.")
+            return
+        if amount <= 0:
+            await update.message.reply_text("⚠️ El monto debe ser mayor que 0.")
+            return
+        balance = user_balance(update.effective_user.id)
+        if amount > balance:
+            await update.message.reply_text(f"⚠️ Saldo insuficiente.\nDisponible: {money(balance)} USDT")
+            return
+        context.user_data["withdraw_amount"] = amount
+        context.user_data["manual_flow"] = "withdraw_address"
+        await update.message.reply_text("📍 Envía ahora tu dirección *USDT TRC20*.", parse_mode="Markdown")
+        return
+    if flow == "withdraw_address":
+        context.user_data["manual_flow"] = None
+        # Reutilizar la lógica existente de retiro.
+        context.user_data["withdraw_amount"] = context.user_data.get("withdraw_amount", 0)
+        await finish_withdraw_manual(update, context, text)
+        return
+
+
+async def handle_text_panel_action(update, context, action):
+    # Construye un callback artificial para reutilizar las funciones existentes sin duplicarlas.
+    class FakeQuery:
+        def __init__(self, message, user):
+            self.message = message
+            self.from_user = user
+        async def edit_message_text(self, *args, **kwargs):
+            return await update.message.reply_text(*args, **kwargs)
+        async def answer(self, *args, **kwargs):
+            return None
+    fake = FakeQuery(update.message, update.effective_user)
+    if action == "admin_users":
+        conn=db(); count=conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]; total=conn.execute("SELECT COALESCE(SUM(total_depositado),0) s FROM usuarios").fetchone()["s"]; invested=conn.execute("SELECT COALESCE(SUM(invertido),0) s FROM usuarios").fetchone()["s"]; conn.close()
+        await update.message.reply_text(f"👥 *USUARIOS*\n\nUsuarios registrados: *{count}*\nTotal depositado: *{money(total)} USDT*\nCapital actualmente invertido: *{money(invested)} USDT*", parse_mode="Markdown")
+    elif action == "admin_deposits": await update.message.reply_text("📥 Usa el panel para revisar los depósitos pendientes.")
+    elif action == "admin_withdrawals": await update.message.reply_text("📤 Usa el panel para revisar los retiros pendientes.")
+    elif action == "admin_investments": await update.message.reply_text("📈 *INVERSIONES*\n\nConsulta el resumen actualizado desde el panel.", parse_mode="Markdown")
+    elif action == "admin_backup": await send_excel_backup(context.bot, "Respaldo solicitado por el administrador")
+    elif action == "admin_status": await update.message.reply_text("📊 *ESTADO*\n\nBot activo.", parse_mode="Markdown")
+    elif action == "admin_profit": await update.message.reply_text("⚙️ Pulsa el botón inline *Procesar ahora* para ejecutar las ganancias.", parse_mode="Markdown")
+    elif action == "admin_user_menu": await send_user_menu(update.effective_chat.id, context, "👤 *MENÚ DE USUARIO*")
+    elif action == "user_account": await show_account(fake)
+    elif action == "user_invest": await show_investments(fake)
+    elif action == "user_referrals": await show_referrals(fake, context)
+    elif action == "user_history": await show_history(fake)
+    elif action == "user_info": await show_info(fake)
+
+
+async def finish_withdraw_manual(update, context, address):
+    user_id = update.effective_user.id
+    amount = float(context.user_data.get("withdraw_amount", 0))
+    if len(address) < 20:
+        context.user_data["manual_flow"] = "withdraw_address"
+        await update.message.reply_text("⚠️ La dirección parece inválida. Envíala nuevamente.")
+        return
+    conn=db(); row=conn.execute("SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+    if not row or float(row["saldo"]) < amount:
+        conn.close(); await update.message.reply_text("⚠️ El saldo ya no es suficiente para esta solicitud."); return
+    conn.execute("UPDATE usuarios SET saldo=saldo-? WHERE telegram_id=?", (amount,user_id))
+    cur=conn.execute("INSERT INTO retiros (telegram_id,monto,direccion,estado,fecha) VALUES (?,?,?,'pendiente',?)", (user_id,amount,address,now_iso()))
+    wid=cur.lastrowid; conn.commit(); conn.close()
+    add_movement(user_id,"retiro_pendiente",amount,f"Retiro #{wid} enviado para revisión")
+    await update.message.reply_text("⏳ *RETIRO SOLICITADO*\n\n" f"ID: `{wid}`\nMonto: *{money(amount)} USDT*\nRed: *TRC20*\nDirección: `{address}`\n\nEl administrador revisará y procesará la solicitud.", parse_mode="Markdown")
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Aprobar",callback_data=f"wd_approve_{wid}"),InlineKeyboardButton("❌ Rechazar",callback_data=f"wd_reject_{wid}")]])
+    try: await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID,text=("📤 *NUEVO RETIRO PENDIENTE*\n\n" f"ID: `{wid}`\nUsuario: `{user_id}`\nMonto: *{money(amount)} USDT*\nDirección TRC20:\n`{address}`"),parse_mode="Markdown",reply_markup=kb)
+    except Exception as e: print(f"Error notificando retiro: {e}")
+    context.user_data.clear()
+
+# =========================================================
+# RESPALDO EXCEL AUTOMÁTICO
+# =========================================================
+
+def create_excel_backup():
+    conn = db()
+    wb = Workbook()
+    wb.remove(wb.active)
+    tables = [
+        "usuarios", "depositos", "retiros", "inversiones", "movimientos", "referidos"
+    ]
+    for table in tables:
+        ws = wb.create_sheet(table[:31])
+        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        columns = [d[1] for d in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        ws.append(columns)
+        for row in rows:
+            ws.append([row[col] for col in columns])
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for col_cells in ws.columns:
+            max_len = max(len(str(c.value or "")) for c in col_cells[:200])
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 12), 40)
+
+    ws = wb.create_sheet("resumen")
+    approved = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()["s"]
+    active = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+    daily = float(approved) * DAILY_RATE
+    ws.append(["Indicador", "Valor"])
+    ws.append(["Fecha UTC", now_iso()])
+    ws.append(["Tasa diaria", DAILY_RATE])
+    ws.append(["Total depósitos aprobados (USDT)", float(approved)])
+    ws.append(["Capital activo invertido (USDT)", float(active)])
+    ws.append(["Ganancia diaria sobre depósitos aprobados (USDT)", daily])
+    ws.freeze_panes = "A2"
+    ws.column_dimensions["A"].width = 48
+    ws.column_dimensions["B"].width = 24
+    conn.close()
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+async def send_excel_backup(bot, reason="Respaldo automático"):
+    filename = f"respaldo_inversion_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"
+    output = create_excel_backup()
+    await bot.send_document(
+        chat_id=ADMIN_TELEGRAM_ID,
+        document=InputFile(output, filename=filename),
+        caption=f"💾 {reason}\n📊 Respaldo completo en Excel (.xlsx)."
+    )
+
+
+async def automatic_backup_loop(application):
+    while True:
+        try:
+            tz = ZoneInfo(BACKUP_TIMEZONE)
+        except Exception:
+            print(f"⚠️ Zona horaria inválida: {BACKUP_TIMEZONE}. Se usará UTC.")
+            tz = timezone.utc
+        now = datetime.now(tz)
+        try:
+            hour, minute = [int(x) for x in BACKUP_TIME.split(":", 1)]
+        except Exception:
+            hour, minute = 6, 0
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = max(1, (target - now).total_seconds())
+        print(f"💾 Próximo respaldo automático: {target.isoformat()}")
+        await asyncio.sleep(wait_seconds)
+        try:
+            await send_excel_backup(application.bot, "Respaldo automático diario de las 06:00")
+            await send_admin_menu(ADMIN_TELEGRAM_ID, application, "✅ *RESPALDO AUTOMÁTICO ENVIADO*\\n\\nPanel administrativo:")
+        except Exception as e:
+            print(f"❌ Error en respaldo automático: {e}")
 
 
 # =========================================================
 # COMANDOS ADMIN
 # =========================================================
+
+async def manual_deposit_photo(update, context):
+    if not private_only(update):
+        return
+    if context.user_data.get("manual_flow") != "deposit_photo":
+        return
+    photo = update.message.photo[-1]
+    context.user_data["deposit_photo"] = photo.file_id
+    await finish_deposit(update, context)
+
+
+async def skip_manual_deposit_photo(update, context):
+    if context.user_data.get("deposit_amount") and context.user_data.get("deposit_tx") and context.user_data.get("manual_flow") == "deposit_photo":
+        context.user_data["deposit_photo"] = ""
+        await finish_deposit(update, context)
+
 
 async def backup_command(update, context):
     if not private_only(update):
@@ -2040,6 +2209,9 @@ async def main():
     )
     app.add_handler(withdraw_handler)
 
+    app.add_handler(CommandHandler("skip", skip_manual_deposit_photo, filters=filters.ChatType.PRIVATE))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, manual_deposit_photo))
+
     # -------------------------------
     # Botones
     # -------------------------------
@@ -2071,7 +2243,11 @@ async def main():
     await app.start()
     await app.updater.start_polling()
 
-    await asyncio.Event().wait()
+    backup_task = asyncio.create_task(automatic_backup_loop(app))
+    try:
+        await asyncio.Event().wait()
+    finally:
+        backup_task.cancel()
 
 
 if __name__ == "__main__":
