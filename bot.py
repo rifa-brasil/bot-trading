@@ -674,7 +674,7 @@ async def show_plans(query):
     row_buttons = []
     for amount in INVESTMENT_PLANS:
         row_buttons.append(InlineKeyboardButton(
-            f"💎 {money(amount)} USDT",
+            f"🟢₮ {money(amount)} USDT",
             callback_data=f"plan_{amount}"
         ))
         if len(row_buttons) == 2:
@@ -939,7 +939,7 @@ async def show_investments(query):
     for dep in available_plans:
         amount = float(dep["plan_monto"] or dep["monto"])
         buttons.append([InlineKeyboardButton(
-            f"🚀 Invertir Plan {money(amount)} USDT",
+            f"🚀 🟢₮ Plan {money(amount)} USDT",
             callback_data=f"invest_deposit_{dep['id']}"
         )])
     buttons.append([InlineKeyboardButton("💎 Elegir otro Plan de Inversión", callback_data="user_plans")])
@@ -1110,7 +1110,7 @@ async def automatic_profit_loop(application):
         except Exception: tz=timezone.utc
         now=datetime.now(tz)
         try: hour,minute=[int(x) for x in PROFIT_TIME.split(':',1)]
-        except Exception: hour,minute=18,30
+        except Exception: hour,minute=20,0
         target=now.replace(hour=hour,minute=minute,second=0,microsecond=0)
         if target<=now: target += timedelta(days=1)
         await asyncio.sleep(max(1,(target-now).total_seconds()))
@@ -1748,42 +1748,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_profit":
         conn = db()
-        total_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()["s"]
         active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
-        pending_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='pendiente'").fetchone()["s"]
+        active_investments = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]
         conn.close()
-        daily_general = float(total_deposits) * DAILY_RATE
+        daily_due = float(active_capital) * DAILY_RATE
         await query.edit_message_text(
-            "⚙️ *PROCESAR GANANCIAS*\n\n"
-            f"💰 Total de depósitos aprobados: *{money(total_deposits)} USDT*\n"
-            f"📈 Capital actualmente invertido: *{money(active_capital)} USDT*\n"
-            f"⏳ Depósitos pendientes: *{money(pending_deposits)} USDT*\n"
+            "💰 *PAGO DIARIO 0,5%*\n\n"
+            f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
+            f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
-            f"💵 Ganancia general diaria según depósitos aprobados: *{money(daily_general)} USDT*\n\n"
-            "El botón de abajo ejecuta el cálculo de las inversiones activas desde su último cálculo.",
+            f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
+            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *20:00*.\n"
+            "Este botón es solamente informativo; no acredita las ganancias manualmente.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Procesar ahora", callback_data="admin_profit_execute")],
                 [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
             ])
-        )
-        return
-
-    if data == "admin_profit_execute":
-        processed, total = process_profits()
-        conn = db()
-        total_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()["s"]
-        conn.close()
-        daily_general = float(total_deposits) * DAILY_RATE
-        await query.edit_message_text(
-            "✅ *GANANCIAS PROCESADAS*\n\n"
-            f"💰 Capital total depositado aprobado: *{money(total_deposits)} USDT*\n"
-            f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
-            f"💵 Referencia de ganancia diaria general: *{money(daily_general)} USDT*\n"
-            f"📈 Inversiones procesadas: *{processed}*\n"
-            f"💵 Ganancia acreditada en esta ejecución: *{money(total)} USDT*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
         )
         return
 
@@ -2495,7 +2475,7 @@ async def handle_text_panel_action(update, context, action):
             "💰 *PAGO DIARIO 0,5%*\n\n"
             f"Inversiones procesadas: *{processed}*\n"
             f"Ganancia acreditada: *{money(total)} USDT*\n\n"
-            "El proceso automático está programado de lunes a viernes a las 18:30.",
+            "El proceso automático está programado de lunes a viernes a las 20:00.",
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
         return
