@@ -1,2 +1,2 @@
-python-telegram-bot
-aiohttp
+python-telegram-bot==22.5
+aiohttp==3.12.15
