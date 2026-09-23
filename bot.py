@@ -130,7 +130,9 @@ def init_db():
             estado TEXT NOT NULL DEFAULT 'pendiente',
             fecha TEXT NOT NULL,
             fecha_revision TEXT,
-            revisado_por INTEGER
+            revisado_por INTEGER,
+            plan_monto REAL NOT NULL DEFAULT 0,
+            inversion_id INTEGER
         )
     """)
 
@@ -191,6 +193,23 @@ def init_db():
         cur.execute("ALTER TABLE usuarios ADD COLUMN ganancias_disponibles REAL NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    try:
+        cur.execute("ALTER TABLE depositos ADD COLUMN plan_monto REAL NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE depositos ADD COLUMN inversion_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    # Los depósitos aprobados antiguos que aún no están vinculados a una inversión
+    # se consideran planes disponibles por el mismo importe del depósito.
+    cur.execute("""
+        UPDATE depositos
+        SET plan_monto = monto
+        WHERE estado = 'aprobado'
+          AND COALESCE(plan_monto, 0) <= 0
+          AND inversion_id IS NULL
+    """)
     cur.execute("INSERT OR IGNORE INTO sistema(clave, valor) VALUES ('mantenimiento','0')")
     cur.execute("UPDATE inversiones SET tasa_diaria = ? WHERE estado = 'activa'", (DAILY_RATE,))
     conn.commit()
@@ -676,103 +695,161 @@ async def select_plan(query, amount):
     row = get_user(user_id)
     if not row:
         ensure_user(query.from_user)
-        row = get_user(user_id)
-    balance = float(row["saldo"]) if row else 0.0
 
     if amount not in INVESTMENT_PLANS:
         await query.answer("Plan no disponible.", show_alert=True)
         return
 
-    if balance >= amount:
+    conn = db()
+    available = conn.execute("""
+        SELECT id, monto, plan_monto
+        FROM depositos
+        WHERE telegram_id = ?
+          AND estado = 'aprobado'
+          AND COALESCE(plan_monto, 0) = ?
+          AND inversion_id IS NULL
+        ORDER BY id ASC
+        LIMIT 1
+    """, (user_id, amount)).fetchone()
+    pending = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM depositos
+        WHERE telegram_id = ?
+          AND estado = 'pendiente'
+          AND COALESCE(plan_monto, 0) = ?
+    """, (user_id, amount)).fetchone()["c"]
+    conn.close()
+
+    if available:
         await query.edit_message_text(
-            "🚀 *PLAN DISPONIBLE PARA INVERTIR*\n\n"
+            "💎 *PLAN DISPONIBLE PARA INVERTIR*\n\n"
             f"Plan seleccionado: *{money(amount)} USDT*\n"
-            f"Saldo disponible: *{money(balance)} USDT*\n"
+            f"Depósito asociado: *#{available['id']}*\n"
             f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
-            "El plan permanecerá activo hasta alcanzar el 200% del capital del plan.\n\n"
-            "Puedes invertir ahora usando exactamente el monto de este plan.",
+            "Este plan es independiente de cualquier otro depósito o inversión.\n\n"
+            "Puedes invertir ahora exactamente el monto de este plan.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"✅ Invertir {money(amount)} USDT", callback_data=f"confirm_plan_{amount}")],
+                [InlineKeyboardButton(f"✅ Invertir Plan {money(amount)} USDT", callback_data=f"invest_deposit_{available['id']}")],
                 [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
             ])
         )
-    else:
-        faltante = amount - balance
-        await query.edit_message_text(
-            "💰 *DEPÓSITO PARA ESTE PLAN*\n\n"
-            f"Plan seleccionado: *{money(amount)} USDT*\n"
-            f"Saldo disponible: *{money(balance)} USDT*\n"
-            f"Falta depositar: *{money(faltante)} USDT*\n\n"
-            "Al pulsar el botón de abajo, el monto del depósito queda fijado al valor del plan. No tendrás que escribir la cantidad.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"💰 Depositar {money(faltante)} USDT", callback_data=f"deposit_plan_{amount}")],
-                [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
-            ])
-        )
+        return
+
+    pending_text = (
+        f"\n\n⏳ Ya tienes *{pending} depósito(s) pendiente(s)* para este plan. "
+        "Cada depósito pendiente corresponde a un plan independiente."
+    ) if pending else ""
+
+    await query.edit_message_text(
+        "💰 *NUEVO PLAN DE INVERSIÓN*\n\n"
+        f"Plan seleccionado: *{money(amount)} USDT*\n"
+        f"Monto exacto que debes depositar: *{money(amount)} USDT*\n\n"
+        "⚠️ El saldo de depósitos anteriores NO se utiliza para completar este nuevo plan. "
+        "Cada vez que seleccionas un plan, su depósito se registra por el importe completo del plan."
+        + pending_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💰 Depositar {money(amount)} USDT", callback_data=f"deposit_plan_{amount}")],
+            [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+        ])
+    )
 
 
 async def confirm_plan_investment(query, amount):
+    # Compatibilidad con botones antiguos: busca un depósito disponible del importe exacto.
     user_id = query.from_user.id
     conn = db()
-    row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id = ?", (user_id,)).fetchone()
+    row = conn.execute("""
+        SELECT id FROM depositos
+        WHERE telegram_id = ? AND estado = 'aprobado'
+          AND COALESCE(plan_monto, 0) = ? AND inversion_id IS NULL
+        ORDER BY id ASC LIMIT 1
+    """, (user_id, amount)).fetchone()
+    conn.close()
     if not row:
-        conn.close()
-        await query.answer("Cuenta no encontrada.", show_alert=True)
+        await query.answer("No hay un depósito aprobado disponible para este plan.", show_alert=True)
         return
-    balance = float(row["saldo"])
+    await invest_available_plan(query, row["id"])
+
+
+async def invest_available_plan(query, deposit_id):
+    user_id = query.from_user.id
+    conn = db()
+    row = conn.execute("""
+        SELECT id, monto, plan_monto, inversion_id
+        FROM depositos
+        WHERE id = ? AND telegram_id = ? AND estado = 'aprobado'
+    """, (deposit_id, user_id)).fetchone()
+
+    if not row or row["inversion_id"] is not None:
+        conn.close()
+        await query.answer("Este plan ya fue invertido o no está disponible.", show_alert=True)
+        return
+
+    amount = float(row["plan_monto"] or row["monto"])
+    balance_row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id = ?", (user_id,)).fetchone()
+    balance = float(balance_row["saldo"]) if balance_row else 0.0
     if balance < amount:
         conn.close()
-        await query.answer("El saldo disponible ya no alcanza para este plan.", show_alert=True)
+        await query.answer(
+            f"El saldo disponible ({money(balance)} USDT) no alcanza para invertir este plan de {money(amount)} USDT.",
+            show_alert=True
+        )
         return
 
     now = now_iso()
-    conn.execute("""
-        UPDATE usuarios SET saldo = saldo - ?, invertido = invertido + ?
-        WHERE telegram_id = ?
-    """, (amount, amount, user_id))
-    conn.execute("""
+    cur = conn.execute("""
         INSERT INTO inversiones (
             telegram_id, plan, capital, ganancia_acumulada,
             tasa_diaria, multiplicador_objetivo, estado,
             fecha_inicio, ultimo_calculo
         ) VALUES (?, ?, ?, 0, ?, 2.0, 'activa', ?, ?)
     """, (user_id, f"Plan {money(amount)} USDT", amount, DAILY_RATE, now, now))
+    investment_id = cur.lastrowid
+
+    conn.execute("""
+        UPDATE usuarios
+        SET saldo = saldo - ?, invertido = invertido + ?
+        WHERE telegram_id = ?
+    """, (amount, amount, user_id))
+    conn.execute("UPDATE depositos SET inversion_id = ? WHERE id = ?", (investment_id, deposit_id))
     conn.commit()
     conn.close()
 
-    add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT")
+    add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT (depósito #{deposit_id})")
 
     await query.edit_message_text(
         "✅ *INVERSIÓN CREADA*\n\n"
         f"Plan: *{money(amount)} USDT*\n"
+        f"Depósito utilizado: *#{deposit_id}*\n"
         f"Capital invertido: *{money(amount)} USDT*\n"
-        f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
-        "Objetivo del plan: alcanzar el 200% del capital total del plan.\n\n"
-        "Tu saldo disponible se actualizó correctamente.",
+        f"Ganancia inicial: *0.00 USDT*\n"
+        f"Ganancia diaria al {DAILY_RATE * 100:.1f}%: *{money(amount * DAILY_RATE)} USDT*\n\n"
+        "Este plan es independiente de tus demás planes y depósitos.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_invest")],
+            [InlineKeyboardButton("💎 Elegir otro Plan", callback_data="user_plans")],
             [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
     )
 
 
 async def start_plan_deposit(query, context, plan_amount):
-    row = get_user(query.from_user.id)
-    balance = float(row["saldo"]) if row else 0.0
-    deposit_amount = max(0.0, float(plan_amount) - balance)
     context.user_data.clear()
     context.user_data["manual_flow"] = "deposit_tx_fixed"
-    context.user_data["deposit_amount"] = deposit_amount
+    # IMPORTANTE: cada nuevo plan exige el 100% del importe del plan.
+    # Nunca se resta saldo de depósitos anteriores.
+    context.user_data["deposit_amount"] = float(plan_amount)
+    context.user_data["deposit_plan_amount"] = float(plan_amount)
     await query.edit_message_text(
         "💰 *DEPÓSITO DEL PLAN*\n\n"
         f"Plan seleccionado: *{money(plan_amount)} USDT*\n"
-        f"Saldo disponible actual: *{money(balance)} USDT*\n"
-        f"Monto exacto a depositar: *{money(deposit_amount)} USDT*\n\n"
+        f"Monto exacto a depositar: *{money(plan_amount)} USDT*\n\n"
+        "Este depósito es independiente de cualquier depósito anterior. No se descuenta ni se completa con tu saldo anterior.\n\n"
         f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
-        "Realiza el depósito por el monto indicado y después envía aquí el TXID. No necesitas escribir el monto.",
+        "Realiza el depósito por el monto indicado y después envía aquí el TXID. No necesitas escribir la cantidad.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
@@ -803,24 +880,40 @@ async def show_investments(query):
         ensure_user(query.from_user)
         row = get_user(user_id)
     rows = investment_summary(user_id)
+
     conn = db()
     total_deposited = conn.execute("SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'", (user_id,)).fetchone()["s"]
     active_invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'", (user_id,)).fetchone()["s"]
     total_gains = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?", (user_id,)).fetchone()["s"]
+    available_plans = conn.execute("""
+        SELECT id, plan_monto, monto
+        FROM depositos
+        WHERE telegram_id=? AND estado='aprobado'
+          AND COALESCE(plan_monto, 0) > 0
+          AND inversion_id IS NULL
+        ORDER BY id ASC
+    """, (user_id,)).fetchall()
     conn.close()
+
     daily = float(active_invested) * DAILY_RATE
     balance = float(row["saldo"]) if row else 0.0
-    pct = (float(total_gains) / float(total_deposited) * 100) if float(total_deposited) > 0 else 0.0
 
     lines = [
         "📈 *MIS INVERSIONES*", "",
         f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
-        f"💳 Saldo disponible para invertir: *{money(balance)} USDT*",
+        f"💳 Saldo disponible: *{money(balance)} USDT*",
         f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*",
         f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
-        f"📈 Rendimiento de la cuenta: *{pct:.2f}%*",
         f"💵 Ganancia diaria estimada al {DAILY_RATE * 100:.1f}%: *{money(daily)} USDT*", ""
     ]
+
+    if available_plans:
+        lines += ["💎 *PLANES DISPONIBLES PARA INVERTIR*", ""]
+        for dep in available_plans:
+            amount = float(dep["plan_monto"] or dep["monto"])
+            lines.append(f"• Depósito #{dep['id']} — Plan {money(amount)} USDT")
+        lines.append("")
+
     if rows:
         for inv in rows:
             capital = float(inv["capital"])
@@ -835,9 +928,15 @@ async def show_investments(query):
                 f"Estado: {inv['estado']}\n"
             )
     else:
-        lines.append("No tienes inversiones registradas todavía.")
+        lines.append("No tienes inversiones activas o históricas registradas todavía.")
 
     buttons = []
+    for dep in available_plans:
+        amount = float(dep["plan_monto"] or dep["monto"])
+        buttons.append([InlineKeyboardButton(
+            f"🚀 Invertir Plan {money(amount)} USDT",
+            callback_data=f"invest_deposit_{dep['id']}"
+        )])
     buttons.append([InlineKeyboardButton("💎 Elegir otro Plan de Inversión", callback_data="user_plans")])
     buttons.append([InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")])
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
@@ -1105,6 +1204,7 @@ async def skip_deposit_photo(update, context):
 async def finish_deposit(update, context):
     user_id = update.effective_user.id
     amount = float(context.user_data.get("deposit_amount", 0))
+    plan_amount = float(context.user_data.get("deposit_plan_amount", 0) or 0)
     tx = context.user_data.get("deposit_tx", "")
     photo_id = context.user_data.get("deposit_photo", "")
 
@@ -1112,15 +1212,16 @@ async def finish_deposit(update, context):
     cur = conn.execute("""
         INSERT INTO depositos (
             telegram_id, monto, tx_hash, foto_file_id,
-            estado, fecha
+            estado, fecha, plan_monto
         )
-        VALUES (?, ?, ?, ?, 'pendiente', ?)
+        VALUES (?, ?, ?, ?, 'pendiente', ?, ?)
     """, (
         user_id,
         amount,
         tx,
         photo_id,
-        now_iso()
+        now_iso(),
+        plan_amount
     ))
     deposit_id = cur.lastrowid
     conn.commit()
@@ -1748,9 +1849,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Depósito #{deposit_id} aprobado"
         )
 
+        plan_amount = float(row["plan_monto"] or 0)
+        plan_line = f"\n💎 Plan disponible para invertir: *{money(plan_amount)} USDT*" if plan_amount > 0 else ""
+
         await query.edit_message_text(
             f"✅ *DEPÓSITO #{deposit_id} APROBADO*\n\n"
-            f"Monto acreditado: *{money(amount)} USDT*",
+            f"Monto acreditado: *{money(amount)} USDT*" + plan_line,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -1765,8 +1869,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=uid,
                 text=(
                     "✅ *DEPÓSITO APROBADO*\n\n"
-                    f"Tu depósito de *{money(amount)} USDT* "
-                    "fue aprobado y acreditado a tu saldo."
+                    f"Tu depósito de *{money(amount)} USDT* fue aprobado y acreditado a tu saldo."
+                    + (f"\n\n💎 Tu Plan {money(plan_amount)} USDT ya está disponible para invertir desde *📈 Inversiones*." if plan_amount > 0 else "")
                 ),
                 parse_mode="Markdown"
             )
@@ -2015,8 +2119,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_plan_deposit(query, context, amount)
         return
 
+    if data.startswith("invest_deposit_"):
+        try:
+            deposit_id = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            await query.answer("Plan inválido.", show_alert=True)
+            return
+        await invest_available_plan(query, deposit_id)
+        return
+
     if data == "user_new_investment":
-        await create_investment(query)
+        await show_plans(query)
         return
 
     if data == "user_confirm_invest":
