@@ -53,7 +53,7 @@ TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
-PROFIT_TIME = os.getenv("PROFIT_TIME", "16:15").strip()
+PROFIT_TIME = os.getenv("PROFIT_TIME", "18:30").strip()
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
@@ -524,8 +524,6 @@ async def show_account(query):
     total_depositado = max(float(row["total_depositado"] or 0), float(total_depositado_db or 0))
     total_retirado = max(float(row["total_retirado"] or 0), float(total_retirado_db or 0))
     ganancias = float(row["ganancias"] or 0)
-    porcentaje = (ganancias / total_depositado * 100) if total_depositado > 0 else 0.0
-
     texto = (
         "👤 *MI CUENTA*\n\n"
         f"🆔 ID: `{row['telegram_id']}`\n"
@@ -535,7 +533,7 @@ async def show_account(query):
         f"📈 Capital invertido: *{money(row['invertido'])} USDT*\n"
         f"💵 Ganancias acumuladas: *{money(ganancias)} USDT*\n"
         f"💳 Ganancias disponibles para retirar: *{money(row['ganancias_disponibles'] or 0)} USDT*\n"
-        f"📊 Ganancia de la cuenta: *{porcentaje:.2f}%*\n"
+        
         f"📤 Total retirado: *{money(total_retirado)} USDT*\n\n"
         "El saldo disponible es el dinero acreditado que todavía no está invertido y puede utilizarse según los planes disponibles."
     )
@@ -625,7 +623,7 @@ async def show_info(query):
         f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n"
         f"💸 Retiro mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
         "🗓️ Frecuencia de retiros: *1 solicitud cada 7 días*\n"
-        "📅 Ganancias generadas: *lunes a viernes a las 16:15*\n\n"
+        "📅 Ganancias generadas: *lunes a viernes a las 18:30*\n\n"
         "🌐 Red de depósitos y retiros: *TRC20*\n"
         "📥 Los depósitos son revisados manualmente por el administrador.\n"
         "📤 Los retiros también son revisados manualmente."
@@ -667,8 +665,8 @@ async def show_plans(query):
     texto = (
         "💎 *PLANES DE INVERSIÓN*\n\n"
         f"Saldo disponible: *{money(balance)} USDT*\n"
-        f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
-        "Selecciona el plan que deseas contratar."
+        f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n\n"
+        "Selecciona el plan que deseas contratar. Cada vez que eliges un plan se crea una inversión independiente; tus planes anteriores no se reutilizan ni bloquean la compra de otro plan."
     )
     await query.edit_message_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -829,12 +827,10 @@ async def show_investments(query):
             gain = float(inv["ganancia_acumulada"])
             target_profit = capital
             progress = min(100.0, gain / target_profit * 100) if target_profit else 0.0
-            total_value = capital + gain
             lines.append(
                 f"💎 *{inv['plan']}*\n"
                 f"Capital: {money(capital)} USDT\n"
                 f"Ganancia: {money(gain)} USDT\n"
-                f"Total generado: {money(total_value)} USDT\n"
                 f"Progreso hacia el 200%: {progress:.2f}%\n"
                 f"Estado: {inv['estado']}\n"
             )
@@ -842,9 +838,7 @@ async def show_investments(query):
         lines.append("No tienes inversiones registradas todavía.")
 
     buttons = []
-    if balance >= MIN_INVESTMENT:
-        buttons.append([InlineKeyboardButton("🚀 Invertir saldo disponible", callback_data="user_new_investment")])
-    buttons.append([InlineKeyboardButton("💎 Planes de Inversión", callback_data="user_plans")])
+    buttons.append([InlineKeyboardButton("💎 Elegir otro Plan de Inversión", callback_data="user_plans")])
     buttons.append([InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")])
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -1012,7 +1006,7 @@ async def automatic_profit_loop(application):
         except Exception: tz=timezone.utc
         now=datetime.now(tz)
         try: hour,minute=[int(x) for x in PROFIT_TIME.split(':',1)]
-        except Exception: hour,minute=16,15
+        except Exception: hour,minute=18,30
         target=now.replace(hour=hour,minute=minute,second=0,microsecond=0)
         if target<=now: target += timedelta(days=1)
         await asyncio.sleep(max(1,(target-now).total_seconds()))
@@ -2383,7 +2377,7 @@ async def handle_text_panel_action(update, context, action):
             "💰 *PAGO DIARIO 0,5%*\n\n"
             f"Inversiones procesadas: *{processed}*\n"
             f"Ganancia acreditada: *{money(total)} USDT*\n\n"
-            "El proceso automático está programado de lunes a viernes a las 16:15.",
+            "El proceso automático está programado de lunes a viernes a las 18:30.",
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
         return
