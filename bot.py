@@ -53,7 +53,7 @@ TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
-PROFIT_TIME = os.getenv("PROFIT_TIME", "18:30").strip()
+PROFIT_TIME = os.getenv("PROFIT_TIME", "20:00").strip()
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
@@ -642,7 +642,7 @@ async def show_info(query):
         f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n"
         f"💸 Retiro mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
         "🗓️ Frecuencia de retiros: *1 solicitud cada 7 días*\n"
-        "📅 Ganancias generadas: *lunes a viernes a las 18:30*\n\n"
+        "📅 Ganancias generadas: *lunes a viernes a las 20:00*\n\n"
         "🌐 Red de depósitos y retiros: *TRC20*\n"
         "📥 Los depósitos son revisados manualmente por el administrador.\n"
         "📤 Los retiros también son revisados manualmente."
@@ -670,11 +670,18 @@ async def show_plans(query):
     balance = float(row["saldo"]) if row else 0.0
 
     buttons = []
+    # Mostrar los planes en una cuadrícula de 2 columnas para aprovechar mejor el espacio.
+    row_buttons = []
     for amount in INVESTMENT_PLANS:
-        buttons.append([InlineKeyboardButton(
-            f"💎 Plan {money(amount)} USDT",
+        row_buttons.append(InlineKeyboardButton(
+            f"💎 {money(amount)} USDT",
             callback_data=f"plan_{amount}"
-        )])
+        ))
+        if len(row_buttons) == 2:
+            buttons.append(row_buttons)
+            row_buttons = []
+    if row_buttons:
+        buttons.append(row_buttons)
 
     buttons.append([
         InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"),
@@ -878,24 +885,13 @@ async def show_investments(query):
     daily = float(active_invested) * DAILY_RATE
     balance = float(row["saldo"]) if row else 0.0
 
-    lines = [
-        "📈 *MIS INVERSIONES*", "",
-        f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
-        f"💳 Saldo disponible: *{money(balance)} USDT*",
-        f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*",
-        f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
-        f"💵 Ganancia diaria estimada al {DAILY_RATE * 100:.1f}%: *{money(daily)} USDT*", ""
-    ]
+    # Primero se muestran los planes activos; después, el resumen de la cuenta.
+    lines = ["📈 *MIS INVERSIONES*", ""]
 
-    if available_plans:
-        lines += ["💎 *PLANES DISPONIBLES PARA INVERTIR*", ""]
-        for dep in available_plans:
-            amount = float(dep["plan_monto"] or dep["monto"])
-            lines.append(f"• Depósito #{dep['id']} — Plan {money(amount)} USDT")
-        lines.append("")
-
-    if rows:
-        for inv in rows:
+    active_rows = [inv for inv in rows if inv["estado"] == "activa"]
+    if active_rows:
+        lines += ["🔥 *PLANES ACTIVOS*", ""]
+        for inv in active_rows:
             capital = float(inv["capital"])
             gain = float(inv["ganancia_acumulada"])
             target_profit = capital
@@ -905,12 +901,41 @@ async def show_investments(query):
                 f"Capital: {money(capital)} USDT\n"
                 f"Ganancia: {money(gain)} USDT\n"
                 f"Progreso hacia el 200%: {progress:.2f}%\n"
-                f"Estado: {inv['estado']}\n"
+                f"Estado: 🟢 Activa\n"
             )
     else:
-        lines.append("No tienes inversiones activas o históricas registradas todavía.")
+        lines += ["🔥 *PLANES ACTIVOS*", "", "No tienes planes activos actualmente.", ""]
+
+    lines += [
+        "📊 *RESUMEN DE LA CUENTA*", "",
+        f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
+        f"💳 Saldo disponible: *{money(balance)} USDT*",
+        f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*",
+        f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
+        f"💵 Ganancia diaria estimada al {DAILY_RATE * 100:.1f}%: *{money(daily)} USDT*",
+        ""
+    ]
+
+    if available_plans:
+        lines += ["💎 *PLANES DISPONIBLES PARA INVERTIR*", ""]
+        for dep in available_plans:
+            amount = float(dep["plan_monto"] or dep["monto"])
+            lines.append(f"• Depósito #{dep['id']} — Plan {money(amount)} USDT")
+        lines.append("")
+
+    completed_rows = [inv for inv in rows if inv["estado"] != "activa"]
+    if completed_rows:
+        lines += ["📚 *HISTORIAL DE PLANES COMPLETADOS*", ""]
+        for inv in completed_rows:
+            capital = float(inv["capital"])
+            gain = float(inv["ganancia_acumulada"])
+            lines.append(
+                f"• {inv['plan']} — Capital: {money(capital)} USDT — "
+                f"Ganancia: {money(gain)} USDT — Estado: {inv['estado']}"
+            )
 
     buttons = []
+    # Cada depósito aprobado que todavía no se ha invertido tiene su propio botón.
     for dep in available_plans:
         amount = float(dep["plan_monto"] or dep["monto"])
         buttons.append([InlineKeyboardButton(
