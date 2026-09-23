@@ -2594,17 +2594,42 @@ def create_excel_backup():
     conn.close(); output=BytesIO(); wb.save(output); output.seek(0); return output
 
 async def send_excel_backup(bot, reason="Respaldo automático"):
-    filename=f"respaldo_inversion_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"; output=create_excel_backup()
-    await bot.send_document(chat_id=ADMIN_TELEGRAM_ID, document=InputFile(output,filename=filename), caption=f"💾 {reason}\n📊 Respaldo Excel completo.")
+    filename = f"respaldo_inversion_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.xlsx"
+    output = create_excel_backup()
+    await bot.send_document(
+        chat_id=ADMIN_TELEGRAM_ID,
+        document=InputFile(output, filename=filename),
+        caption=f"💾 {reason}\n📊 Respaldo Excel completo (.xlsx)."
+    )
 
 async def send_db_backup(bot, reason="Respaldo de base de datos"):
-    os.makedirs(BACKUP_DIR,exist_ok=True); filename=f"database_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.db"; path=os.path.join(BACKUP_DIR,filename)
-    conn=db(); backup_conn=sqlite3.connect(path); conn.backup(backup_conn); backup_conn.close(); conn.close()
-    with open(path,"rb") as f: await bot.send_document(chat_id=ADMIN_TELEGRAM_ID,document=InputFile(f,filename=filename),caption=f"💾 {reason}")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"database_backup_{stamp}.db"
+    path = os.path.join(BACKUP_DIR, filename)
+    conn = db()
+    try:
+        backup_conn = sqlite3.connect(path)
+        conn.backup(backup_conn)
+        backup_conn.close()
+    finally:
+        conn.close()
+    # Leer el archivo completo a memoria antes de enviarlo para que Telegram
+    # reciba una copia independiente y el archivo .db quede realmente adjunto.
+    with open(path, "rb") as f:
+        data = f.read()
+    stream = BytesIO(data)
+    stream.name = filename
+    await bot.send_document(
+        chat_id=ADMIN_TELEGRAM_ID,
+        document=InputFile(stream, filename=filename),
+        caption=f"💾 {reason}\n🗄️ Base SQLite completa (.db) para restauración."
+    )
 
 async def send_full_backup(bot, reason="Respaldo solicitado"):
-    await send_db_backup(bot,reason+" — base SQLite .db")
-    await send_excel_backup(bot,reason+" — Excel .xlsx")
+    # SIEMPRE se envían DOS archivos independientes: primero .db y luego .xlsx.
+    await send_db_backup(bot, reason + " — base SQLite .db")
+    await send_excel_backup(bot, reason + " — Excel .xlsx")
 
 
 async def automatic_backup_loop(application):
