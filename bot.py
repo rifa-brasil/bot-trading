@@ -1758,7 +1758,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
             f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
-            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *20:10*.\n"
+            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *20:15*.\n"
             "Este botón es solamente informativo; no acredita las ganancias manualmente.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
