@@ -49,7 +49,9 @@ DAILY_RATE = 0.005  # 0,5% diario
 BACKUP_TIME = os.getenv("BACKUP_TIME", "06:00").strip()
 BACKUP_TIMEZONE = os.getenv("BACKUP_TIMEZONE", "America/Sao_Paulo").strip()
 TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
-MIN_INVESTMENT = float(os.getenv("MIN_INVESTMENT", "10"))
+MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
+MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
+WITHDRAWAL_INTERVAL_DAYS = 7
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
 # Estados de conversación
@@ -301,6 +303,33 @@ def add_movement(telegram_id, tipo, amount, description):
     conn.commit()
     conn.close()
 
+
+def withdrawal_wait_info(telegram_id):
+    """Devuelve (puede_retirar, restante_segundos) según el último retiro solicitado."""
+    conn = db()
+    row = conn.execute(
+        "SELECT fecha FROM retiros WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
+        (telegram_id,)
+    ).fetchone()
+    conn.close()
+    if not row or not row["fecha"]:
+        return True, 0
+    try:
+        last = datetime.fromisoformat(row["fecha"])
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+    except Exception:
+        return True, 0
+    elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+    remaining = max(0, WITHDRAWAL_INTERVAL_DAYS * 86400 - elapsed)
+    return remaining <= 0, int(remaining)
+
+def withdrawal_wait_text(seconds):
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    if days > 0:
+        return f"{days} día(s) y {hours} hora(s)"
+    return f"{hours} hora(s)"
 
 def user_balance(telegram_id):
     row = get_user(telegram_id)
@@ -979,7 +1008,9 @@ async def start_withdraw(update, context):
 
     await update.message.reply_text(
         "💸 *SOLICITAR RETIRO*\n\n"
-        f"Saldo disponible: *{money(balance)} USDT*\n\n"
+        f"Saldo disponible: *{money(balance)} USDT*\n"
+        f"Mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
+        "Frecuencia: *1 retiro cada 7 días*\n\n"
         "Introduce el monto que deseas retirar.",
         parse_mode="Markdown"
     )
@@ -998,8 +1029,21 @@ async def receive_withdraw_amount(update, context):
         await update.message.reply_text("⚠️ Introduce un monto válido.")
         return WITHDRAW_AMOUNT
 
-    if amount <= 0:
-        await update.message.reply_text("⚠️ El monto debe ser mayor que 0.")
+    if amount < MIN_WITHDRAWAL:
+        await update.message.reply_text(
+            f"⚠️ El retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT*.",
+            parse_mode="Markdown"
+        )
+        return WITHDRAW_AMOUNT
+
+    can_withdraw, remaining = withdrawal_wait_info(update.effective_user.id)
+    if not can_withdraw:
+        await update.message.reply_text(
+            "⏳ *RETIRO SEMANAL*\n\n"
+            f"Ya realizaste una solicitud de retiro.\n"
+            f"Podrás solicitar otro retiro en aproximadamente *{withdrawal_wait_text(remaining)}*.",
+            parse_mode="Markdown"
+        )
         return WITHDRAW_AMOUNT
 
     balance = user_balance(update.effective_user.id)
@@ -1793,7 +1837,9 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balance = float(row["saldo"]) if row else 0
         await update.message.reply_text(
             "💸 *SOLICITAR RETIRO*\n\n"
-            f"Saldo disponible: *{money(balance)} USDT*\n\n"
+            f"Saldo disponible: *{money(balance)} USDT*\n"
+            f"Mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
+            "Frecuencia: *1 retiro cada 7 días*\n\n"
             "Escribe ahora el monto que deseas retirar.",
             parse_mode="Markdown"
         )
@@ -1833,8 +1879,20 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("⚠️ Introduce un monto válido.")
             return
-        if amount <= 0:
-            await update.message.reply_text("⚠️ El monto debe ser mayor que 0.")
+        if amount < MIN_WITHDRAWAL:
+            await update.message.reply_text(
+                f"⚠️ El retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT*.",
+                parse_mode="Markdown"
+            )
+            return
+        can_withdraw, remaining = withdrawal_wait_info(update.effective_user.id)
+        if not can_withdraw:
+            await update.message.reply_text(
+                "⏳ *RETIRO SEMANAL*\n\n"
+                f"Ya realizaste una solicitud de retiro.\n"
+                f"Podrás solicitar otro retiro en aproximadamente *{withdrawal_wait_text(remaining)}*.",
+                parse_mode="Markdown"
+            )
             return
         balance = user_balance(update.effective_user.id)
         if amount > balance:
