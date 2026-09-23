@@ -365,12 +365,13 @@ def user_keyboard():
 
 
 def admin_keyboard():
+    # El administrador SOLO recibe el panel administrativo.
     return ReplyKeyboardMarkup([
         ["👥 Usuarios", "📥 Depósitos"],
         ["📤 Retiros", "📈 Inversiones"],
         ["💾 Crear respaldo", "📊 Estado"],
         ["⚙️ Procesar ganancias"],
-        ["👤 Menú usuario"],
+        ["📢 Enviar mensaje"],
     ], resize_keyboard=True, is_persistent=True)
 
 
@@ -415,7 +416,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.id,
             context,
             "👑 *PANEL DE ADMINISTRACIÓN*\n\n"
-            "También puedes entrar al menú normal con el botón correspondiente."
+            "Este usuario tiene acceso exclusivamente al panel administrativo."
         )
     else:
         await send_user_menu(
@@ -1459,152 +1460,155 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_users":
         conn = db()
-        count = conn.execute(
-            "SELECT COUNT(*) AS c FROM usuarios"
-        ).fetchone()["c"]
-        total = conn.execute(
-            "SELECT COALESCE(SUM(total_depositado), 0) AS s FROM usuarios"
-        ).fetchone()["s"]
-        invested = conn.execute(
-            "SELECT COALESCE(SUM(invertido), 0) AS s FROM usuarios"
-        ).fetchone()["s"]
+        count = conn.execute("SELECT COUNT(*) AS c FROM usuarios").fetchone()["c"]
+        with_deposit = conn.execute("SELECT COUNT(*) AS c FROM usuarios WHERE total_depositado > 0").fetchone()["c"]
+        total = conn.execute("SELECT COALESCE(SUM(total_depositado), 0) AS s FROM usuarios").fetchone()["s"]
+        balance = conn.execute("SELECT COALESCE(SUM(saldo), 0) AS s FROM usuarios").fetchone()["s"]
+        invested = conn.execute("SELECT COALESCE(SUM(invertido), 0) AS s FROM usuarios").fetchone()["s"]
+        earnings = conn.execute("SELECT COALESCE(SUM(ganancias), 0) AS s FROM usuarios").fetchone()["s"]
+        withdrawn = conn.execute("SELECT COALESCE(SUM(total_retirado), 0) AS s FROM usuarios").fetchone()["s"]
         conn.close()
 
+        text = (
+            "👥 *RESUMEN DE USUARIOS*\n\n"
+            f"👤 Usuarios registrados: *{count}*\n"
+            f"💰 Usuarios que han depositado: *{with_deposit}*\n\n"
+            f"📥 Total depositado: *{money(total)} USDT*\n"
+            f"💵 Saldo disponible de usuarios: *{money(balance)} USDT*\n"
+            f"📈 Capital actualmente invertido: *{money(invested)} USDT*\n"
+            f"🎁 Ganancias acumuladas: *{money(earnings)} USDT*\n"
+            f"💸 Total retirado: *{money(withdrawn)} USDT*"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_inline())
+        return
+
+    if data == "admin_deposits":
+        conn = db()
+        total_count = conn.execute("SELECT COUNT(*) AS c FROM depositos").fetchone()["c"]
+        approved_count, approved_amount = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()
+        pending_count, pending_amount = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM depositos WHERE estado='pendiente'").fetchone()
+        rejected_count, rejected_amount = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM depositos WHERE estado='rechazado'").fetchone()
+        conn.close()
+        text = (
+            "📥 *RESUMEN DE DEPÓSITOS*\n\n"
+            f"📊 Total de solicitudes: *{total_count}*\n\n"
+            f"✅ Aprobados: *{approved_count}* — *{money(approved_amount)} USDT*\n"
+            f"⏳ Pendientes: *{pending_count}* — *{money(pending_amount)} USDT*\n"
+            f"❌ Rechazados: *{rejected_count}* — *{money(rejected_amount)} USDT*\n\n"
+            "Pulsa el botón de abajo para revisar los depósitos pendientes."
+        )
         await query.edit_message_text(
-            "👥 *USUARIOS*\n\n"
-            f"Usuarios registrados: *{count}*\n"
-            f"Total depositado: *{money(total)} USDT*\n"
-            f"Capital actualmente invertido: *{money(invested)} USDT*",
-            parse_mode="Markdown",
+            text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔎 Ver pendientes", callback_data="admin_deposits_pending")],
                 [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
             ])
         )
         return
 
-    if data == "admin_deposits":
+    if data == "admin_deposits_pending":
         conn = db()
-        rows = conn.execute("""
-            SELECT *
-            FROM depositos
-            WHERE estado = 'pendiente'
-            ORDER BY id DESC
-            LIMIT 10
-        """).fetchall()
+        rows = conn.execute("SELECT * FROM depositos WHERE estado='pendiente' ORDER BY id DESC LIMIT 20").fetchall()
         conn.close()
-
         if not rows:
             text = "📥 *DEPÓSITOS PENDIENTES*\n\nNo hay depósitos pendientes."
         else:
             text = "📥 *DEPÓSITOS PENDIENTES*\n\n"
             for r in rows:
-                text += (
-                    f"#{r['id']} — Usuario `{r['telegram_id']}`\n"
-                    f"Monto: *{money(r['monto'])} USDT*\n"
-                    f"TX: `{r['tx_hash']}`\n\n"
-                )
-
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
-            ])
-        )
+                text += (f"#{r['id']} — Usuario `{r['telegram_id']}`\n"
+                         f"Monto: *{money(r['monto'])} USDT*\n"
+                         f"TX: `{r['tx_hash']}`\n\n")
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Depósitos", callback_data="admin_deposits")],[InlineKeyboardButton("🏠 Panel", callback_data="admin_home")]]))
         return
 
     if data == "admin_withdrawals":
         conn = db()
-        rows = conn.execute("""
-            SELECT *
-            FROM retiros
-            WHERE estado = 'pendiente'
-            ORDER BY id DESC
-            LIMIT 10
-        """).fetchall()
+        total_count = conn.execute("SELECT COUNT(*) AS c FROM retiros").fetchone()["c"]
+        pending_count, pending_amount = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM retiros WHERE estado='pendiente'").fetchone()
+        approved_count, approved_amount = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM retiros WHERE estado='aprobado'").fetchone()
+        rejected_count, rejected_amount = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM retiros WHERE estado='rechazado'").fetchone()
         conn.close()
+        text = (
+            "📤 *RESUMEN DE RETIROS*\n\n"
+            f"📊 Total de solicitudes: *{total_count}*\n\n"
+            f"⏳ Pendientes: *{pending_count}* — *{money(pending_amount)} USDT*\n"
+            f"✅ Aprobados: *{approved_count}* — *{money(approved_amount)} USDT*\n"
+            f"❌ Rechazados: *{rejected_count}* — *{money(rejected_amount)} USDT*\n\n"
+            f"💸 Total retirado aprobado: *{money(approved_amount)} USDT*"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Ver pendientes", callback_data="admin_withdrawals_pending")],[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]]))
+        return
 
+    if data == "admin_withdrawals_pending":
+        conn = db()
+        rows = conn.execute("SELECT * FROM retiros WHERE estado='pendiente' ORDER BY id DESC LIMIT 20").fetchall()
+        conn.close()
         if not rows:
             text = "📤 *RETIROS PENDIENTES*\n\nNo hay retiros pendientes."
         else:
             text = "📤 *RETIROS PENDIENTES*\n\n"
             for r in rows:
-                text += (
-                    f"#{r['id']} — Usuario `{r['telegram_id']}`\n"
-                    f"Monto: *{money(r['monto'])} USDT*\n"
-                    f"Dirección: `{r['direccion']}`\n\n"
-                )
-
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
-            ])
-        )
+                text += (f"#{r['id']} — Usuario `{r['telegram_id']}`\n"
+                         f"Monto: *{money(r['monto'])} USDT*\n"
+                         f"Dirección: `{r['direccion']}`\n\n")
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retiros", callback_data="admin_withdrawals")],[InlineKeyboardButton("🏠 Panel", callback_data="admin_home")]]))
         return
 
     if data == "admin_investments":
         conn = db()
-        active = conn.execute("""
-            SELECT COUNT(*) AS c
-            FROM inversiones
-            WHERE estado = 'activa'
-        """).fetchone()["c"]
-
-        capital = conn.execute("""
-            SELECT COALESCE(SUM(capital), 0) AS s
-            FROM inversiones
-            WHERE estado = 'activa'
-        """).fetchone()["s"]
-
-        profit = conn.execute("""
-            SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s
-            FROM inversiones
-        """).fetchone()["s"]
-
+        active_count = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]
+        active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        total_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones").fetchone()["s"]
+        profit = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada),0) s FROM inversiones").fetchone()["s"]
+        finished = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='finalizada'").fetchone()["c"]
         conn.close()
-
-        await query.edit_message_text(
-            "📈 *INVERSIONES*\n\n"
-            f"Activas: *{active}*\n"
-            f"Capital activo: *{money(capital)} USDT*\n"
-            f"Ganancias acumuladas: *{money(profit)} USDT*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
-            ])
+        daily = float(active_capital) * DAILY_RATE
+        text = (
+            "📈 *RESUMEN DE INVERSIONES*\n\n"
+            f"🟢 Inversiones activas: *{active_count}*\n"
+            f"💰 Capital actualmente invertido: *{money(active_capital)} USDT*\n"
+            f"📊 Capital invertido histórico: *{money(total_capital)} USDT*\n"
+            f"🎁 Ganancias acumuladas: *{money(profit)} USDT*\n"
+            f"🏁 Planes finalizados: *{finished}*\n"
+            f"📅 Ganancia diaria estimada al 0,5% sobre capital activo: *{money(daily)} USDT*\n"
+            f"🎯 Objetivo de cada plan: 200% del capital inicial"
         )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_inline())
         return
 
     if data == "admin_status":
         conn = db()
-        users = conn.execute(
-            "SELECT COUNT(*) AS c FROM usuarios"
-        ).fetchone()["c"]
-        deposits = conn.execute(
-            "SELECT COUNT(*) AS c FROM depositos WHERE estado='pendiente'"
-        ).fetchone()["c"]
-        withdrawals = conn.execute(
-            "SELECT COUNT(*) AS c FROM retiros WHERE estado='pendiente'"
-        ).fetchone()["c"]
-        investments = conn.execute(
-            "SELECT COUNT(*) AS c FROM inversiones WHERE estado='activa'"
-        ).fetchone()["c"]
+        users = conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
+        approved_dep = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()["s"]
+        pending_dep = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM depositos WHERE estado='pendiente'").fetchone()["s"]
+        active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        earnings = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada),0) s FROM inversiones").fetchone()["s"]
+        pending_wd = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM retiros WHERE estado='pendiente'").fetchone()["s"]
+        approved_wd = conn.execute("SELECT COALESCE(SUM(monto),0) s FROM retiros WHERE estado='aprobado'").fetchone()["s"]
         conn.close()
-
-        await query.edit_message_text(
-            "📊 *ESTADO DEL SISTEMA*\n\n"
-            "🟢 Bot: activo\n"
+        text = (
+            "📊 *RESUMEN GENERAL DEL SISTEMA*\n\n"
             f"👥 Usuarios: *{users}*\n"
-            f"📥 Depósitos pendientes: *{deposits}*\n"
-            f"📤 Retiros pendientes: *{withdrawals}*\n"
-            f"📈 Inversiones activas: *{investments}*\n"
-            f"💾 Base de datos: `{DB_FILE}`",
+            f"📥 Depósitos aprobados: *{money(approved_dep)} USDT*\n"
+            f"⏳ Depósitos pendientes: *{money(pending_dep)} USDT*\n"
+            f"📈 Capital invertido activo: *{money(active_capital)} USDT*\n"
+            f"🎁 Ganancias acumuladas: *{money(earnings)} USDT*\n"
+            f"📤 Retiros pendientes: *{money(pending_wd)} USDT*\n"
+            f"💸 Retiros aprobados: *{money(approved_wd)} USDT*\n\n"
+            "🟢 Bot: activo\n"
+            f"📊 Tasa diaria: *{DAILY_RATE * 100:.2f}%*"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_inline())
+        return
+
+    if data == "admin_broadcast":
+        context.user_data["admin_broadcast"] = True
+        await query.edit_message_text(
+            "📢 *ENVIAR MENSAJE A TODOS*\n\n"
+            "Escribe ahora el mensaje que quieres enviar a todos los usuarios registrados.\n\n"
+            "⚠️ El mensaje se enviará a todos los usuarios que tengan una cuenta en el bot.",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_home")]])
         )
         return
 
@@ -1661,16 +1665,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=back_inline()
             )
         return
-    if data == "admin_user_menu":
-        await send_user_menu(
-            ADMIN_TELEGRAM_ID,
-            context,
-            "👤 *MENÚ DE USUARIO*\n\n"
-            "Estás viendo el menú normal como administrador."
-        )
-        return
-
     if data == "admin_home":
+        context.user_data.pop("admin_broadcast", None)
         await send_admin_menu(
             ADMIN_TELEGRAM_ID,
             context
@@ -2047,13 +2043,48 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # El administrador no entra nunca en el flujo de usuario.
+    if is_admin(update.effective_user.id) and context.user_data.get("admin_broadcast"):
+        if text == "/cancelar":
+            context.user_data.pop("admin_broadcast", None)
+            await update.message.reply_text("❌ Envío cancelado.", reply_markup=admin_keyboard())
+            return
+
+        context.user_data.pop("admin_broadcast", None)
+        conn = db()
+        rows = conn.execute("SELECT telegram_id FROM usuarios ORDER BY id ASC").fetchall()
+        conn.close()
+
+        sent = 0
+        failed = 0
+        for row in rows:
+            try:
+                await context.bot.send_message(
+                    chat_id=row["telegram_id"],
+                    text=("📢 MENSAJE DEL ADMINISTRADOR\n\n" + text)
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                print(f"⚠️ No se pudo enviar mensaje a {row['telegram_id']}: {e}")
+
+        await update.message.reply_text(
+            "✅ *MENSAJE ENVIADO*\n\n"
+            f"👥 Usuarios encontrados: *{len(rows)}*\n"
+            f"✅ Enviados correctamente: *{sent}*\n"
+            f"⚠️ No enviados: *{failed}*",
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard()
+        )
+        return
+
     ensure_user(update.effective_user)
 
     admin_actions = {
         "👥 Usuarios": "admin_users", "📥 Depósitos": "admin_deposits",
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
         "💾 Crear respaldo": "admin_backup", "📊 Estado": "admin_status",
-        "⚙️ Procesar ganancias": "admin_profit", "👤 Menú usuario": "admin_user_menu",
+        "⚙️ Procesar ganancias": "admin_profit", "📢 Enviar mensaje": "admin_broadcast",
     }
     user_actions = {
         "👤 Mi cuenta": "user_account", "📈 Inversiones": "user_invest",
@@ -2066,6 +2097,9 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_text_panel_action(update, context, admin_actions[text])
         return
     if text in user_actions:
+        if is_admin(update.effective_user.id):
+            await send_admin_menu(update.effective_chat.id, context, "👑 *PANEL DE ADMINISTRACIÓN*\n\nEste usuario tiene acceso exclusivamente al panel administrativo.")
+            return
         await handle_text_panel_action(update, context, user_actions[text])
         return
     if text == "💰 Depositar":
@@ -2182,7 +2216,133 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_panel_action(update, context, action):
-    # Construye un callback artificial para reutilizar las funciones existentes sin duplicarlas.
+    # Los botones inferiores del administrador muestran el mismo resumen
+    # general que sus respectivos botones inline.
+    if action == "admin_users":
+        conn = db()
+        count = conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
+        with_deposit = conn.execute("SELECT COUNT(*) c FROM usuarios WHERE total_depositado > 0").fetchone()["c"]
+        total = conn.execute("SELECT COALESCE(SUM(total_depositado),0) s FROM usuarios").fetchone()["s"]
+        balance = conn.execute("SELECT COALESCE(SUM(saldo),0) s FROM usuarios").fetchone()["s"]
+        invested = conn.execute("SELECT COALESCE(SUM(invertido),0) s FROM usuarios").fetchone()["s"]
+        earnings = conn.execute("SELECT COALESCE(SUM(ganancias),0) s FROM usuarios").fetchone()["s"]
+        withdrawn = conn.execute("SELECT COALESCE(SUM(total_retirado),0) s FROM usuarios").fetchone()["s"]
+        conn.close()
+        await update.message.reply_text(
+            "👥 *RESUMEN DE USUARIOS*\n\n"
+            f"👤 Usuarios registrados: *{count}*\n"
+            f"💰 Usuarios que han depositado: *{with_deposit}*\n\n"
+            f"📥 Total depositado: *{money(total)} USDT*\n"
+            f"💵 Saldo disponible: *{money(balance)} USDT*\n"
+            f"📈 Capital invertido: *{money(invested)} USDT*\n"
+            f"🎁 Ganancias acumuladas: *{money(earnings)} USDT*\n"
+            f"💸 Total retirado: *{money(withdrawn)} USDT*",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    if action == "admin_deposits":
+        conn = db()
+        total_count = conn.execute("SELECT COUNT(*) c FROM depositos").fetchone()["c"]
+        ac, aa = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM depositos WHERE estado='aprobado'").fetchone()
+        pc, pa = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM depositos WHERE estado='pendiente'").fetchone()
+        rc, ra = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM depositos WHERE estado='rechazado'").fetchone()
+        conn.close()
+        await update.message.reply_text(
+            "📥 *RESUMEN DE DEPÓSITOS*\n\n"
+            f"📊 Total de solicitudes: *{total_count}*\n"
+            f"✅ Aprobados: *{ac}* — *{money(aa)} USDT*\n"
+            f"⏳ Pendientes: *{pc}* — *{money(pa)} USDT*\n"
+            f"❌ Rechazados: *{rc}* — *{money(ra)} USDT*",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    if action == "admin_withdrawals":
+        conn = db()
+        total_count = conn.execute("SELECT COUNT(*) c FROM retiros").fetchone()["c"]
+        pc, pa = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM retiros WHERE estado='pendiente'").fetchone()
+        ac, aa = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM retiros WHERE estado='aprobado'").fetchone()
+        rc, ra = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(monto),0) s FROM retiros WHERE estado='rechazado'").fetchone()
+        conn.close()
+        await update.message.reply_text(
+            "📤 *RESUMEN DE RETIROS*\n\n"
+            f"📊 Total de solicitudes: *{total_count}*\n"
+            f"⏳ Pendientes: *{pc}* — *{money(pa)} USDT*\n"
+            f"✅ Aprobados: *{ac}* — *{money(aa)} USDT*\n"
+            f"❌ Rechazados: *{rc}* — *{money(ra)} USDT*\n"
+            f"💸 Total retirado aprobado: *{money(aa)} USDT*",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    if action == "admin_investments":
+        conn = db()
+        active_count = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]
+        active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        total_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones").fetchone()["s"]
+        profit = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada),0) s FROM inversiones").fetchone()["s"]
+        finished = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='finalizada'").fetchone()["c"]
+        conn.close()
+        await update.message.reply_text(
+            "📈 *RESUMEN DE INVERSIONES*\n\n"
+            f"🟢 Inversiones activas: *{active_count}*\n"
+            f"💰 Capital actualmente invertido: *{money(active_capital)} USDT*\n"
+            f"📊 Capital invertido histórico: *{money(total_capital)} USDT*\n"
+            f"🎁 Ganancias acumuladas: *{money(profit)} USDT*\n"
+            f"🏁 Planes finalizados: *{finished}*\n"
+            f"📅 Ganancia diaria al 0,5%: *{money(float(active_capital)*DAILY_RATE)} USDT*\n"
+            "🎯 Objetivo por plan: 200% del capital inicial",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    if action == "admin_backup":
+        await send_excel_backup(context.bot, "Respaldo solicitado por el administrador")
+        await update.message.reply_text("💾 Respaldo enviado correctamente.", reply_markup=admin_keyboard())
+        return
+
+    if action == "admin_status":
+        conn = db()
+        users = conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
+        deposits = conn.execute("SELECT COUNT(*) c FROM depositos WHERE estado='pendiente'").fetchone()["c"]
+        withdrawals = conn.execute("SELECT COUNT(*) c FROM retiros WHERE estado='pendiente'").fetchone()["c"]
+        investments = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]
+        conn.close()
+        await update.message.reply_text(
+            "📊 *ESTADO DEL SISTEMA*\n\n"
+            f"👥 Usuarios: *{users}*\n"
+            f"📥 Depósitos pendientes: *{deposits}*\n"
+            f"📤 Retiros pendientes: *{withdrawals}*\n"
+            f"📈 Inversiones activas: *{investments}*\n"
+            f"📊 Tasa diaria: *{DAILY_RATE*100:.2f}%*",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    if action == "admin_profit":
+        context.user_data.pop("admin_broadcast", None)
+        await update.message.reply_text(
+            "⚙️ Pulsa el botón inline *Procesar ahora* para ejecutar las ganancias.",
+            parse_mode="Markdown", reply_markup=back_inline()
+        )
+        return
+
+    if action == "admin_broadcast":
+        context.user_data["admin_broadcast"] = True
+        await update.message.reply_text(
+            "📢 *ENVIAR MENSAJE A TODOS*\n\n"
+            "Escribe ahora el mensaje que quieres enviar a todos los usuarios registrados.\n\n"
+            "Puedes cancelar usando el botón ❌ Cancelar.",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    # Acciones de usuario: nunca se ejecutan para el administrador.
+    if is_admin(update.effective_user.id):
+        await send_admin_menu(update.effective_chat.id, context, "👑 *PANEL DE ADMINISTRACIÓN*\n\nEste usuario tiene acceso exclusivamente al panel administrativo.")
+        return
+
     class FakeQuery:
         def __init__(self, message, user):
             self.message = message
@@ -2192,17 +2352,7 @@ async def handle_text_panel_action(update, context, action):
         async def answer(self, *args, **kwargs):
             return None
     fake = FakeQuery(update.message, update.effective_user)
-    if action == "admin_users":
-        conn=db(); count=conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]; total=conn.execute("SELECT COALESCE(SUM(total_depositado),0) s FROM usuarios").fetchone()["s"]; invested=conn.execute("SELECT COALESCE(SUM(invertido),0) s FROM usuarios").fetchone()["s"]; conn.close()
-        await update.message.reply_text(f"👥 *USUARIOS*\n\nUsuarios registrados: *{count}*\nTotal depositado: *{money(total)} USDT*\nCapital actualmente invertido: *{money(invested)} USDT*", parse_mode="Markdown")
-    elif action == "admin_deposits": await update.message.reply_text("📥 Usa el panel para revisar los depósitos pendientes.")
-    elif action == "admin_withdrawals": await update.message.reply_text("📤 Usa el panel para revisar los retiros pendientes.")
-    elif action == "admin_investments": await update.message.reply_text("📈 *INVERSIONES*\n\nConsulta el resumen actualizado desde el panel.", parse_mode="Markdown")
-    elif action == "admin_backup": await send_excel_backup(context.bot, "Respaldo solicitado por el administrador")
-    elif action == "admin_status": await update.message.reply_text("📊 *ESTADO*\n\nBot activo.", parse_mode="Markdown")
-    elif action == "admin_profit": await update.message.reply_text("⚙️ Pulsa el botón inline *Procesar ahora* para ejecutar las ganancias.", parse_mode="Markdown")
-    elif action == "admin_user_menu": await send_user_menu(update.effective_chat.id, context, "👤 *MENÚ DE USUARIO*")
-    elif action == "user_account": await show_account(fake)
+    if action == "user_account": await show_account(fake)
     elif action == "user_invest": await show_investments(fake)
     elif action == "user_plans": await show_plans(fake)
     elif action == "user_referrals": await show_referrals(fake, context)
