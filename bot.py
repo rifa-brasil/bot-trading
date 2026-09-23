@@ -700,17 +700,10 @@ async def select_plan(query, amount):
         await query.answer("Plan no disponible.", show_alert=True)
         return
 
+    # REGLA FUNDAMENTAL: cada selección de plan inicia un depósito NUEVO
+    # por el 100% del importe del plan. Nunca se descuenta saldo, ganancias,
+    # depósitos anteriores ni otros planes para calcular el nuevo depósito.
     conn = db()
-    available = conn.execute("""
-        SELECT id, monto, plan_monto
-        FROM depositos
-        WHERE telegram_id = ?
-          AND estado = 'aprobado'
-          AND COALESCE(plan_monto, 0) = ?
-          AND inversion_id IS NULL
-        ORDER BY id ASC
-        LIMIT 1
-    """, (user_id, amount)).fetchone()
     pending = conn.execute("""
         SELECT COUNT(*) AS c
         FROM depositos
@@ -720,33 +713,20 @@ async def select_plan(query, amount):
     """, (user_id, amount)).fetchone()["c"]
     conn.close()
 
-    if available:
-        await query.edit_message_text(
-            "💎 *PLAN DISPONIBLE PARA INVERTIR*\n\n"
-            f"Plan seleccionado: *{money(amount)} USDT*\n"
-            f"Depósito asociado: *#{available['id']}*\n"
-            f"Tasa diaria fija: *{DAILY_RATE * 100:.1f}%*\n"
-            "Este plan es independiente de cualquier otro depósito o inversión.\n\n"
-            "Puedes invertir ahora exactamente el monto de este plan.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"✅ Invertir Plan {money(amount)} USDT", callback_data=f"invest_deposit_{available['id']}")],
-                [InlineKeyboardButton("⬅️ Atrás", callback_data="user_plans"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
-            ])
-        )
-        return
-
     pending_text = (
-        f"\n\n⏳ Ya tienes *{pending} depósito(s) pendiente(s)* para este plan. "
-        "Cada depósito pendiente corresponde a un plan independiente."
+        f"\n\n⏳ Ya tienes *{pending} depósito(s) pendiente(s)* de este mismo plan. "
+        "Eso no cambia el nuevo depósito: este también será por el importe completo."
     ) if pending else ""
 
     await query.edit_message_text(
-        "💰 *NUEVO PLAN DE INVERSIÓN*\n\n"
+        "💎 *NUEVO PLAN DE INVERSIÓN*\n\n"
         f"Plan seleccionado: *{money(amount)} USDT*\n"
-        f"Monto exacto que debes depositar: *{money(amount)} USDT*\n\n"
-        "⚠️ El saldo de depósitos anteriores NO se utiliza para completar este nuevo plan. "
-        "Cada vez que seleccionas un plan, su depósito se registra por el importe completo del plan."
+        f"Monto exacto a depositar: *{money(amount)} USDT*\n\n"
+        "🔒 Este depósito es independiente de todos los anteriores.\n"
+        "El saldo disponible, las ganancias acumuladas, otros depósitos y otros planes "
+        "NO se descuentan para calcular este importe.\n\n"
+        "Si vuelves a seleccionar este mismo plan, se crea otro depósito independiente "
+        "por el importe completo del plan."
         + pending_text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -1783,10 +1763,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "admin_backup":
-        await query.edit_message_text("💾 *PREPARANDO RESPALDO EXCEL...*", parse_mode="Markdown")
+        await query.edit_message_text("💾 *PREPARANDO RESPALDO COMPLETO...*", parse_mode="Markdown")
         try:
-            await send_excel_backup(context.bot, "Respaldo solicitado por el administrador")
-            await send_admin_menu(ADMIN_TELEGRAM_ID, context, "✅ *RESPALDO CREADO Y ENVIADO*\n\nPanel administrativo:")
+            await send_full_backup(context.bot, "Respaldo solicitado por el administrador")
+            await send_admin_menu(ADMIN_TELEGRAM_ID, context, "✅ *RESPALDO COMPLETO CREADO Y ENVIADO*\n\nSe enviaron `.db` y `.xlsx`.\n\nPanel administrativo:")
         except Exception as e:
             await query.edit_message_text(
                 f"❌ *ERROR AL CREAR RESPALDO*\n\n`{str(e)}`",
@@ -2461,8 +2441,8 @@ async def handle_text_panel_action(update, context, action):
         return
 
     if action == "admin_backup":
-        await send_excel_backup(context.bot, "Respaldo solicitado por el administrador")
-        await update.message.reply_text("💾 Respaldo enviado correctamente.", reply_markup=admin_keyboard())
+        await send_full_backup(context.bot, "Respaldo solicitado por el administrador")
+        await update.message.reply_text("💾 Respaldo completo enviado: `.db` y `.xlsx`.", parse_mode="Markdown", reply_markup=admin_keyboard())
         return
 
     if action == "admin_status":
