@@ -53,11 +53,10 @@ TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
-PROFIT_TIME = os.getenv("PROFIT_TIME", "13:00").strip()
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
 DAILY_PROFIT_IMAGE = Path(__file__).resolve().parent / "ganancia_diaria.jpg"
 
-# Usuarios y ganancias acreditadas en la última ejecución automática.
+# Usuarios y ganancias acreditadas en la última ejecución manual.
 # Se utiliza para enviar una sola notificación por usuario, aunque tenga varias inversiones.
 LAST_DAILY_PROFITS = {}
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
@@ -440,7 +439,8 @@ def admin_keyboard():
         ["📤 Retiros", "📈 Inversiones"],
         ["💾 Crear respaldo", "♻️ Restaurar respaldo"],
         ["🔒 Bloquear bot", "🔓 Desbloquear bot"],
-        ["💰 Acreditar ganancias", "📊 Estado"],
+        ["💰 Pago diario 0,5%", "💵 Pago manual"],
+        ["📊 Estado"],
         ["📢 Enviar mensaje"],
     ], resize_keyboard=True, is_persistent=True)
 
@@ -1076,7 +1076,7 @@ async def confirm_investment(query):
 # =========================================================
 
 def process_profits(force=False):
-    """Acredita como máximo un pago diario por fecha local, lunes-viernes."""
+    """Acredita como máximo un pago por fecha local. El pago se ejecuta manualmente."""
     global LAST_DAILY_PROFITS
     LAST_DAILY_PROFITS = {}
 
@@ -1201,42 +1201,6 @@ async def send_daily_profit_notifications(application):
             print(f"⚠️ No se pudo enviar la notificación de ganancias a {user_id}: {e}")
 
     return sent
-
-
-async def automatic_profit_loop(application):
-    while True:
-        try:
-            tz = ZoneInfo(PROFIT_TIMEZONE)
-        except Exception:
-            tz = timezone.utc
-
-        now = datetime.now(tz)
-        try:
-            hour, minute = [int(x) for x in PROFIT_TIME.split(':', 1)]
-        except Exception:
-            hour, minute = 13, 0
-
-        target = now.replace(
-            hour=hour,
-            minute=minute,
-            second=0,
-            microsecond=0
-        )
-        if target <= now:
-            target += timedelta(days=1)
-
-        await asyncio.sleep(max(1, (target - now).total_seconds()))
-
-        try:
-            # process_profits no acredita nada los sábados ni domingos.
-            processed, total = process_profits(False)
-            print(f'💰 Pago diario: {processed} inversiones, {total:.2f} USDT')
-
-            if processed > 0 and total > 0:
-                notified = await send_daily_profit_notifications(application)
-                print(f'📸 Notificaciones de ganancias enviadas: {notified} usuarios')
-        except Exception as e:
-            print(f'⚠️ Error pago diario: {e}')
 
 
 # =========================================================
@@ -1872,18 +1836,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         daily_due = float(active_capital) * DAILY_RATE
         await query.edit_message_text(
-            "💰 *ACREDITAR GANANCIAS 0,5%*\n\n"
+            "💰 *PAGO DIARIO 0,5%*\n\n"
             f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
             f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
-            f"💵 Total estimado a acreditar: *{money(daily_due)} USDT*\n\n"
-            "⏰ La acreditación automática funciona de lunes a viernes a las *13:00*.\n\n"
-            "🧪 Para probar el sistema ahora mismo, pulsa el botón de abajo.\n"
-            "El proceso utilizará exactamente la misma lógica de acreditación y enviará la imagen de ganancia a cada usuario que reciba dinero.\n\n"
-            "⚠️ Solo se permite una acreditación por fecha para evitar pagos duplicados.",
+            f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
+            "ℹ️ Este botón es solamente informativo. Aquí puedes consultar cuánto corresponde pagar hoy según el capital actualmente invertido.\n\n"
+            "💵 Para realizar la acreditación, utiliza el botón *Pago manual* del panel.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧪 Acreditar ganancias ahora", callback_data="admin_profit_manual")],
+                [InlineKeyboardButton("💵 Pago manual", callback_data="admin_profit_manual")],
                 [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
             ])
         )
@@ -1894,30 +1856,57 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⛔ No autorizado.", show_alert=True)
             return
 
+        conn = db()
+        active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        active_investments = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]
+        conn.close()
+        daily_due = float(active_capital) * DAILY_RATE
+
         await query.edit_message_text(
-            "⏳ *PROCESANDO ACREDITACIÓN...*\n\n"
+            "💵 *PAGO MANUAL DE GANANCIAS*\n\n"
+            f"📈 Capital invertido activo: *{money(active_capital)} USDT*\n"
+            f"👥 Inversiones activas: *{active_investments}*\n"
+            f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
+            f"💰 Total que se acreditará: *{money(daily_due)} USDT*\n\n"
+            "⚠️ Al confirmar, el bot acreditará las ganancias pendientes de hoy usando la misma lógica del pago diario y enviará automáticamente la imagen de ganancia a los usuarios que reciban el pago.\n\n"
+            "🔒 Solo se permite una acreditación por fecha para evitar pagos duplicados.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirmar pago manual", callback_data="admin_profit_manual_confirm")],
+                [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
+            ])
+        )
+        return
+
+    if data == "admin_profit_manual_confirm":
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "⏳ *PROCESANDO PAGO MANUAL...*\n\n"
             "Se están calculando las ganancias y enviando la notificación con la imagen a los usuarios correspondientes.",
             parse_mode="Markdown"
         )
 
         try:
-            # force=True permite hacer la prueba manual incluso sábado/domingo.
-            # La tabla pagos_diarios sigue evitando una segunda acreditación el mismo día.
+            # Pago exclusivamente manual. force=True permite acreditar cualquier día,
+            # mientras pagos_diarios evita una segunda acreditación en la misma fecha.
             processed, total = process_profits(force=True)
 
             if processed > 0 and total > 0:
                 notified = await send_daily_profit_notifications(context.application)
                 text = (
-                    "✅ *ACREDITACIÓN MANUAL COMPLETADA*\n\n"
+                    "✅ *PAGO MANUAL COMPLETADO*\n\n"
                     f"📈 Inversiones procesadas: *{processed}*\n"
                     f"💰 Total acreditado: *{money(total)} USDT*\n"
-                    f"📸 Notificaciones con imagen enviadas: *{notified}*\n\n"
-                    "Los usuarios que recibieron ganancias ya tienen la imagen en su chat."
+                    f"📸 Notificaciones con imagen enviadas: *{notified}* usuarios\n\n"
+                    "Las ganancias ya fueron acreditadas y la imagen fue enviada a los usuarios correspondientes."
                 )
             else:
                 text = (
                     "ℹ️ *NO SE ACREDITARON GANANCIAS*\n\n"
-                    "No hay inversiones activas con ganancias pendientes o ya se realizó la acreditación correspondiente a esta fecha.\n\n"
+                    "No hay inversiones activas con ganancias pendientes o ya se realizó el pago correspondiente a esta fecha.\n\n"
                     "Esto evita que una misma ganancia diaria sea pagada dos veces."
                 )
 
@@ -1925,14 +1914,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💰 Volver a ganancias", callback_data="admin_profit")],
+                    [InlineKeyboardButton("💰 Pago diario 0,5%", callback_data="admin_profit")],
+                    [InlineKeyboardButton("💵 Pago manual", callback_data="admin_profit_manual")],
                     [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
                 ])
             )
         except Exception as e:
-            print(f"❌ Error en acreditación manual: {e}")
+            print(f"❌ Error en pago manual: {e}")
             await query.edit_message_text(
-                f"❌ *ERROR EN LA ACREDITACIÓN MANUAL*\n\n`{str(e)}`",
+                f"❌ *ERROR EN EL PAGO MANUAL*\n\n`{str(e)}`",
                 parse_mode="Markdown",
                 reply_markup=back_inline()
             )
@@ -2402,7 +2392,8 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
         "💾 Crear respaldo": "admin_backup", "♻️ Restaurar respaldo": "admin_restore",
         "🔒 Bloquear bot": "admin_lock", "🔓 Desbloquear bot": "admin_unlock",
-        "💰 Acreditar ganancias": "admin_profit", "📊 Estado": "admin_status",
+        "💰 Pago diario 0,5%": "admin_profit", "💵 Pago manual": "admin_manual_profit",
+        "📊 Estado": "admin_status",
         "📢 Enviar mensaje": "admin_broadcast",
     }
     user_actions = {
@@ -2656,9 +2647,35 @@ async def handle_text_panel_action(update, context, action):
             f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
             f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
-            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *13:00*.\n"
-            "Este botón es solamente informativo; no acredita las ganancias manualmente.",
+            "ℹ️ Este botón es solamente informativo. Muestra el total que corresponde pagar hoy según el capital actualmente invertido.\n\n"
+            "💵 Para acreditar las ganancias, utiliza *Pago manual*.",
             parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    if action == "admin_manual_profit":
+        conn = db()
+        active_capital = conn.execute(
+            "SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'"
+        ).fetchone()["s"]
+        active_investments = conn.execute(
+            "SELECT COUNT(*) c FROM inversiones WHERE estado='activa'"
+        ).fetchone()["c"]
+        conn.close()
+        daily_due = float(active_capital) * DAILY_RATE
+        await update.message.reply_text(
+            "💵 *PAGO MANUAL DE GANANCIAS*\n\n"
+            f"📈 Capital invertido activo: *{money(active_capital)} USDT*\n"
+            f"👥 Inversiones activas: *{active_investments}*\n"
+            f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
+            f"💰 Total que se acreditará: *{money(daily_due)} USDT*\n\n"
+            "⚠️ Pulsa el botón de abajo para confirmar. Se acreditarán las ganancias pendientes de hoy y se enviará automáticamente la imagen a los usuarios que reciban el pago.\n\n"
+            "🔒 Solo se permite una acreditación por fecha para evitar pagos duplicados.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirmar pago manual", callback_data="admin_profit_manual_confirm")],
+                [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
+            ])
         )
         return
 
@@ -3115,6 +3132,7 @@ async def main():
     print(f"💾 DB = {DB_FILE}")
     print(f"💰 Wallet TRC20 configurada = {bool(USDT_TRC20_ADDRESS)}")
     print("🔒 Funciones privadas: SOLO CHAT PRIVADO")
+    print("💵 Pago de ganancias: SOLO MANUAL")
     print("==============================================")
 
     await app.initialize()
@@ -3122,12 +3140,10 @@ async def main():
     await app.updater.start_polling()
 
     backup_task = asyncio.create_task(automatic_backup_loop(app))
-    profit_task = asyncio.create_task(automatic_profit_loop(app))
     try:
         await asyncio.Event().wait()
     finally:
         backup_task.cancel()
-        profit_task.cancel()
 
 
 if __name__ == "__main__":
