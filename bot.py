@@ -944,7 +944,7 @@ async def show_investments(query):
     for dep in available_plans:
         amount = float(dep["plan_monto"] or dep["monto"])
         buttons.append([InlineKeyboardButton(
-            f"🚀 🟢₮ Plan {money(amount)} USDT",
+            f"🚀 Invertir Plan {money(amount)} USDT",
             callback_data=f"invest_deposit_{dep['id']}"
         )])
     buttons.append([InlineKeyboardButton("💎 Elegir otro Plan de Inversión", callback_data="user_plans")])
