@@ -509,7 +509,8 @@ def admin_keyboard():
     return ReplyKeyboardMarkup([
         ["👥 Usuarios", "📥 Depósitos"],
         ["📤 Retiros", "📈 Inversiones"],
-        ["💾 Crear respaldo", "📊 Estado"],
+        ["💾 Crear respaldo", "♻️ Restaurar respaldo"],
+        ["📊 Estado"],
         ["💰 Pago Diario", "📊 Cuotas Diarias"],
         ["🔒 Bloquear bot", "🔓 Desbloquear bot"],
         ["📢 Enviar mensaje"],
@@ -747,11 +748,17 @@ async def show_plans(query):
     balance = float(row["saldo"]) if row else 0.0
 
     buttons = []
+    plan_row = []
     for amount in INVESTMENT_PLANS:
-        buttons.append([InlineKeyboardButton(
-            f"💎 Plan {money(amount)} USDT",
+        plan_row.append(InlineKeyboardButton(
+            f"💎 {money(amount)} USDT",
             callback_data=f"plan_{amount}"
-        )])
+        ))
+        if len(plan_row) == 3:
+            buttons.append(plan_row)
+            plan_row = []
+    if plan_row:
+        buttons.append(plan_row)
 
     buttons.append([
         InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"),
@@ -1795,8 +1802,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_quota_menu":
         buttons=[]
+        quota_row=[]
         for rate in DAILY_QUOTA_OPTIONS:
-            buttons.append([InlineKeyboardButton(f"{rate:.2f}%".replace(".",","), callback_data=f"quota_{int(round(rate*100)):02d}")])
+            quota_row.append(InlineKeyboardButton(f"{rate:.2f}%".replace(".",","), callback_data=f"quota_{int(round(rate*100)):02d}"))
+            if len(quota_row) == 4:
+                buttons.append(quota_row)
+                quota_row=[]
+        if quota_row:
+            buttons.append(quota_row)
         buttons.append([InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")])
         await query.edit_message_text("📊 *CUOTAS DIARIAS*\n\nSelecciona la cuota que se acreditará hoy.\n\n⚠️ Solo puede acreditarse una cuota por día.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -1830,8 +1843,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ *ERROR AL CREAR RESPALDO*\n\n`{e}`",parse_mode="Markdown",reply_markup=back_inline())
         return
 
+    if data == "admin_restore":
+        context.user_data["await_restore_db"] = True
+        await query.edit_message_text(
+            "♻️ *RESTAURAR RESPALDO*\n\n"
+            "Envía ahora el archivo `.db` que quieres restaurar.\n\n"
+            "⚠️ Antes de reemplazar la base actual se conservará una copia de seguridad automática.\n"
+            "Usa /cancelar si deseas salir.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_home")]])
+        )
+        return
+
     if data == "admin_home":
         context.user_data.pop("admin_broadcast", None)
+        context.user_data.pop("await_restore_db", None)
         await send_admin_menu(
             ADMIN_TELEGRAM_ID,
             context
@@ -2145,6 +2171,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_plan_deposit(query, context, amount)
         return
 
+    if data.startswith("invest_deposit_"):
+        try:
+            deposit_id = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            await query.answer("Plan inválido.", show_alert=True)
+            return
+        await invest_from_deposit(query, deposit_id)
+        return
+
     if data == "user_new_investment":
         await create_investment(query)
         return
@@ -2247,7 +2282,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_actions = {
         "👥 Usuarios": "admin_users", "📥 Depósitos": "admin_deposits",
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
-        "💾 Crear respaldo": "admin_backup", "📊 Estado": "admin_status",
+        "💾 Crear respaldo": "admin_backup", "♻️ Restaurar respaldo": "admin_restore", "📊 Estado": "admin_status",
         "💰 Pago Diario": "admin_payment_info", "📊 Cuotas Diarias": "admin_quota_menu",
         "🔒 Bloquear bot": "admin_block", "🔓 Desbloquear bot": "admin_unblock",
         "📢 Enviar mensaje": "admin_broadcast",
@@ -2478,6 +2513,14 @@ async def handle_text_panel_action(update, context, action):
         await update.message.reply_text("💾 Respaldo enviado correctamente.", reply_markup=admin_keyboard())
         return
 
+    if action == "admin_restore":
+        context.user_data["await_restore_db"] = True
+        await update.message.reply_text(
+            "♻️ *RESTAURAR RESPALDO*\n\nEnvía ahora el archivo `.db` que quieres restaurar.\n\n⚠️ Se guardará primero una copia de seguridad de la base actual.\nUsa /cancelar si deseas salir.",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
     if action == "admin_status":
         conn = db()
         users = conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
@@ -2505,8 +2548,14 @@ async def handle_text_panel_action(update, context, action):
 
     if action == "admin_quota_menu":
         buttons=[]
+        quota_row=[]
         for rate in DAILY_QUOTA_OPTIONS:
-            buttons.append([InlineKeyboardButton(f"{rate:.2f}%".replace(".",","), callback_data=f"quota_{int(round(rate*100)):02d}")])
+            quota_row.append(InlineKeyboardButton(f"{rate:.2f}%".replace(".",","), callback_data=f"quota_{int(round(rate*100)):02d}"))
+            if len(quota_row) == 4:
+                buttons.append(quota_row)
+                quota_row=[]
+        if quota_row:
+            buttons.append(quota_row)
         buttons.append([InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")])
         await update.message.reply_text("📊 *CUOTAS DIARIAS*\n\nSelecciona la cuota que se acreditará hoy.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -2714,6 +2763,51 @@ async def automatic_backup_loop(application):
 # =========================================================
 # COMANDOS ADMIN
 # =========================================================
+
+async def restore_database_document(update, context):
+    """Restaura una copia SQLite enviada por el administrador."""
+    if not private_only(update) or not is_admin(update.effective_user.id):
+        return False
+    if not context.user_data.get("await_restore_db"):
+        return False
+    document = update.message.document
+    if not document or not (document.file_name or "").lower().endswith(".db"):
+        await update.message.reply_text("⚠️ Envía un archivo de respaldo SQLite con extensión .db.", reply_markup=admin_keyboard())
+        return True
+
+    temp = os.path.join(BACKUP_DIR, f"restore_temp_{uuid.uuid4().hex}.db")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        await telegram_file.download_to_drive(temp)
+
+        check = sqlite3.connect(temp)
+        result = check.execute("PRAGMA integrity_check").fetchone()[0]
+        check.close()
+        if str(result).lower() != "ok":
+            raise RuntimeError("el archivo SQLite no pasó la comprobación de integridad")
+
+        await send_db_backup(context.bot, "Respaldo de seguridad antes de restaurar")
+        if os.path.exists(DB_FILE):
+            shutil.copy2(DB_FILE, os.path.join(BACKUP_DIR, f"before_restore_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.db"))
+        shutil.copy2(temp, DB_FILE)
+        init_db()
+        context.user_data.pop("await_restore_db", None)
+        await send_admin_menu(ADMIN_TELEGRAM_ID, context, "✅ *BASE DE DATOS RESTAURADA*\n\nSe conservó un respaldo de seguridad de la base anterior.\n\nPanel administrativo:")
+    except Exception as e:
+        await update.message.reply_text(f"❌ *NO SE PUDO RESTAURAR LA BASE*\n\n`{e}`", parse_mode="Markdown", reply_markup=admin_keyboard())
+    finally:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+    return True
+
+async def cancel_admin_restore(update, context):
+    if not private_only(update) or not is_admin(update.effective_user.id):
+        return
+    context.user_data.pop("await_restore_db", None)
+    await update.message.reply_text("❌ Restauración cancelada.", reply_markup=admin_keyboard())
 
 async def admin_withdraw_proof_photo(update, context):
     if not private_only(update) or not is_admin(update.effective_user.id):
@@ -2972,8 +3066,10 @@ async def main():
     app.add_handler(withdraw_handler)
 
     app.add_handler(CommandHandler("skip", skip_manual_deposit_photo, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("cancelar", cancel_admin_restore, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, manual_deposit_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, admin_withdraw_proof_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, restore_database_document), group=0)
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, admin_withdraw_proof_photo), group=1)
 
     # -------------------------------
     # Botones
