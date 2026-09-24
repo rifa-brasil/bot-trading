@@ -1,0 +1,16 @@
+# Base de datos
+database.db
+*.db
+
+# Respaldos
+backup_*.xlsx
+backup_*.db
+*.xlsx
+
+# Caché de Python
+__pycache__/
+*.pyc
+
+# Archivos temporales
+*.log
+.env
