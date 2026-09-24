@@ -53,8 +53,13 @@ TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
-PROFIT_TIME = os.getenv("PROFIT_TIME", "21:00").strip()
+PROFIT_TIME = os.getenv("PROFIT_TIME", "13:00").strip()
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
+DAILY_PROFIT_IMAGE = Path(__file__).resolve().parent / "ganancia_diaria.jpg"
+
+# Usuarios y ganancias acreditadas en la última ejecución automática.
+# Se utiliza para enviar una sola notificación por usuario, aunque tenga varias inversiones.
+LAST_DAILY_PROFITS = {}
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
 # Planes de inversión disponibles. El monto del plan queda definido por el botón.
@@ -642,7 +647,7 @@ async def show_info(query):
         f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n"
         f"💸 Retiro mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
         "🗓️ Frecuencia de retiros: *1 solicitud cada 7 días*\n"
-        "📅 Ganancias generadas: *lunes a viernes a las 21:00*\n\n"
+        "📅 Ganancias generadas: *lunes a viernes a las 13:00*\n\n"
         "🌐 Red de depósitos y retiros: *TRC20*\n"
         "📥 Los depósitos son revisados manualmente por el administrador.\n"
         "📤 Los retiros también son revisados manualmente."
@@ -1072,68 +1077,166 @@ async def confirm_investment(query):
 
 def process_profits(force=False):
     """Acredita como máximo un pago diario por fecha local, lunes-viernes."""
+    global LAST_DAILY_PROFITS
+    LAST_DAILY_PROFITS = {}
+
     try:
         tz = ZoneInfo(PROFIT_TIMEZONE)
     except Exception:
         tz = timezone.utc
     local_now = datetime.now(tz)
     date_key = local_now.date().isoformat()
+
     if local_now.weekday() >= 5 and not force:
         return 0, 0.0
+
     conn = db()
-    already = conn.execute("SELECT 1 FROM pagos_diarios WHERE fecha=?", (date_key,)).fetchone()
+    already = conn.execute(
+        "SELECT 1 FROM pagos_diarios WHERE fecha=?",
+        (date_key,)
+    ).fetchone()
     if already:
-        conn.close(); return 0, 0.0
-    rows = conn.execute("SELECT * FROM inversiones WHERE estado='activa'").fetchall()
-    processed = 0; total_profit = 0.0
+        conn.close()
+        return 0, 0.0
+
+    rows = conn.execute(
+        "SELECT * FROM inversiones WHERE estado='activa'"
+    ).fetchall()
+
+    processed = 0
+    total_profit = 0.0
+    credited_by_user = {}
+
     for inv in rows:
-        capital = float(inv['capital']); accumulated = float(inv['ganancia_acumulada'])
+        capital = float(inv['capital'])
+        accumulated = float(inv['ganancia_acumulada'])
         target_profit = capital * (float(inv['multiplicador_objetivo']) - 1)
         remaining = max(0.0, target_profit - accumulated)
         profit = min(capital * DAILY_RATE, remaining)
+
         if profit <= 0:
-            conn.execute("UPDATE inversiones SET estado='completada', ultimo_calculo=? WHERE id=?", (now_iso(), inv['id']))
+            conn.execute(
+                "UPDATE inversiones SET estado='completada', ultimo_calculo=? WHERE id=?",
+                (now_iso(), inv['id'])
+            )
             continue
-        conn.execute("UPDATE inversiones SET ganancia_acumulada=ganancia_acumulada+?, ultimo_calculo=? WHERE id=?", (profit, now_iso(), inv['id']))
-        conn.execute("UPDATE usuarios SET ganancias=ganancias+?, ganancias_disponibles=ganancias_disponibles+?, saldo=saldo+? WHERE telegram_id=?", (profit, profit, profit, inv['telegram_id']))
-        conn.execute("INSERT INTO movimientos(telegram_id,tipo,monto,descripcion,fecha) VALUES(?,?,?,?,?)", (inv['telegram_id'],'ganancia',profit,f'Pago diario 0,5% inversión #{inv["id"]}',now_iso()))
+
+        conn.execute(
+            "UPDATE inversiones SET ganancia_acumulada=ganancia_acumulada+?, ultimo_calculo=? WHERE id=?",
+            (profit, now_iso(), inv['id'])
+        )
+        conn.execute(
+            "UPDATE usuarios SET ganancias=ganancias+?, ganancias_disponibles=ganancias_disponibles+?, saldo=saldo+? WHERE telegram_id=?",
+            (profit, profit, profit, inv['telegram_id'])
+        )
+        conn.execute(
+            "INSERT INTO movimientos(telegram_id,tipo,monto,descripcion,fecha) VALUES(?,?,?,?,?)",
+            (
+                inv['telegram_id'],
+                'ganancia',
+                profit,
+                f'Pago diario 0,5% inversión #{inv["id"]}',
+                now_iso()
+            )
+        )
+
         if accumulated + profit >= target_profit:
-            conn.execute("UPDATE inversiones SET estado='completada' WHERE id=?", (inv['id'],))
-        processed += 1; total_profit += profit
-    conn.execute("INSERT INTO pagos_diarios(fecha,fecha_proceso,total,inversiones) VALUES(?,?,?,?)", (date_key,now_iso(),total_profit,processed))
-    conn.commit(); conn.close()
+            conn.execute(
+                "UPDATE inversiones SET estado='completada' WHERE id=?",
+                (inv['id'],)
+            )
+
+        processed += 1
+        total_profit += profit
+        uid = int(inv['telegram_id'])
+        credited_by_user[uid] = credited_by_user.get(uid, 0.0) + profit
+
+    conn.execute(
+        "INSERT INTO pagos_diarios(fecha,fecha_proceso,total,inversiones) VALUES(?,?,?,?)",
+        (date_key, now_iso(), total_profit, processed)
+    )
+    conn.commit()
+    conn.close()
+
+    # Guardamos el total acreditado por usuario para enviar una sola imagen
+    # personalizada a cada usuario que recibió ganancias en esta ejecución.
+    LAST_DAILY_PROFITS = credited_by_user
     return processed, total_profit
+
+
+async def send_daily_profit_notifications(application):
+    """Envía la imagen de ganancias a cada usuario al que se le acreditó hoy."""
+    if not LAST_DAILY_PROFITS:
+        return 0
+
+    if not DAILY_PROFIT_IMAGE.exists():
+        print(f"⚠️ No se encontró la imagen de ganancias: {DAILY_PROFIT_IMAGE}")
+        return 0
+
+    sent = 0
+    try:
+        tz = ZoneInfo(PROFIT_TIMEZONE)
+    except Exception:
+        tz = timezone.utc
+
+    local_now = datetime.now(tz)
+    date_text = local_now.strftime('%d/%m/%Y')
+
+    for user_id, profit in list(LAST_DAILY_PROFITS.items()):
+        try:
+            with open(DAILY_PROFIT_IMAGE, 'rb') as photo:
+                await application.bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo,
+                    caption=(
+                        "✅ *GANANCIA DIARIA ACREDITADA*\n\n"
+                        f"📅 Fecha: *{date_text}*\n"
+                        f"💰 Ganancia acreditada hoy: *{money(profit)} USDT*\n\n"
+                        "La ganancia ya fue acreditada en tu cuenta."
+                    ),
+                    parse_mode="Markdown"
+                )
+            sent += 1
+        except Exception as e:
+            print(f"⚠️ No se pudo enviar la notificación de ganancias a {user_id}: {e}")
+
+    return sent
+
 
 async def automatic_profit_loop(application):
     while True:
-        try: tz=ZoneInfo(PROFIT_TIMEZONE)
-        except Exception: tz=timezone.utc
-        now=datetime.now(tz)
-        try: hour,minute=[int(x) for x in PROFIT_TIME.split(':',1)]
-        except Exception: hour,minute=21,0
-        target=now.replace(hour=hour,minute=minute,second=0,microsecond=0)
-        if target<=now: target += timedelta(days=1)
-        await asyncio.sleep(max(1,(target-now).total_seconds()))
         try:
-            processed,total=process_profits(False)
+            tz = ZoneInfo(PROFIT_TIMEZONE)
+        except Exception:
+            tz = timezone.utc
+
+        now = datetime.now(tz)
+        try:
+            hour, minute = [int(x) for x in PROFIT_TIME.split(':', 1)]
+        except Exception:
+            hour, minute = 13, 0
+
+        target = now.replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0
+        )
+        if target <= now:
+            target += timedelta(days=1)
+
+        await asyncio.sleep(max(1, (target - now).total_seconds()))
+
+        try:
+            # process_profits no acredita nada los sábados ni domingos.
+            processed, total = process_profits(False)
             print(f'💰 Pago diario: {processed} inversiones, {total:.2f} USDT')
+
             if processed > 0 and total > 0:
-                try:
-                    await application.bot.send_message(
-                        chat_id=ADMIN_TELEGRAM_ID,
-                        text=(
-                            "✅ *GANANCIAS DIARIAS ACREDITADAS*\n\n"
-                            f"📅 Fecha: {datetime.now(ZoneInfo(PROFIT_TIMEZONE)).strftime('%d/%m/%Y')}\n"
-                            f"⏰ Hora: {datetime.now(ZoneInfo(PROFIT_TIMEZONE)).strftime('%H:%M')}\n"
-                            f"📈 Inversiones procesadas: *{processed}*\n"
-                            f"💰 Total acreditado: *{money(total)} USDT*\n\n"
-                            "🤖 La acreditación automática se realizó correctamente."
-                        ),
-                        parse_mode="Markdown"
-                    )
-                except Exception as notify_error:
-                    print(f'⚠️ No se pudo enviar la notificación de ganancias al administrador: {notify_error}')
-        except Exception as e: print(f'⚠️ Error pago diario: {e}')
+                notified = await send_daily_profit_notifications(application)
+                print(f'📸 Notificaciones de ganancias enviadas: {notified} usuarios')
+        except Exception as e:
+            print(f'⚠️ Error pago diario: {e}')
 
 
 # =========================================================
@@ -1774,7 +1877,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
             f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
-            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *21:00*.\n"
+            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *13:00*.\n"
             "Este botón es solamente informativo; no acredita las ganancias manualmente.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -2501,7 +2604,7 @@ async def handle_text_panel_action(update, context, action):
             f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
             f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
-            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *21:00*.\n"
+            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *13:00*.\n"
             "Este botón es solamente informativo; no acredita las ganancias manualmente.",
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
