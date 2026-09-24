@@ -440,7 +440,7 @@ def admin_keyboard():
         ["📤 Retiros", "📈 Inversiones"],
         ["💾 Crear respaldo", "♻️ Restaurar respaldo"],
         ["🔒 Bloquear bot", "🔓 Desbloquear bot"],
-        ["💰 Pago diario 0,5%", "📊 Estado"],
+        ["💰 Acreditar ganancias", "📊 Estado"],
         ["📢 Enviar mensaje"],
     ], resize_keyboard=True, is_persistent=True)
 
@@ -1872,18 +1872,70 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         daily_due = float(active_capital) * DAILY_RATE
         await query.edit_message_text(
-            "💰 *PAGO DIARIO 0,5%*\n\n"
+            "💰 *ACREDITAR GANANCIAS 0,5%*\n\n"
             f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
             f"👥 Inversiones activas: *{active_investments}*\n"
             f"📊 Tasa diaria: *{DAILY_RATE * 100:.4g}%*\n"
-            f"💵 Total que corresponde acreditar hoy: *{money(daily_due)} USDT*\n\n"
-            "🕗 Las ganancias se acreditan automáticamente en las cuentas de los usuarios de lunes a viernes a las *13:00*.\n"
-            "Este botón es solamente informativo; no acredita las ganancias manualmente.",
+            f"💵 Total estimado a acreditar: *{money(daily_due)} USDT*\n\n"
+            "⏰ La acreditación automática funciona de lunes a viernes a las *13:00*.\n\n"
+            "🧪 Para probar el sistema ahora mismo, pulsa el botón de abajo.\n"
+            "El proceso utilizará exactamente la misma lógica de acreditación y enviará la imagen de ganancia a cada usuario que reciba dinero.\n\n"
+            "⚠️ Solo se permite una acreditación por fecha para evitar pagos duplicados.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧪 Acreditar ganancias ahora", callback_data="admin_profit_manual")],
                 [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
             ])
         )
+        return
+
+    if data == "admin_profit_manual":
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "⏳ *PROCESANDO ACREDITACIÓN...*\n\n"
+            "Se están calculando las ganancias y enviando la notificación con la imagen a los usuarios correspondientes.",
+            parse_mode="Markdown"
+        )
+
+        try:
+            # force=True permite hacer la prueba manual incluso sábado/domingo.
+            # La tabla pagos_diarios sigue evitando una segunda acreditación el mismo día.
+            processed, total = process_profits(force=True)
+
+            if processed > 0 and total > 0:
+                notified = await send_daily_profit_notifications(context.application)
+                text = (
+                    "✅ *ACREDITACIÓN MANUAL COMPLETADA*\n\n"
+                    f"📈 Inversiones procesadas: *{processed}*\n"
+                    f"💰 Total acreditado: *{money(total)} USDT*\n"
+                    f"📸 Notificaciones con imagen enviadas: *{notified}*\n\n"
+                    "Los usuarios que recibieron ganancias ya tienen la imagen en su chat."
+                )
+            else:
+                text = (
+                    "ℹ️ *NO SE ACREDITARON GANANCIAS*\n\n"
+                    "No hay inversiones activas con ganancias pendientes o ya se realizó la acreditación correspondiente a esta fecha.\n\n"
+                    "Esto evita que una misma ganancia diaria sea pagada dos veces."
+                )
+
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 Volver a ganancias", callback_data="admin_profit")],
+                    [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
+                ])
+            )
+        except Exception as e:
+            print(f"❌ Error en acreditación manual: {e}")
+            await query.edit_message_text(
+                f"❌ *ERROR EN LA ACREDITACIÓN MANUAL*\n\n`{str(e)}`",
+                parse_mode="Markdown",
+                reply_markup=back_inline()
+            )
         return
 
     if data == "admin_backup":
@@ -2350,7 +2402,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
         "💾 Crear respaldo": "admin_backup", "♻️ Restaurar respaldo": "admin_restore",
         "🔒 Bloquear bot": "admin_lock", "🔓 Desbloquear bot": "admin_unlock",
-        "💰 Pago diario 0,5%": "admin_profit", "📊 Estado": "admin_status",
+        "💰 Acreditar ganancias": "admin_profit", "📊 Estado": "admin_status",
         "📢 Enviar mensaje": "admin_broadcast",
     }
     user_actions = {
