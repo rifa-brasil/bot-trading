@@ -48,6 +48,12 @@ BACKUP_DIR = "backups"
 PLAN_NAME = os.getenv("PLAN_NAME", "Plan Inicial")
 DAILY_RATE = 0.005  # Tasa histórica/base; los pagos diarios reales se seleccionan manualmente.
 DAILY_QUOTA_OPTIONS = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+DAILY_QUOTA_LABELS = {
+    0.25: "0,25%", 0.30: "0,30%", 0.35: "0,35%", 0.40: "0,40%",
+    0.45: "0,45%", 0.50: "0,50%", 0.55: "0,55%", 0.60: "0,60%",
+    0.65: "0,65%", 0.70: "0,70%", 0.75: "0,75%", 0.80: "0,80%",
+    0.85: "0,85%", 0.90: "0,90%", 0.95: "0,95%", 1.00: "1,00%",
+}
 BACKUP_TIME = os.getenv("BACKUP_TIME", "06:00").strip()
 BACKUP_TIMEZONE = os.getenv("BACKUP_TIMEZONE", "America/Sao_Paulo").strip()
 TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
@@ -1119,7 +1125,13 @@ def parse_quota(value):
 
 
 def quota_label(rate_decimal):
-    return f"{rate_decimal * 100:.2f}%".replace(".", ",")
+    # Etiqueta visible fija: 0,25%, 0,30%, ..., 1,00%.
+    # rate_decimal interno es 0.0025 para 0,25%, 0.0030 para 0,30%, etc.
+    pct = round(rate_decimal * 100, 2)
+    for value, label in DAILY_QUOTA_LABELS.items():
+        if abs(pct - value) < 0.0001:
+            return label
+    return f"{pct:.2f}%".replace(".", ",")
 
 
 def get_current_quota_decimal():
@@ -1196,7 +1208,7 @@ async def send_daily_quota_notifications(application, credited_by_user, rate_dec
 def quota_keyboard():
     buttons=[]; row=[]
     for pct in DAILY_QUOTA_OPTIONS:
-        row.append(InlineKeyboardButton(quota_label(pct/100.0), callback_data=f"quota_{int(round(pct*100))}"))
+        row.append(InlineKeyboardButton(DAILY_QUOTA_LABELS[pct], callback_data=f"quota_{int(round(pct*100))}"))
         if len(row)==4:
             buttons.append(row); row=[]
     if row: buttons.append(row)
@@ -2650,7 +2662,7 @@ async def handle_text_panel_action(update, context, action):
     if action == "admin_quotas":
         buttons=[]; row=[]
         for rate in DAILY_QUOTA_OPTIONS:
-            row.append(InlineKeyboardButton(quota_label(rate), callback_data=f"quota_{int(round(rate*100)):02d}"))
+            row.append(InlineKeyboardButton(DAILY_QUOTA_LABELS[rate], callback_data=f"quota_{int(round(rate*100)):02d}"))
             if len(row)==4:
                 buttons.append(row); row=[]
         if row: buttons.append(row)
