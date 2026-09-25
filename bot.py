@@ -414,19 +414,36 @@ async def broadcast_users(bot, text):
             print(f"⚠️ Broadcast fallo {row['telegram_id']}: {e}")
     return sent, failed
 
+async def send_image_to_user(bot, chat_id, image_path, caption=None):
+    if not image_path.exists():
+        print(f"⚠️ Imagen no encontrada: {image_path}")
+        return False
+    try:
+        with open(image_path, "rb") as photo:
+            await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption or None, parse_mode="Markdown" if caption else None)
+        return True
+    except Exception as e:
+        print(f"⚠️ Error enviando imagen a {chat_id}: {e}")
+        return False
+
+
+async def broadcast_image(bot, image_path, caption=None):
+    conn = db(); rows = conn.execute("SELECT telegram_id FROM usuarios ORDER BY id ASC").fetchall(); conn.close()
+    sent = failed = 0
+    for row in rows:
+        if await send_image_to_user(bot, row["telegram_id"], image_path, caption):
+            sent += 1
+        else:
+            failed += 1
+    return sent, failed
+
+
 async def maintenance_guard(update):
     if is_admin(update.effective_user.id):
         return False
     if is_maintenance():
         if update.message:
-            try:
-                if LOCK_IMAGE.exists():
-                    with open(LOCK_IMAGE, "rb") as photo:
-                        await update.message.reply_photo(photo=photo)
-                else:
-                    await update.message.reply_text("🔧 Bot en mantenimiento. Intenta más tarde.")
-            except Exception:
-                await update.message.reply_text("🔧 Bot en mantenimiento. Intenta más tarde.")
+            await send_image_to_user(update.get_bot(), update.effective_user.id, LOCK_IMAGE)
         elif update.callback_query:
             await update.callback_query.answer("🔧 Bot en mantenimiento. Intenta más tarde.", show_alert=True)
         return True
@@ -452,7 +469,7 @@ def admin_keyboard():
         ["📤 Retiros", "📈 Inversiones"],
         ["💾 Crear respaldo", "♻️ Restaurar respaldo"],
         ["🔒 Bloquear bot", "🔓 Desbloquear bot"],
-        ["💰 Pago diario", "📊 Cuotas Diarias"],
+        ["💰 Pago Diario", "📊 Cuotas Diarias"],
         ["📊 Estado"],
         ["📢 Enviar mensaje"],
     ], resize_keyboard=True, is_persistent=True)
@@ -694,16 +711,12 @@ async def show_plans(query):
     balance = float(row["saldo"]) if row else 0.0
 
     buttons = []
-    # Mostrar los planes en una cuadrícula de 2 columnas para aprovechar mejor el espacio.
+    # Mostrar los planes en una cuadrícula de 3 columnas.
     row_buttons = []
     for amount in INVESTMENT_PLANS:
-        row_buttons.append(InlineKeyboardButton(
-            f"🟢₮ {money(amount)} USDT",
-            callback_data=f"plan_{amount}"
-        ))
-        if len(row_buttons) == 2:
-            buttons.append(row_buttons)
-            row_buttons = []
+        row_buttons.append(InlineKeyboardButton(f"💎 {money(amount)} USDT", callback_data=f"plan_{amount}"))
+        if len(row_buttons) == 3:
+            buttons.append(row_buttons); row_buttons = []
     if row_buttons:
         buttons.append(row_buttons)
 
@@ -1079,7 +1092,7 @@ async def confirm_investment(query):
         "✅ *INVERSIÓN CREADA*\n\n"
         f"Plan: *{PLAN_NAME}*\n"
         f"Capital: *{money(amount)} USDT*\n"
-        f"Tasa configurada: *{DAILY_RATE * 100:.4g}% diaria*\n\n"
+        "📊 Rendimiento diario: *variable según la cuota seleccionada por el administrador*\n\n"
         "La inversión ya aparece en tu panel.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -1090,138 +1103,157 @@ async def confirm_investment(query):
 
 
 # =========================================================
-# GANANCIAS
+# CUOTAS Y GANANCIAS
 # =========================================================
-
 def parse_quota(value):
-    """
-    Convierte una cuota introducida por el administrador a tasa decimal.
-
-    Ejemplos:
-      0,25 -> 0.0025 (0,25%)
-      0,30 -> 0.0030 (0,30%)
-      0,50 -> 0.0050 (0,50%)
-      1,00 -> 0.0100 (1,00%)
-    Los valores entre 0,01 y 1 sin el signo % se interpretan como
-    porcentajes escritos en formato 0,25 / 0,30 / 0,50 / 1,00.
-    Los valores <= 0,01 ya se consideran tasas decimales internas.
-    """
+    """Convierte 0,30 / 0.30 / 30 en porcentaje. Devuelve 0.003 para 0,30%."""
     try:
-        raw = str(value).strip().replace(',', '.')
-        has_percent = raw.endswith('%')
-        if has_percent:
-            raw = raw[:-1].strip()
-        number = float(raw)
-    except Exception:
-        return None
-
-    if number <= 0:
-        return None
-
-    if has_percent:
-        rate = number / 100.0
-    elif number <= 0.01:
-        # Tasa decimal interna: 0.003 = 0,30%
-        rate = number
-    elif number <= 1:
-        # Entrada del administrador: 0.30 = 0,30%, NO 30%
-        rate = number / 100.0
-    else:
-        return None
-
-    if rate <= 0 or rate > 0.01:
-        return None
-    return rate
+        raw = str(value).strip().replace("%", "").replace(",", ".")
+        n = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("Cuota inválida.")
+    # La interfaz usa 0,25 ... 1,00 para representar porcentajes.
+    if n <= 0 or n > 1.0:
+        raise ValueError("La cuota debe estar entre 0,25% y 1,00%.")
+    return n / 100.0
 
 
-def quota_label(rate):
-    return f"{rate * 100:.2f}%".replace('.', ',')
+def quota_label(rate_decimal):
+    return f"{rate_decimal * 100:.2f}%".replace(".", ",")
 
 
-def get_current_quota():
+def get_current_quota_decimal():
     conn = db()
     row = conn.execute("SELECT valor FROM sistema WHERE clave='cuota_diaria_actual'").fetchone()
     conn.close()
-    return parse_quota(row['valor']) if row and row['valor'] else None
+    try:
+        value = float(row["valor"]) if row and str(row["valor"]).strip() else 0.0
+        return value
+    except Exception:
+        return 0.0
 
 
-def set_current_quota(rate):
+def set_current_quota(rate_decimal):
     conn = db()
-    conn.execute("INSERT OR REPLACE INTO sistema(clave,valor) VALUES('cuota_diaria_actual',?)", (str(rate),))
-    conn.commit()
-    conn.close()
+    conn.execute("INSERT OR REPLACE INTO sistema(clave,valor) VALUES('cuota_diaria_actual',?)", (str(rate_decimal),))
+    conn.commit(); conn.close()
 
 
-def process_daily_quota(rate):
-    """Acredita una cuota manual única por fecha local a todas las inversiones activas."""
+def process_daily_quota(rate_decimal):
+    """Acredita una sola cuota por día. rate_decimal es 0.003 para 0,30%."""
     global LAST_DAILY_PROFITS
     LAST_DAILY_PROFITS = {}
-    rate = parse_quota(rate)
-    if rate is None:
-        return 0, 0.0, "Cuota inválida."
     try:
         tz = ZoneInfo(PROFIT_TIMEZONE)
     except Exception:
         tz = timezone.utc
     local_now = datetime.now(tz)
     date_key = local_now.date().isoformat()
+
     conn = db()
-    already = conn.execute("SELECT 1 FROM pagos_diarios WHERE fecha=?", (date_key,)).fetchone()
-    if already:
+    if conn.execute("SELECT 1 FROM pagos_diarios WHERE fecha=?", (date_key,)).fetchone():
         conn.close()
-        return 0, 0.0, "Ya existe un pago diario acreditado para hoy."
+        return 0, 0.0, {}, True
+
     rows = conn.execute("SELECT * FROM inversiones WHERE estado='activa'").fetchall()
-    processed = 0
-    total_profit = 0.0
-    credited_by_user = {}
+    processed = 0; total_profit = 0.0; credited_by_user = {}
     for inv in rows:
-        capital = float(inv['capital'])
-        accumulated = float(inv['ganancia_acumulada'])
-        target_profit = capital * (float(inv['multiplicador_objetivo']) - 1)
+        capital = float(inv["capital"])
+        accumulated = float(inv["ganancia_acumulada"])
+        target_profit = max(0.0, capital * (float(inv["multiplicador_objetivo"]) - 1.0))
         remaining = max(0.0, target_profit - accumulated)
-        profit = min(capital * rate, remaining)
+        profit = min(capital * rate_decimal, remaining)
         if profit <= 0:
-            conn.execute("UPDATE inversiones SET estado='completada', ultimo_calculo=? WHERE id=?", (now_iso(), inv['id']))
+            conn.execute("UPDATE inversiones SET estado='completada', ultimo_calculo=? WHERE id=?", (now_iso(), inv["id"]))
             continue
-        conn.execute("UPDATE inversiones SET ganancia_acumulada=ganancia_acumulada+?, ultimo_calculo=? WHERE id=?", (profit, now_iso(), inv['id']))
-        conn.execute("UPDATE usuarios SET ganancias=ganancias+?, ganancias_disponibles=ganancias_disponibles+?, saldo=saldo+? WHERE telegram_id=?", (profit, profit, profit, inv['telegram_id']))
-        conn.execute("INSERT INTO movimientos(telegram_id,tipo,monto,descripcion,fecha) VALUES(?,?,?,?,?)", (inv['telegram_id'], 'ganancia', profit, f'Pago diario {quota_label(rate)} inversión #{inv["id"]}', now_iso()))
-        if accumulated + profit >= target_profit:
-            conn.execute("UPDATE inversiones SET estado='completada' WHERE id=?", (inv['id'],))
-        processed += 1
-        total_profit += profit
-        uid = int(inv['telegram_id'])
-        credited_by_user[uid] = credited_by_user.get(uid, 0.0) + profit
+        conn.execute("UPDATE inversiones SET ganancia_acumulada=ganancia_acumulada+?, tasa_diaria=?, ultimo_calculo=? WHERE id=?", (profit, rate_decimal, now_iso(), inv["id"]))
+        conn.execute("UPDATE usuarios SET ganancias=ganancias+?, ganancias_disponibles=ganancias_disponibles+?, saldo=saldo+? WHERE telegram_id=?", (profit, profit, profit, inv["telegram_id"]))
+        conn.execute("INSERT INTO movimientos(telegram_id,tipo,monto,descripcion,fecha) VALUES(?,?,?,?,?)", (inv["telegram_id"], "ganancia", profit, f"Cuota diaria {quota_label(rate_decimal)} inversión #{inv['id']}", now_iso()))
+        if accumulated + profit >= target_profit - 1e-12:
+            conn.execute("UPDATE inversiones SET estado='completada' WHERE id=?", (inv["id"],))
+        processed += 1; total_profit += profit
+        uid = int(inv["telegram_id"]); credited_by_user[uid] = credited_by_user.get(uid, 0.0) + profit
+
     conn.execute("INSERT INTO pagos_diarios(fecha,fecha_proceso,total,inversiones) VALUES(?,?,?,?)", (date_key, now_iso(), total_profit, processed))
     conn.commit(); conn.close()
-    set_current_quota(rate)
     LAST_DAILY_PROFITS = credited_by_user
-    return processed, total_profit, ""
+    return processed, total_profit, credited_by_user, False
 
 
-async def send_daily_quota_notifications(application, rate):
-    if not LAST_DAILY_PROFITS:
-        return 0
-    image = IMAGES_DIR / f"{rate * 100:.2f}".replace(".", ",") + ".jpg"
+async def send_daily_quota_notifications(application, credited_by_user, rate_decimal):
     sent = 0
-    for user_id, profit in list(LAST_DAILY_PROFITS.items()):
-        try:
-            if image.exists():
-                with open(image, 'rb') as photo:
-                    await application.bot.send_photo(chat_id=user_id, photo=photo, caption=(
-                        f"✅ *CUOTA DIARIA ACREDITADA: {quota_label(rate)}*\n\n"
-                        f"💰 Ganancia acreditada hoy: *{money(profit)} USDT*\n"
-                        "La ganancia ya fue acreditada en tu cuenta."
-                    ), parse_mode='Markdown')
-            else:
-                await application.bot.send_message(chat_id=user_id, text=(
-                    f"✅ *CUOTA DIARIA ACREDITADA: {quota_label(rate)}*\n\n"
-                    f"💰 Ganancia acreditada hoy: *{money(profit)} USDT*"
-                ), parse_mode='Markdown')
+    image = IMAGES_DIR / (f"{rate_decimal * 100:.2f}".replace(".", ",") + ".jpg")
+    for user_id, profit in credited_by_user.items():
+        caption = (f"✅ *CUOTA DIARIA ACREDITADA*\n\n"
+                   f"📊 Cuota aplicada: *{quota_label(rate_decimal)}*\n"
+                   f"💰 Ganancia acreditada hoy: *{money(profit)} USDT*\n\n"
+                   "La ganancia ya fue acreditada en tu cuenta.")
+        if await send_image_to_user(application.bot, user_id, image, caption):
             sent += 1
-        except Exception as e:
-            print(f"⚠️ No se pudo notificar cuota a {user_id}: {e}")
     return sent
+
+
+def quota_keyboard():
+    buttons=[]; row=[]
+    for pct in DAILY_QUOTA_OPTIONS:
+        row.append(InlineKeyboardButton(quota_label(pct/100.0), callback_data=f"quota_{int(round(pct*100))}"))
+        if len(row)==4:
+            buttons.append(row); row=[]
+    if row: buttons.append(row)
+    buttons.append([InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def show_daily_quotas(query):
+    current = get_current_quota_decimal()
+    await query.edit_message_text(
+        "📊 *CUOTAS DIARIAS*\n\n"
+        f"Cuota configurada actualmente: *{quota_label(current) if current else 'Sin seleccionar'}*\n\n"
+        "Selecciona una cuota para acreditar hoy las ganancias de todas las inversiones activas.\n"
+        "⚠️ La cuota se interpreta como porcentaje: 0,30 = 0,30%, no 30%.\n"
+        "Cada usuario que reciba una acreditación recibirá la imagen correspondiente a la cuota seleccionada.\n\n"
+        "No se puede ejecutar dos veces la acreditación del mismo día.",
+        parse_mode="Markdown", reply_markup=quota_keyboard())
+
+
+async def process_quota_callback(query, context, rate_decimal):
+    if rate_decimal not in [round(x/100.0, 6) for x in DAILY_QUOTA_OPTIONS]:
+        await query.answer("Cuota no disponible.", show_alert=True); return
+    processed, total, credited, already = process_daily_quota(rate_decimal)
+    if already:
+        await query.edit_message_text("⚠️ *PAGO DIARIO YA REALIZADO*\n\nLa acreditación de hoy ya fue ejecutada. No se volverá a pagar una segunda vez el mismo día.", parse_mode="Markdown", reply_markup=back_inline())
+        return
+    set_current_quota(rate_decimal)
+    notified = await send_daily_quota_notifications(context.application, credited, rate_decimal) if credited else 0
+    await query.edit_message_text(
+        "✅ *CUOTA DIARIA APLICADA*\n\n"
+        f"📊 Cuota: *{quota_label(rate_decimal)}*\n"
+        f"📈 Inversiones acreditadas: *{processed}*\n"
+        f"💰 Total acreditado: *{money(total)} USDT*\n"
+        f"👥 Usuarios notificados: *{notified}*\n\n"
+        "La acreditación fue aplicada sobre el capital de cada inversión activa y limitada al objetivo restante de cada plan.",
+        parse_mode="Markdown", reply_markup=back_inline())
+
+
+async def show_daily_payment_info(query, context, rate_decimal=None):
+    if rate_decimal is None:
+        context.user_data["admin_payment_info"] = True
+        await query.edit_message_text(
+            "💰 *PAGO DIARIO*\n\n"
+            "Escribe la cuota que deseas consultar, por ejemplo: `0,30` para 0,30%.\n\n"
+            "Este botón es solamente informativo: NO acredita ganancias y NO envía imágenes.",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_home")]]) )
+        return
+    conn=db(); active_capital=conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]; active=conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]; conn.close()
+    due=float(active_capital)*rate_decimal
+    await query.edit_message_text(
+        "💰 *PAGO DIARIO — CÁLCULO INFORMATIVO*\n\n"
+        f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
+        f"👥 Inversiones activas: *{active}*\n"
+        f"📊 Cuota consultada: *{quota_label(rate_decimal)}*\n"
+        f"💵 Total que correspondería pagar hoy: *{money(due)} USDT*\n\n"
+        "ℹ️ Este cálculo NO acredita fondos, NO cambia saldos y NO envía imágenes.",
+        parse_mode="Markdown", reply_markup=back_inline())
 
 
 # =========================================================
@@ -1458,9 +1490,11 @@ async def receive_withdraw_amount(update, context):
 
     balance = user_balance(update.effective_user.id)
 
-    if amount > balance:
+    row = get_user(update.effective_user.id)
+    gains_available = float(row["ganancias_disponibles"] or 0) if row else 0.0
+    if amount > gains_available:
         await update.message.reply_text(
-            f"⚠️ Saldo insuficiente.\nDisponible: {money(balance)} USDT"
+            f"⚠️ Solo puedes retirar ganancias disponibles.\nDisponible para retirar: {money(gains_available)} USDT"
         )
         return WITHDRAW_AMOUNT
 
@@ -1800,7 +1834,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         profit = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada),0) s FROM inversiones").fetchone()["s"]
         finished = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='finalizada'").fetchone()["c"]
         conn.close()
-        daily = float(active_capital) * DAILY_RATE
+        daily = float(active_capital) * get_current_quota_decimal()
         text = (
             "📈 *RESUMEN DE INVERSIONES*\n\n"
             f"🟢 Inversiones activas: *{active_count}*\n"
@@ -1850,57 +1884,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "admin_profit":
-        conn = db()
-        active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
-        active_investments = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]
-        conn.close()
-        await query.edit_message_text(
-            "💰 *PAGO DIARIO — CONSULTA*\n\n"
-            f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
-            f"👥 Inversiones activas: *{active_investments}*\n\n"
-            "Escribe una cuota, por ejemplo: *0,35* o *0,50*, para calcular cuánto correspondería pagar hoy.\n\n"
-            "ℹ️ Esta opción es solamente informativa: no acredita el pago ni envía imágenes.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
-        )
-        context.user_data["admin_payment_info"] = True
+    if data == "admin_quotas":
+        await show_daily_quotas(query)
         return
 
-    if data == "admin_quotas":
-        buttons=[]; row=[]
-        for rate in DAILY_QUOTA_OPTIONS:
-            row.append(InlineKeyboardButton(quota_label(rate), callback_data=f"quota_{int(round(rate*10000)):02d}"))
-            if len(row)==4:
-                buttons.append(row); row=[]
-        if row: buttons.append(row)
-        buttons.append([InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")])
-        current=get_current_quota()
-        text=("📊 *CUOTAS DIARIAS*\n\n"
-              "Selecciona la cuota que vas a pagar hoy. El sistema acreditará esa cuota a cada inversión activa, respetando el límite de ganancia de cada plan.\n\n"
-              f"Cuota actual: *{quota_label(current) if current else 'No seleccionada'}*")
-        await query.edit_message_text(text,parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(buttons))
+    if data == "admin_profit":
+        await show_daily_payment_info(query, context)
         return
 
     if data.startswith("quota_"):
-        if not is_admin(user_id):
-            await query.answer("⛔ No autorizado.", show_alert=True); return
         try:
-            rate=int(data.split("_",1)[1])/10000.0
-        except Exception:
+            code = int(data.rsplit("_", 1)[1])
+            rate_decimal = code / 10000.0
+        except ValueError:
             await query.answer("Cuota inválida.", show_alert=True); return
-        processed,total,error=process_daily_quota(rate)
-        if error:
-            await query.answer(error,show_alert=True)
-            return
-        notified=await send_daily_quota_notifications(context.application,rate)
-        await query.edit_message_text(
-            f"✅ *CUOTA {quota_label(rate)} PROCESADA*\n\n"
-            f"📈 Inversiones acreditadas: *{processed}*\n"
-            f"💰 Total acreditado: *{money(total)} USDT*\n"
-            f"📨 Usuarios notificados: *{notified}*\n\n"
-            "La cuota de hoy quedó registrada y no puede volver a acreditarse el mismo día.",
-            parse_mode="Markdown",reply_markup=back_inline())
+        await process_quota_callback(query, context, rate_decimal)
         return
 
     if data == "admin_home":
@@ -2313,6 +2311,30 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["withdraw_admin_message"]=text; context.user_data["withdraw_admin_action"]="approve_photo"
             await update.message.reply_text("📸 Ahora envía la captura del comprobante de pago.",reply_markup=admin_keyboard()); return
 
+    if is_admin(update.effective_user.id) and context.user_data.get("admin_payment_info"):
+        if text == "/cancelar":
+            context.user_data.pop("admin_payment_info", None)
+            await update.message.reply_text("❌ Cálculo cancelado.", reply_markup=admin_keyboard())
+            return
+        try:
+            rate_decimal = parse_quota(text)
+        except ValueError as e:
+            await update.message.reply_text("⚠️ " + str(e) + " Ejemplo válido: 0,30", reply_markup=admin_keyboard())
+            return
+        context.user_data.pop("admin_payment_info", None)
+        # cálculo informativo únicamente
+        conn=db(); active_capital=conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]; active=conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]; conn.close()
+        due=float(active_capital)*rate_decimal
+        await update.message.reply_text(
+            "💰 *PAGO DIARIO — CÁLCULO INFORMATIVO*\n\n"
+            f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
+            f"👥 Inversiones activas: *{active}*\n"
+            f"📊 Cuota consultada: *{quota_label(rate_decimal)}*\n"
+            f"💵 Total que correspondería pagar hoy: *{money(due)} USDT*\n\n"
+            "ℹ️ Este cálculo NO acredita fondos, NO cambia saldos y NO envía imágenes.",
+            parse_mode="Markdown", reply_markup=admin_keyboard())
+        return
+
     # El administrador no entra nunca en el flujo de usuario.
     if is_admin(update.effective_user.id) and context.user_data.get("admin_broadcast"):
         if text == "/cancelar":
@@ -2377,7 +2399,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
         "💾 Crear respaldo": "admin_backup", "♻️ Restaurar respaldo": "admin_restore",
         "🔒 Bloquear bot": "admin_lock", "🔓 Desbloquear bot": "admin_unlock",
-        "💰 Pago diario": "admin_profit", "📊 Cuotas Diarias": "admin_quotas",
+        "💰 Pago Diario": "admin_profit", "📊 Cuotas Diarias": "admin_quotas",
         "📊 Estado": "admin_status",
         "📢 Enviar mensaje": "admin_broadcast",
     }
@@ -2628,11 +2650,11 @@ async def handle_text_panel_action(update, context, action):
     if action == "admin_quotas":
         buttons=[]; row=[]
         for rate in DAILY_QUOTA_OPTIONS:
-            row.append(InlineKeyboardButton(quota_label(rate), callback_data=f"quota_{int(round(rate*10000)):02d}"))
+            row.append(InlineKeyboardButton(quota_label(rate), callback_data=f"quota_{int(round(rate*100)):02d}"))
             if len(row)==4:
                 buttons.append(row); row=[]
         if row: buttons.append(row)
-        current=get_current_quota()
+        current=get_current_quota_decimal()
         await update.message.reply_text(
             "📊 *CUOTAS DIARIAS*\n\n"
             "Selecciona la cuota que vas a pagar hoy. Se acreditará a todas las inversiones activas y se enviará la imagen correspondiente.\n\n"
@@ -2653,10 +2675,10 @@ async def handle_text_panel_action(update, context, action):
         conn=db(); rows=conn.execute("SELECT telegram_id FROM usuarios WHERE telegram_id != ?",(ADMIN_TELEGRAM_ID,)).fetchall(); conn.close()
         for row in rows:
             try:
-                if LOCK_IMAGE.exists():
-                    with open(LOCK_IMAGE,"rb") as photo: await context.bot.send_photo(chat_id=row["telegram_id"],photo=photo)
-                else: await context.bot.send_message(chat_id=row["telegram_id"],text="🔧 Bot en mantenimiento.")
-                sent+=1
+                if await send_image_to_user(context.bot, row["telegram_id"], LOCK_IMAGE):
+                    sent += 1
+                else:
+                    failed += 1
             except Exception as e: failed+=1; print(e)
         await update.message.reply_text(f"🔒 *BOT BLOQUEADO*\n\nUsuarios notificados: {sent}\nNo enviados: {failed}", parse_mode="Markdown", reply_markup=admin_keyboard())
         return
@@ -2669,10 +2691,10 @@ async def handle_text_panel_action(update, context, action):
         conn=db(); rows=conn.execute("SELECT telegram_id FROM usuarios WHERE telegram_id != ?",(ADMIN_TELEGRAM_ID,)).fetchall(); conn.close()
         for row in rows:
             try:
-                if UNLOCK_IMAGE.exists():
-                    with open(UNLOCK_IMAGE,"rb") as photo: await context.bot.send_photo(chat_id=row["telegram_id"],photo=photo)
-                else: await context.bot.send_message(chat_id=row["telegram_id"],text="✅ Bot operativo.")
-                sent+=1
+                if await send_image_to_user(context.bot, row["telegram_id"], UNLOCK_IMAGE):
+                    sent += 1
+                else:
+                    failed += 1
             except Exception as e: failed+=1; print(e)
         await update.message.reply_text(f"🔓 *BOT DESBLOQUEADO*\n\nUsuarios notificados: {sent}\nNo enviados: {failed}", parse_mode="Markdown", reply_markup=admin_keyboard())
         return
@@ -2770,8 +2792,8 @@ def create_excel_backup():
         ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
         for col_cells in ws.columns:
             max_len=max([len(str(c.value or "")) for c in list(col_cells)[:200]]+[12]); ws.column_dimensions[col_cells[0].column_letter].width=min(max_len+2,40)
-    ws=wb.create_sheet("resumen"); active=conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]; daily=float(active)*DAILY_RATE
-    ws.append(["Indicador","Valor"]); ws.append(["Fecha UTC",now_iso()]); ws.append(["Cuota diaria actual",get_current_quota() or "No seleccionada"]); ws.append(["Capital activo invertido (USDT)",float(active)]); ws.append(["Pago diario estimado con cuota actual (USDT)",daily]); ws.append(["Ganancias disponibles para retiro (USDT)",float(conn.execute("SELECT COALESCE(SUM(ganancias_disponibles),0) s FROM usuarios").fetchone()["s"])])
+    ws=wb.create_sheet("resumen"); active=conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]; daily=float(active)*get_current_quota_decimal()
+    ws.append(["Indicador","Valor"]); ws.append(["Fecha UTC",now_iso()]); ws.append(["Cuota diaria actual",get_current_quota_decimal() if get_current_quota_decimal() else "Sin seleccionar"]); ws.append(["Capital activo invertido (USDT)",float(active)]); ws.append(["Pago diario estimado con cuota actual (USDT)",daily]); ws.append(["Ganancias disponibles para retiro (USDT)",float(conn.execute("SELECT COALESCE(SUM(ganancias_disponibles),0) s FROM usuarios").fetchone()["s"])])
     conn.close(); output=BytesIO(); wb.save(output); output.seek(0); return output
 
 async def send_excel_backup(bot, reason="Respaldo automático"):
@@ -2814,7 +2836,7 @@ async def send_full_backup(bot, reason="Respaldo solicitado"):
 
 
 async def automatic_profit_loop(application):
-    """Compatibilidad: no realiza pagos automáticos. Los pagos son manuales y variables."""
+    """Compatibilidad: no realiza pagos automáticos. Las cuotas se aplican manualmente desde el panel."""
     while True:
         await asyncio.sleep(86400)
 
@@ -2860,9 +2882,7 @@ async def manual_deposit_photo(update, context):
         try:
             await context.bot.send_message(chat_id=row['telegram_id'],text=f"✅ *RETIRO APROBADO*\n\nSolicitud #{wid}.\nMonto: *{money(row['monto'])} USDT*\n\n{msg}",parse_mode="Markdown")
             await context.bot.send_photo(chat_id=row['telegram_id'],photo=photo,caption=f"📸 Comprobante del retiro #{wid}")
-            if WITHDRAW_SENT_IMAGE.exists():
-                with open(WITHDRAW_SENT_IMAGE,"rb") as sent_photo:
-                    await context.bot.send_photo(chat_id=row['telegram_id'],photo=sent_photo)
+            await send_image_to_user(context.bot, row['telegram_id'], WITHDRAW_SENT_IMAGE)
         except Exception as e: print(e)
         return
     if context.user_data.get("manual_flow") != "deposit_photo":
