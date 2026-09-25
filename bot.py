@@ -4,6 +4,7 @@ import shutil
 import uuid
 import asyncio
 from io import BytesIO
+from html import escape
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -60,12 +61,17 @@ TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
+WITHDRAWAL_FEE_RATE = 0.03
+REFERRAL_BONUS_RATE = float(os.getenv("REFERRAL_BONUS_RATE", "0.03") or "0.03")
+ADMIN_WALLET_URL = os.getenv("ADMIN_WALLET_URL", "").strip()
+TRONSCAN_TX_URL = "https://tronscan.org/#/transaction/"
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
 IMAGES_DIR = Path(__file__).resolve().parent / "images"
 WELCOME_IMAGE = IMAGES_DIR / "bienvenida.jpg"
 LOCK_IMAGE = IMAGES_DIR / "bot bloqueado.jpg"
 UNLOCK_IMAGE = IMAGES_DIR / "bot operativo.jpg"
 WITHDRAW_SENT_IMAGE = IMAGES_DIR / "retiro enviado.jpg"
+USDT_ICON_IMAGE = IMAGES_DIR / "usdt_trc20_icon.png"
 
 # Usuarios y ganancias acreditadas en la última ejecución manual.
 # Se utiliza para enviar una sola notificación por usuario, aunque tenga varias inversiones.
@@ -131,7 +137,12 @@ def init_db():
             total_retirado REAL NOT NULL DEFAULT 0,
             codigo_referido TEXT UNIQUE,
             referido_por TEXT,
-            fecha_registro TEXT NOT NULL
+            fecha_registro TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            telefono TEXT NOT NULL DEFAULT '',
+            pais TEXT NOT NULL DEFAULT '',
+            wallet_retiro TEXT NOT NULL DEFAULT '',
+            registro_completo INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -208,6 +219,17 @@ def init_db():
         cur.execute("ALTER TABLE usuarios ADD COLUMN ganancias_disponibles REAL NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    for column_sql in [
+        "ALTER TABLE usuarios ADD COLUMN email TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE usuarios ADD COLUMN telefono TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE usuarios ADD COLUMN pais TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE usuarios ADD COLUMN wallet_retiro TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE usuarios ADD COLUMN registro_completo INTEGER NOT NULL DEFAULT 0",
+    ]:
+        try:
+            cur.execute(column_sql)
+        except sqlite3.OperationalError:
+            pass
     try:
         cur.execute("ALTER TABLE depositos ADD COLUMN plan_monto REAL NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
@@ -237,6 +259,16 @@ def init_db():
 
 def money(value):
     return f"{float(value):,.2f}"
+
+
+def tx_explorer_url(tx_hash):
+    return TRONSCAN_TX_URL + quote(str(tx_hash).strip(), safe="")
+
+
+def admin_wallet_url():
+    # Solo abre la wallet configurada por el administrador.
+    # No se usa TRONSCAN como sustituto.
+    return ADMIN_WALLET_URL
 
 
 def is_admin(user_id):
@@ -276,10 +308,9 @@ def ensure_user(user, start_ref=None):
     if existing:
         conn.execute("""
             UPDATE usuarios
-            SET nombre = ?, username = ?
+            SET username = ?
             WHERE telegram_id = ?
         """, (
-            user.full_name or "",
             user.username or "",
             user.id
         ))
@@ -303,12 +334,12 @@ def ensure_user(user, start_ref=None):
     conn.execute("""
         INSERT INTO usuarios (
             telegram_id, nombre, username, codigo_referido,
-            referido_por, fecha_registro
+            referido_por, fecha_registro, registro_completo
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
     """, (
         user.id,
-        user.full_name or "",
+        "",
         user.username or "",
         ref_code,
         referido_por,
@@ -395,6 +426,142 @@ def user_balance(telegram_id):
     return float(row["saldo"])
 
 
+def registration_complete(telegram_id):
+    row = get_user(telegram_id)
+    if not row:
+        return False
+    return bool(int(row["registro_completo"] or 0)) and bool((row["username"] or "").strip())
+
+
+def registration_missing_step(row, telegram_user=None):
+    username = (telegram_user.username if telegram_user else row["username"]) or ""
+    if not username.strip():
+        return "username"
+    if not (row["nombre"] or "").strip():
+        return "nombre"
+    if not (row["email"] or "").strip():
+        return "email"
+    if not (row["telefono"] or "").strip():
+        return "telefono"
+    if not (row["pais"] or "").strip():
+        return "pais"
+    if not (row["wallet_retiro"] or "").strip():
+        return "wallet"
+    return None
+
+
+def save_registration_field(telegram_id, field, value):
+    allowed = {"nombre", "email", "telefono", "pais", "wallet_retiro"}
+    if field not in allowed:
+        raise ValueError("Campo de registro no permitido")
+    conn = db()
+    conn.execute(f"UPDATE usuarios SET {field}=? WHERE telegram_id=?", (value.strip(), telegram_id))
+    conn.commit(); conn.close()
+
+
+def mark_registration_complete_if_ready(telegram_id, telegram_user=None):
+    conn = db()
+    row = conn.execute("SELECT * FROM usuarios WHERE telegram_id=?", (telegram_id,)).fetchone()
+    if not row:
+        conn.close(); return False
+    username = (telegram_user.username if telegram_user else row["username"]) or ""
+    complete = bool(username.strip() and row["nombre"].strip() and row["email"].strip() and row["telefono"].strip() and row["pais"].strip() and row["wallet_retiro"].strip())
+    conn.execute("UPDATE usuarios SET username=?, registro_completo=? WHERE telegram_id=?", (username.strip(), 1 if complete else 0, telegram_id))
+    conn.commit(); conn.close()
+    return complete
+
+
+async def prompt_registration(update, context, force_step=None, user=None):
+    user = user or getattr(update, "effective_user", None)
+    if user is None:
+        raise ValueError("No se pudo identificar al usuario para el registro")
+    row = get_user(user.id)
+    if not row:
+        ensure_user(user)
+        row = get_user(user.id)
+    step = force_step or registration_missing_step(row, user)
+    context.user_data["registration_step"] = step
+    messages = {
+        "username": (
+            "📝 *REGISTRO OBLIGATORIO*\n\n"
+            "Antes de utilizar el sistema debes configurar un *nombre de usuario de Telegram (@usuario)*.\n\n"
+            "Ve a *Ajustes de Telegram → Editar perfil → Nombre de usuario*, configura uno y después vuelve al bot y pulsa /start."
+        ),
+        "nombre": "👤 *REGISTRO — NOMBRE*\n\nEscribe tu nombre y apellidos.",
+        "email": "📧 *REGISTRO — CORREO*\n\nEscribe tu dirección de correo electrónico.",
+        "telefono": "📱 *REGISTRO — TELÉFONO*\n\nEscribe tu número de teléfono con el que podamos contactarte por WhatsApp.",
+        "pais": "🌎 *REGISTRO — PAÍS*\n\nEscribe el país donde resides.",
+        "wallet": "💳 *REGISTRO — WALLET DE RETIRO*\n\nEscribe tu dirección de *USDT TRC20* donde deseas recibir tus retiros.",
+    }
+    message = getattr(update, "effective_message", None) or update
+    await message.reply_text(messages[step], parse_mode="Markdown")
+
+
+async def registration_text(update, context, text):
+    user = update.effective_user
+    row = get_user(user.id)
+    if not row:
+        ensure_user(user)
+        row = get_user(user.id)
+    # Telegram username debe existir; el bot no puede crearlo por el usuario.
+    if not (user.username or "").strip():
+        await prompt_registration(update, context, "username")
+        return True
+    conn = db(); conn.execute("UPDATE usuarios SET username=? WHERE telegram_id=?", (user.username.strip(), user.id)); conn.commit(); conn.close()
+    row = get_user(user.id)
+    step = context.user_data.get("registration_step") or registration_missing_step(row, user)
+    if not step:
+        mark_registration_complete_if_ready(user.id, user)
+        context.user_data.pop("registration_step", None)
+        return False
+    if step == "username":
+        await prompt_registration(update, context, "nombre")
+        return True
+    if step == "nombre":
+        if len(text) < 2:
+            await update.message.reply_text("⚠️ Escribe tu nombre y apellidos.")
+            return True
+        save_registration_field(user.id, "nombre", text)
+        await prompt_registration(update, context, "email")
+        return True
+    if step == "email":
+        import re
+        if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", text):
+            await update.message.reply_text("⚠️ Ese correo no parece válido. Escríbelo nuevamente.")
+            return True
+        save_registration_field(user.id, "email", text)
+        await prompt_registration(update, context, "telefono")
+        return True
+    if step == "telefono":
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) < 7:
+            await update.message.reply_text("⚠️ Introduce un número de teléfono válido para WhatsApp.")
+            return True
+        save_registration_field(user.id, "telefono", text)
+        await prompt_registration(update, context, "pais")
+        return True
+    if step == "pais":
+        if len(text) < 2:
+            await update.message.reply_text("⚠️ Escribe el nombre de tu país.")
+            return True
+        save_registration_field(user.id, "pais", text)
+        await prompt_registration(update, context, "wallet")
+        return True
+    if step == "wallet":
+        address = text.strip()
+        if len(address) < 20 or not address.startswith("T"):
+            await update.message.reply_text("⚠️ Introduce una dirección USDT TRC20 válida. Normalmente comienza por T.")
+            return True
+        save_registration_field(user.id, "wallet_retiro", address)
+        complete = mark_registration_complete_if_ready(user.id, user)
+        context.user_data.pop("registration_step", None)
+        if complete:
+            await update.message.reply_text("✅ *REGISTRO COMPLETADO*\n\nYa tienes acceso al panel del sistema.", parse_mode="Markdown")
+            await send_user_menu(user.id, context)
+        return True
+    return False
+
+
 # =========================================================
 # MANTENIMIENTO Y ESTADO DEL SISTEMA
 # =========================================================
@@ -462,10 +629,10 @@ async def maintenance_guard(update):
 def user_keyboard():
     return ReplyKeyboardMarkup([
         ["👤 Mi cuenta", "📈 Inversiones"],
-        ["💎 Planes de Inversión"],
-        ["💸 Retirar"],
+        ["💰 Planes de Inversión"],
+        ["🔄 Reinvertir saldo", "💸 Retirar"],
         ["🤝 Referidos", "📜 Historial"],
-        ["ℹ️ Información"],
+        ["🆘 Soporte", "ℹ️ Información"],
     ], resize_keyboard=True, is_persistent=True)
 
 
@@ -526,20 +693,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👑 *PANEL DE ADMINISTRACIÓN*\n\n"
             "Este usuario tiene acceso exclusivamente al panel administrativo."
         )
-    else:
-        if is_new and WELCOME_IMAGE.exists():
-            try:
-                with open(WELCOME_IMAGE, "rb") as photo:
-                    await context.bot.send_photo(chat_id=user.id, photo=photo)
-            except Exception as e:
-                print(f"⚠️ No se pudo enviar bienvenida: {e}")
-        await send_user_menu(
-            user.id,
-            context,
-            f"👋 *Bienvenido, {user.first_name or 'usuario'}*\n\n"
-            "Desde aquí puedes administrar tu cuenta, depositar, "
-            "solicitar retiros, consultar inversiones y compartir tu enlace de referido."
-        )
+        return
+
+    if is_new and WELCOME_IMAGE.exists():
+        try:
+            with open(WELCOME_IMAGE, "rb") as photo:
+                await context.bot.send_photo(chat_id=user.id, photo=photo)
+        except Exception as e:
+            print(f"⚠️ No se pudo enviar bienvenida: {e}")
+
+    row = get_user(user.id)
+    step = registration_missing_step(row, user) if row else "username"
+    if step:
+        await prompt_registration(update, context, step)
+        return
+
+    mark_registration_complete_if_ready(user.id, user)
+    await send_user_menu(
+        user.id,
+        context,
+        f"👋 *Bienvenido, {user.first_name or 'usuario'}*\n\n"
+        "Tu registro está completo. Selecciona una opción:"
+    )
 
 
 # =========================================================
@@ -598,7 +773,6 @@ async def show_account(query):
         f"📥 Total depositado: *{money(total_depositado)} USDT*\n"
         f"📈 Capital invertido: *{money(row['invertido'])} USDT*\n"
         f"💵 Ganancias acumuladas: *{money(ganancias)} USDT*\n"
-        f"💳 Ganancias disponibles para retirar: *{money(row['ganancias_disponibles'] or 0)} USDT*\n"
         
         f"📤 Total retirado: *{money(total_retirado)} USDT*\n\n"
         "El saldo disponible es el dinero acreditado que todavía no está invertido y puede utilizarse según los planes disponibles."
@@ -612,6 +786,79 @@ async def show_account(query):
             [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
     )
+
+
+# =========================================================
+# REINVERSIÓN DE GANANCIAS
+# =========================================================
+
+async def show_reinvest(query):
+    user_id = query.from_user.id
+    row = get_user(user_id)
+    gains = float(row["ganancias_disponibles"] or 0) if row else 0.0
+    if gains < MIN_INVESTMENT:
+        await query.edit_message_text(
+            "🔄 *REINVERTIR SALDO*\n\n"
+            f"Tu saldo acumulado de ganancias es de *{money(gains)} USDT*.\n\n"
+            f"⚠️ No es suficiente para una nueva inversión. El mínimo para reinvertir es de *{money(MIN_INVESTMENT)} USDT*.\n\n"
+            "Puedes seguir acumulando ganancias o retirarlas cuando cumplas las condiciones de retiro.",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]])
+        )
+        return
+    buttons=[]; row_buttons=[]
+    for amount in INVESTMENT_PLANS:
+        if amount <= gains:
+            row_buttons.append(InlineKeyboardButton(f"🟢 {money(amount)} USDT", callback_data=f"reinvest_{amount}"))
+            if len(row_buttons)==3:
+                buttons.append(row_buttons); row_buttons=[]
+    if row_buttons: buttons.append(row_buttons)
+    buttons.append([InlineKeyboardButton("⬅️ Atrás", callback_data="user_home")])
+    await query.edit_message_text(
+        "🔄 *REINVERTIR SALDO*\n\n"
+        f"Ganancias disponibles para reinvertir: *{money(gains)} USDT*\n\n"
+        "Selecciona el nuevo plan. El importe se descontará únicamente de tus ganancias disponibles y se creará como una nueva inversión independiente.",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+def credit_referral_bonus(conn, referred_user_id, investment_amount, investment_id):
+    row = conn.execute("SELECT referido_por FROM usuarios WHERE telegram_id=?", (referred_user_id,)).fetchone()
+    if not row or not row["referido_por"]:
+        return 0.0, None
+    referrer = conn.execute("SELECT telegram_id FROM usuarios WHERE codigo_referido=?", (row["referido_por"],)).fetchone()
+    if not referrer or int(referrer["telegram_id"]) == int(referred_user_id):
+        return 0.0, None
+    bonus = round(float(investment_amount) * REFERRAL_BONUS_RATE, 2)
+    if bonus <= 0:
+        return 0.0, None
+    conn.execute("UPDATE usuarios SET saldo=saldo+?, ganancias_disponibles=ganancias_disponibles+?, ganancias=ganancias+? WHERE telegram_id=?", (bonus, bonus, bonus, referrer["telegram_id"]))
+    conn.execute("UPDATE referidos SET bono=bono+? WHERE referido_id=? AND referidor_id=?", (bonus, referred_user_id, referrer["telegram_id"]))
+    conn.execute("INSERT INTO movimientos(telegram_id,tipo,monto,descripcion,fecha) VALUES(?,?,?,?,?)", (referrer["telegram_id"], "bono_referido", bonus, f"Bono de referido {REFERRAL_BONUS_RATE*100:.0f}% por inversión #{investment_id}", now_iso()))
+    return bonus, int(referrer["telegram_id"])
+
+
+async def perform_reinvestment(query, amount):
+    user_id = query.from_user.id
+    if amount not in INVESTMENT_PLANS or amount < MIN_INVESTMENT:
+        await query.answer("Plan no disponible.", show_alert=True); return
+    conn=db()
+    row=conn.execute("SELECT ganancias_disponibles FROM usuarios WHERE telegram_id=?",(user_id,)).fetchone()
+    gains=float(row["ganancias_disponibles"] or 0) if row else 0.0
+    if gains < amount:
+        conn.close()
+        await query.answer(f"No tienes {money(amount)} USDT de ganancias disponibles para este plan.", show_alert=True); return
+    now=now_iso()
+    cur=conn.execute("INSERT INTO inversiones(telegram_id,plan,capital,ganancia_acumulada,tasa_diaria,multiplicador_objetivo,estado,fecha_inicio,ultimo_calculo) VALUES(?,?,?,0,?,2.0,'activa',?,?)",(user_id,f"Plan {money(amount)} USDT",amount,DAILY_RATE,now,now))
+    investment_id=cur.lastrowid
+    conn.execute("UPDATE usuarios SET saldo=saldo-?, ganancias_disponibles=ganancias_disponibles-? WHERE telegram_id=?",(amount,amount,user_id))
+    bonus, referrer_id=credit_referral_bonus(conn,user_id,amount,investment_id)
+    conn.commit(); conn.close()
+    add_movement(user_id,"reinversion",amount,f"Reinversión de ganancias: Plan {money(amount)} USDT")
+    if bonus and referrer_id:
+        try:
+            await query.get_bot().send_message(chat_id=referrer_id,text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por una inversión de *{money(amount)} USDT* realizada por un usuario que se registró con tu enlace."),parse_mode="Markdown")
+        except Exception as e: print(f"Error notificando bono: {e}")
+    await query.edit_message_text("✅ *REINVERSIÓN CREADA*\n\n" f"Plan: *{money(amount)} USDT*\n" f"Ganancias utilizadas: *{money(amount)} USDT*\n" "\nLa inversión es independiente de tus demás planes.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📈 Ver inversiones",callback_data="user_invest")],[InlineKeyboardButton("🏠 Menú Principal",callback_data="user_home")]]))
 
 
 # =========================================================
@@ -666,7 +913,9 @@ async def show_referrals(query, context):
         "Tu enlace personal:\n"
         f"`{link}`\n\n"
         f"👥 Personas registradas: *{count}*\n"
-        f"🎁 Bonos acumulados: *{money(bonus)} USDT*\n\n"
+        f"🎁 Bonos acumulados: *{money(bonus)} USDT*\n"
+        f"📈 Bonificación por inversión referida: *{REFERRAL_BONUS_RATE*100:.0f}%*\n\n"
+        "La bonificación se acredita cuando el usuario referido realiza la inversión, no cuando solamente deposita.\n\n"
         "Comparte el enlace para que otros puedan registrarse usando tu referencia."
     )
 
@@ -678,30 +927,41 @@ async def show_referrals(query, context):
 
 
 # =========================================================
+# SOPORTE
+# =========================================================
+
+async def show_support(query, context):
+    context.user_data["support_waiting"] = True
+    await query.edit_message_text(
+        "🆘 *SOPORTE*\n\n"
+        "Escribe ahora tu consulta o el problema que deseas enviar al administrador.\n\n"
+        "Tu mensaje será enviado de forma privada al administrador y su respuesta llegará únicamente a ti.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="user_home")]])
+    )
+
+
+# =========================================================
 # INFORMACIÓN
 # =========================================================
 
 async def show_info(query):
-    texto = (
-        "ℹ️ *INFORMACIÓN DEL SISTEMA*\n\n"
-        "📊 Rendimiento diario: *variable* según la cuota seleccionada por el administrador.\n"
-        "🎯 Cada plan permanece activo hasta alcanzar una ganancia acumulada equivalente al *100% del capital inicial* (200% en valor total).\n"
-        f"💵 Inversión mínima: *{money(MIN_INVESTMENT)} USDT*\n"
-        f"💸 Retiro mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
-        "🗓️ Frecuencia de retiros: *1 solicitud cada 7 días*\n"
-        "📅 Los pagos diarios se acreditan manualmente por el administrador usando una cuota variable.\n\n"
-        "🌐 Red de depósitos y retiros: *TRC20*\n"
-        "📥 Los depósitos son revisados manualmente por el administrador.\n"
-        "📤 Los retiros también son revisados manualmente."
-    )
-
-    await query.edit_message_text(
-        texto,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
-        ])
-    )
+    temas = [
+        "🔹 *¿QUÉ ES EL SISTEMA?*\nEs un sistema de inversión en el que se gestiona el capital mediante operaciones de trading.",
+        "🔹 *CUOTAS DIARIAS*\nLas cuotas son variables y dependen de los resultados diarios obtenidos en el mercado.",
+        f"🔹 *PLANES DE INVERSIÓN*\nLa inversión mínima es de *{money(MIN_INVESTMENT)} USDT* por plan, mediante la red *TRC20*.",
+        "🔹 *FINALIZACIÓN DEL PLAN*\nCada plan termina cuando la ganancia acumulada alcanza el 100% del capital inicial, es decir, cuando el valor total del plan llega al 200% de la inversión inicial.",
+        "🔹 *ACREDITACIÓN DE GANANCIAS*\nLas ganancias se generan de lunes a viernes. No existe una hora exacta para la acreditación; las ganancias serán acreditadas siempre antes de las 20:00.",
+        f"🔹 *RETIROS*\nEl retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT* y se permite *una solicitud cada 7 días*. Se aplica una comisión del *3%* por cada retiro realizado.",
+        "🔹 *REINVERSIÓN*\nPuedes reinvertir el saldo acumulado de tus ganancias como un nuevo plan cuando alcances el mínimo de *50 USDT*.",
+        "🔹 *TRANSFERENCIAS INTERNAS*\nNo existe transferencia de saldo entre usuarios dentro del sistema.",
+        "🔹 *DEPÓSITOS Y RED*\nLos depósitos se realizan en USDT mediante la red TRC20 y son revisados manualmente por el administrador.",
+        f"🔹 *REFERIDOS*\nCuando un usuario se registra mediante tu enlace y realiza una inversión, el sistema acredita al referente una bonificación del *{REFERRAL_BONUS_RATE*100:.0f}%* del importe invertido.",
+    ]
+    texto = "ℹ️ *INFORMACIÓN DEL SISTEMA*\n\n" + "\n\n".join(temas)
+    await query.edit_message_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+    ]))
 
 
 # =========================================================
@@ -717,12 +977,15 @@ async def show_plans(query):
     balance = float(row["saldo"]) if row else 0.0
 
     buttons = []
-    # Mostrar los planes en una cuadrícula de 3 columnas.
+    # Telegram no permite imágenes dentro de un botón.
+    # Por eso mostramos el icono USDT TRC20 circular como imagen del panel
+    # y dejamos los botones únicamente con el importe de cada plan.
     row_buttons = []
     for amount in INVESTMENT_PLANS:
-        row_buttons.append(InlineKeyboardButton(f"💎 {money(amount)} USDT", callback_data=f"plan_{amount}"))
+        row_buttons.append(InlineKeyboardButton(f"{money(amount)} USDT", callback_data=f"plan_{amount}"))
         if len(row_buttons) == 3:
-            buttons.append(row_buttons); row_buttons = []
+            buttons.append(row_buttons)
+            row_buttons = []
     if row_buttons:
         buttons.append(row_buttons)
 
@@ -732,13 +995,21 @@ async def show_plans(query):
     ])
 
     texto = (
-        "💎 *PLANES DE INVERSIÓN*\n\n"
+        "💰 *PLANES DE INVERSIÓN*\n\n"
         f"Saldo disponible: *{money(balance)} USDT*\n"
         "Rendimiento diario: *variable* según la cuota seleccionada por el administrador.\n\n"
         "Selecciona el plan que deseas contratar. Cada vez que eliges un plan se crea una inversión independiente; tus planes anteriores no se reutilizan ni bloquean la compra de otro plan."
     )
-    await query.edit_message_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
+    # Mostramos el icono circular enviado por el administrador al entrar en Planes.
+    if USDT_ICON_IMAGE.exists():
+        try:
+            with open(USDT_ICON_IMAGE, "rb") as photo:
+                await query.message.reply_photo(photo=photo)
+        except Exception as e:
+            print(f"⚠️ No se pudo enviar el icono USDT TRC20: {e}")
+
+    await query.edit_message_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def select_plan(query, amount):
     user_id = query.from_user.id
@@ -844,10 +1115,16 @@ async def invest_available_plan(query, deposit_id):
         WHERE telegram_id = ?
     """, (amount, amount, user_id))
     conn.execute("UPDATE depositos SET inversion_id = ? WHERE id = ?", (investment_id, deposit_id))
+    bonus, referrer_id = credit_referral_bonus(conn, user_id, amount, investment_id)
     conn.commit()
     conn.close()
 
     add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT (depósito #{deposit_id})")
+    if bonus and referrer_id:
+        try:
+            await query.get_bot().send_message(chat_id=referrer_id, text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por una inversión de *{money(amount)} USDT* realizada por un usuario que se registró con tu enlace."), parse_mode="Markdown")
+        except Exception as e:
+            print(f"Error notificando bono de referido: {e}")
 
     await query.edit_message_text(
         "✅ *INVERSIÓN CREADA*\n\n"
@@ -878,7 +1155,8 @@ async def start_plan_deposit(query, context, plan_amount):
         f"Plan seleccionado: *{money(plan_amount)} USDT*\n"
         f"Monto exacto a depositar: *{money(plan_amount)} USDT*\n\n"
         "Este depósito es independiente de cualquier depósito anterior. No se descuenta ni se completa con tu saldo anterior.\n\n"
-        f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
+        "🟢 *WALLET DE DEPÓSITO*\n"
+        f"`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
         "Realiza el depósito por el monto indicado y después envía aquí el TXID. No necesitas escribir la cantidad.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -1160,18 +1438,18 @@ def process_daily_quota(rate_decimal):
     except Exception:
         tz = timezone.utc
     local_now = datetime.now(tz)
+    # Las ganancias se generan de lunes a viernes.
+    if local_now.weekday() >= 5:
+        return 0, 0.0, {}, False, "weekend"
     date_key = local_now.date().isoformat()
-
     conn = db()
     if conn.execute("SELECT 1 FROM pagos_diarios WHERE fecha=?", (date_key,)).fetchone():
         conn.close()
-        return 0, 0.0, {}, True
-
+        return 0, 0.0, {}, True, "already"
     rows = conn.execute("SELECT * FROM inversiones WHERE estado='activa'").fetchall()
-    processed = 0; total_profit = 0.0; credited_by_user = {}
+    processed = 0; total_profit = 0.0; credited_by_user = {}; details_by_user = {}
     for inv in rows:
-        capital = float(inv["capital"])
-        accumulated = float(inv["ganancia_acumulada"])
+        capital = float(inv["capital"]); accumulated = float(inv["ganancia_acumulada"])
         target_profit = max(0.0, capital * (float(inv["multiplicador_objetivo"]) - 1.0))
         remaining = max(0.0, target_profit - accumulated)
         profit = min(capital * rate_decimal, remaining)
@@ -1185,20 +1463,26 @@ def process_daily_quota(rate_decimal):
             conn.execute("UPDATE inversiones SET estado='completada' WHERE id=?", (inv["id"],))
         processed += 1; total_profit += profit
         uid = int(inv["telegram_id"]); credited_by_user[uid] = credited_by_user.get(uid, 0.0) + profit
-
+        details_by_user.setdefault(uid, []).append((str(inv["plan"]), profit))
     conn.execute("INSERT INTO pagos_diarios(fecha,fecha_proceso,total,inversiones) VALUES(?,?,?,?)", (date_key, now_iso(), total_profit, processed))
     conn.commit(); conn.close()
     LAST_DAILY_PROFITS = credited_by_user
-    return processed, total_profit, credited_by_user, False
+    return processed, total_profit, credited_by_user, False, details_by_user
 
 
-async def send_daily_quota_notifications(application, credited_by_user, rate_decimal):
+async def send_daily_quota_notifications(application, credited_by_user, rate_decimal, details_by_user=None):
     sent = 0
     image = IMAGES_DIR / (f"{rate_decimal * 100:.2f}".replace(".", ",") + ".jpg")
+    details_by_user = details_by_user or {}
     for user_id, profit in credited_by_user.items():
-        caption = (f"✅ *CUOTA DIARIA ACREDITADA*\n\n"
-                   f"📊 Cuota aplicada: *{quota_label(rate_decimal)}*\n"
-                   f"💰 Ganancia acreditada hoy: *{money(profit)} USDT*\n\n"
+        lines = []
+        for plan, plan_profit in details_by_user.get(user_id, []):
+            lines.append(f"• *{plan}*: +{money(plan_profit)} USDT")
+        detail_text = "\n".join(lines) if lines else f"• Ganancia: +{money(profit)} USDT"
+        caption = (f"✅ *GANANCIAS DEL DÍA ACREDITADAS*\n\n"
+                   f"📊 Cuota aplicada: *{quota_label(rate_decimal)}*\n\n"
+                   "📋 *Detalle por plan:*\n" + detail_text + "\n\n"
+                   f"💰 *TOTAL DE GANANCIA ACREDITADA: +{money(profit)} USDT*\n\n"
                    "La ganancia ya fue acreditada en tu cuenta.")
         if await send_image_to_user(application.bot, user_id, image, caption):
             sent += 1
@@ -1231,12 +1515,16 @@ async def show_daily_quotas(query):
 async def process_quota_callback(query, context, rate_decimal):
     if rate_decimal not in [round(x/100.0, 6) for x in DAILY_QUOTA_OPTIONS]:
         await query.answer("Cuota no disponible.", show_alert=True); return
-    processed, total, credited, already = process_daily_quota(rate_decimal)
+    processed, total, credited, already, details_or_status = process_daily_quota(rate_decimal)
     if already:
         await query.edit_message_text("⚠️ *PAGO DIARIO YA REALIZADO*\n\nLa acreditación de hoy ya fue ejecutada. No se volverá a pagar una segunda vez el mismo día.", parse_mode="Markdown", reply_markup=back_inline())
         return
+    if details_or_status == "weekend":
+        await query.edit_message_text("📅 *PAGOS DE GANANCIAS*\n\nLas ganancias se generan de lunes a viernes. Hoy no corresponde realizar una acreditación diaria.", parse_mode="Markdown", reply_markup=back_inline())
+        return
+    details_by_user = details_or_status
     set_current_quota(rate_decimal)
-    notified = await send_daily_quota_notifications(context.application, credited, rate_decimal) if credited else 0
+    notified = await send_daily_quota_notifications(context.application, credited, rate_decimal, details_by_user) if credited else 0
     await query.edit_message_text(
         "✅ *CUOTA DIARIA APLICADA*\n\n"
         f"📊 Cuota: *{quota_label(rate_decimal)}*\n"
@@ -1279,12 +1567,16 @@ async def start_deposit(update, context):
         return ConversationHandler.END
     if not private_only(update):
         return ConversationHandler.END
+    if not is_admin(update.effective_user.id) and not registration_complete(update.effective_user.id):
+        await prompt_registration(update, context)
+        return ConversationHandler.END
 
     context.user_data.clear()
     await update.message.reply_text(
         "💰 *NUEVO DEPÓSITO*\n\n"
+        "🟢 *WALLET DE DEPÓSITO*\n"
         f"Red: *TRC20*\n"
-        f"Wallet:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
+        f"`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
         "Envía ahora el monto que vas a depositar en USDT.",
         parse_mode="Markdown"
     )
@@ -1393,7 +1685,8 @@ async def finish_deposit(update, context):
         f"Monto: *{money(amount)} USDT*\n"
         f"TXID: `{tx}`\n\n"
         "El administrador revisará el depósito manualmente.",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Ver TXID en TRONSCAN", url=tx_explorer_url(tx))]])
     )
 
     admin_text = (
@@ -1406,6 +1699,7 @@ async def finish_deposit(update, context):
     )
 
     admin_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Ver TXID en TRONSCAN", url=tx_explorer_url(tx))],
         [
             InlineKeyboardButton(
                 "✅ Aprobar",
@@ -1456,6 +1750,9 @@ async def start_withdraw(update, context):
         return ConversationHandler.END
     if not private_only(update):
         return ConversationHandler.END
+    if not is_admin(update.effective_user.id) and not registration_complete(update.effective_user.id):
+        await prompt_registration(update, context)
+        return ConversationHandler.END
 
     row = get_user(update.effective_user.id)
     balance = float(row["saldo"]) if row else 0
@@ -1464,7 +1761,8 @@ async def start_withdraw(update, context):
         "💸 *SOLICITAR RETIRO*\n\n"
         f"Saldo disponible: *{money(balance)} USDT*\n"
         f"Mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
-        "Frecuencia: *1 retiro cada 7 días*\n\n"
+        "Frecuencia: *1 retiro cada 7 días*\n"
+        f"Wallet registrada: `{row['wallet_retiro'] if row and row['wallet_retiro'] else 'No registrada'}`\n\n"
         "Introduce el monto que deseas retirar.",
         parse_mode="Markdown"
     )
@@ -1511,11 +1809,12 @@ async def receive_withdraw_amount(update, context):
         return WITHDRAW_AMOUNT
 
     context.user_data["withdraw_amount"] = amount
-
-    await update.message.reply_text(
-        "📍 Envía ahora tu dirección *USDT TRC20*.",
-        parse_mode="Markdown"
-    )
+    row = get_user(update.effective_user.id)
+    registered_wallet = (row["wallet_retiro"] or "").strip() if row else ""
+    if registered_wallet:
+        await finish_withdraw_manual(update, context, registered_wallet)
+        return ConversationHandler.END
+    await update.message.reply_text("📍 Envía ahora tu dirección *USDT TRC20*.", parse_mode="Markdown")
     return WITHDRAW_ADDRESS
 
 
@@ -1599,18 +1898,14 @@ async def receive_withdraw_address(update, context):
         parse_mode="Markdown"
     )
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Aprobar",
-                callback_data=f"wd_approve_{withdrawal_id}"
-            ),
-            InlineKeyboardButton(
-                "❌ Rechazar",
-                callback_data=f"wd_reject_{withdrawal_id}"
-            )
-        ]
+    withdrawal_buttons = []
+    if admin_wallet_url():
+        withdrawal_buttons.append([InlineKeyboardButton("💼 Abrir mi wallet", url=admin_wallet_url())])
+    withdrawal_buttons.append([
+        InlineKeyboardButton("✅ Aprobar", callback_data=f"wd_approve_{withdrawal_id}"),
+        InlineKeyboardButton("❌ Rechazar", callback_data=f"wd_reject_{withdrawal_id}")
     ])
+    keyboard = InlineKeyboardMarkup(withdrawal_buttons)
 
     try:
         await context.bot.send_message(
@@ -1706,6 +2001,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id) and is_maintenance():
         await query.answer("🔧 Bot en mantenimiento. Intenta más tarde.", show_alert=True)
         return
+    if not is_admin(user_id) and not registration_complete(user_id):
+        await query.answer("📝 Primero debes completar tu registro.", show_alert=True)
+        await prompt_registration(query.message, context, user=query.from_user)
+        return
 
     print(
         f"[CALLBACK] user_id={user_id} "
@@ -1726,6 +2025,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row: await query.answer("Este retiro ya fue procesado.",show_alert=True); return
         context.user_data["withdraw_admin_action"]="reject"; context.user_data["withdraw_admin_id"]=wid
         await query.edit_message_text(f"❌ *RECHAZAR RETIRO #{wid}*\n\nEscribe ahora el motivo del rechazo que se enviará al usuario.",parse_mode="Markdown")
+        return
+
+    # -----------------------------------------------------
+    # SOPORTE ADMIN
+    # -----------------------------------------------------
+    if data.startswith("support_reply_"):
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True); return
+        try:
+            target=int(data.rsplit("_",1)[1])
+        except ValueError:
+            await query.answer("Usuario inválido.", show_alert=True); return
+        context.user_data["support_reply_user_id"] = target
+        await query.edit_message_text("💬 *RESPONDER SOPORTE*\n\nEscribe ahora la respuesta que deseas enviar al usuario.\n\nLa respuesta llegará únicamente a ese usuario.",parse_mode="Markdown")
         return
 
     # -----------------------------------------------------
@@ -2259,6 +2572,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_referrals(query, context)
         return
 
+    if data == "user_reinvest":
+        await show_reinvest(query)
+        return
+
+    if data.startswith("reinvest_"):
+        try:
+            amount=float(data.split("_",1)[1])
+        except ValueError:
+            await query.answer("Plan inválido.", show_alert=True); return
+        await perform_reinvestment(query, amount)
+        return
+
+    if data == "user_support":
+        await show_support(query, context)
+        return
+
     if data == "user_history":
         await show_history(query)
         return
@@ -2270,7 +2599,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "user_deposit":
         await query.edit_message_text(
             "💰 *NUEVO DEPÓSITO*\n\n"
-            f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
+            "🟢 *WALLET DE DEPÓSITO*\n"
+            f"`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
             "Puedes elegir un plan para que el monto quede fijado automáticamente.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -2284,7 +2614,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "user_withdraw":
         await query.edit_message_text(
             "💸 *RETIRO*\n\n"
-            "Escribe ahora el monto que deseas retirar.",
+            "Escribe ahora el monto que deseas retirar.\n"
+            "Tu wallet de retiro registrada se utilizará automáticamente.",
             parse_mode="Markdown"
         )
         context.user_data.clear()
@@ -2303,6 +2634,25 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = (update.message.text or "").strip()
     if not text:
+        return
+
+    if not is_admin(update.effective_user.id):
+        row = get_user(update.effective_user.id)
+        if not row:
+            ensure_user(update.effective_user)
+            row = get_user(update.effective_user.id)
+        if not registration_complete(update.effective_user.id):
+            handled = await registration_text(update, context, text)
+            if handled:
+                return
+
+    if is_admin(update.effective_user.id) and context.user_data.get("support_reply_user_id"):
+        target = int(context.user_data.pop("support_reply_user_id"))
+        try:
+            await context.bot.send_message(chat_id=target, text=("💬 RESPUESTA DE SOPORTE\n\n" + text))
+            await update.message.reply_text("✅ Respuesta enviada al usuario.", reply_markup=admin_keyboard())
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ No se pudo enviar la respuesta: {e}", reply_markup=admin_keyboard())
         return
 
     if is_admin(update.effective_user.id) and context.user_data.get("withdraw_admin_action"):
@@ -2404,6 +2754,25 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=admin_keyboard())
         return
 
+    if context.user_data.get("support_waiting") and not is_admin(update.effective_user.id):
+        context.user_data.pop("support_waiting", None)
+        user = update.effective_user
+        await update.message.reply_text("⏳ Tu mensaje fue enviado al administrador. Te responderemos por este mismo chat.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Responder", callback_data=f"support_reply_{user.id}")]])
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_TELEGRAM_ID,
+                text=("🆘 NUEVO MENSAJE DE SOPORTE\n\n"
+                      f"👤 Nombre: {user.full_name or '-'}\n"
+                      f"🔢 ID Telegram: {user.id}\n"
+                      f"👤 Usuario: @{user.username or '-'}\n\n"
+                      f"💬 Mensaje:\n{text}"),
+                reply_markup=kb
+            )
+        except Exception as e:
+            print(f"Error enviando soporte al admin: {e}")
+        return
+
     ensure_user(update.effective_user)
 
     admin_actions = {
@@ -2418,7 +2787,8 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_actions = {
         "👤 Mi cuenta": "user_account", "📈 Inversiones": "user_invest",
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
-        "ℹ️ Información": "user_info", "💎 Planes de Inversión": "user_plans",
+        "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
+        "🔄 Reinvertir saldo": "user_reinvest", "🆘 Soporte": "user_support",
     }
 
     # El teclado inferior funciona como panel fijo.
@@ -2435,7 +2805,8 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         await update.message.reply_text(
             "💰 *NUEVO DEPÓSITO*\n\n"
-            f"Wallet USDT TRC20:\n`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
+            "🟢 *WALLET DE DEPÓSITO*\n"
+            f"`{USDT_TRC20_ADDRESS or 'NO CONFIGURADA'}`\n\n"
             "Selecciona un plan y el monto del depósito quedará fijado automáticamente.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -2741,6 +3112,8 @@ async def handle_text_panel_action(update, context, action):
     elif action == "user_referrals": await show_referrals(fake, context)
     elif action == "user_history": await show_history(fake)
     elif action == "user_info": await show_info(fake)
+    elif action == "user_reinvest": await show_reinvest(fake)
+    elif action == "user_support": await show_support(fake, context)
 
 
 async def finish_withdraw_manual(update, context, address):
@@ -2781,7 +3154,11 @@ async def finish_withdraw_manual(update, context, address):
         "El administrador revisará y procesará la solicitud.", parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]])
     )
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Aprobar",callback_data=f"wd_approve_{wid}"),InlineKeyboardButton("❌ Rechazar",callback_data=f"wd_reject_{wid}")]])
+    withdrawal_buttons = []
+    if admin_wallet_url():
+        withdrawal_buttons.append([InlineKeyboardButton("💼 Abrir mi wallet", url=admin_wallet_url())])
+    withdrawal_buttons.append([InlineKeyboardButton("✅ Aprobar", callback_data=f"wd_approve_{wid}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"wd_reject_{wid}")])
+    kb=InlineKeyboardMarkup(withdrawal_buttons)
     try:
         await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID,text=("📤 *NUEVO RETIRO PENDIENTE*\n\n" f"ID: `{wid}`\nUsuario: `{user_id}`\nMonto: *{money(amount)} USDT*\nDirección TRC20:\n`{address}`"),parse_mode="Markdown",reply_markup=kb)
     except Exception as e:
