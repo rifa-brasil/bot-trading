@@ -1158,7 +1158,7 @@ async def invest_available_plan(query, deposit_id):
     conn.commit()
     conn.close()
 
-    add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT (depósito #{deposit_id})")
+    add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT")
     if bonus and referrer_id:
         try:
             await query.get_bot().send_message(chat_id=referrer_id, text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por el *Plan {referral_plan_number}* de *{money(amount)} USDT* realizado por un usuario que se registró con tu enlace."), parse_mode="Markdown")
@@ -1168,7 +1168,7 @@ async def invest_available_plan(query, deposit_id):
     await query.edit_message_text(
         "✅ *INVERSIÓN CREADA*\n\n"
         f"Plan: *{money(amount)} USDT*\n"
-        f"Depósito utilizado: *#{deposit_id}*\n"
+        "El depósito aprobado fue utilizado para activar este plan.\n"
         f"Capital invertido: *{money(amount)} USDT*\n"
         f"Ganancia inicial: *0.00 USDT*\n"
         "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador.\n\n"
@@ -1249,7 +1249,7 @@ async def show_investments(query):
     # Primero se muestran los planes activos; después, el resumen de la cuenta.
     lines = ["📈 *MIS INVERSIONES*", ""]
 
-    active_rows = [inv for inv in rows if inv["estado"] == "activa"]
+    active_rows = sorted((inv for inv in rows if inv["estado"] == "activa"), key=lambda r: r["id"])
     if active_rows:
         lines += ["🔥 *PLANES ACTIVOS*", ""]
         for inv in active_rows:
@@ -1281,10 +1281,10 @@ async def show_investments(query):
         lines += ["💎 *PLANES DISPONIBLES PARA INVERTIR*", ""]
         for dep in available_plans:
             amount = float(dep["plan_monto"] or dep["monto"])
-            lines.append(f"• Depósito #{dep['id']} — Plan {money(amount)} USDT")
+            lines.append(f"• 💎 Plan disponible — {money(amount)} USDT")
         lines.append("")
 
-    completed_rows = [inv for inv in rows if inv["estado"] != "activa"]
+    completed_rows = sorted((inv for inv in rows if inv["estado"] != "activa"), key=lambda r: r["id"])
     if completed_rows:
         lines += ["📚 *HISTORIAL DE PLANES COMPLETADOS*", ""]
         for inv in completed_rows:
@@ -1523,6 +1523,12 @@ async def send_daily_quota_notifications(application, credited_by_user, rate_dec
         lines = []
         for plan, plan_profit in details_by_user.get(user_id, []):
             lines.append(f"• *{plan}*: +{money(plan_profit)} USDT")
+        if details_by_user.get(user_id):
+            ordered_details = sorted(
+                details_by_user[user_id],
+                key=lambda item: int(str(item[0]).split()[1]) if str(item[0]).startswith("Plan ") else 999999
+            )
+            lines = [f"• *{plan}*: +{money(plan_profit)} USDT" for plan, plan_profit in ordered_details]
         detail_text = "\n".join(lines) if lines else f"• Ganancia: +{money(profit)} USDT"
         caption = (f"✅ *GANANCIAS DEL DÍA ACREDITADAS*\n\n"
                    f"📊 Cuota aplicada: *{quota_label(rate_decimal)}*\n\n"
@@ -1729,12 +1735,11 @@ async def finish_deposit(update, context):
         user_id,
         "deposito_pendiente",
         amount,
-        f"Depósito #{deposit_id} enviado para revisión"
+        "Nuevo depósito enviado para revisión"
     )
 
     await update.message.reply_text(
         "⏳ *DEPÓSITO ENVIADO*\n\n"
-        f"ID: `{deposit_id}`\n"
         f"Monto: *{money(amount)} USDT*\n"
         f"TXID: `{tx}`\n\n"
         "El administrador revisará el depósito manualmente.",
@@ -1743,8 +1748,7 @@ async def finish_deposit(update, context):
     )
 
     admin_text = (
-        "📥 *NUEVO DEPÓSITO PENDIENTE*\n\n"
-        f"ID: `{deposit_id}`\n"
+        "📥 *NUEVA SOLICITUD DE DEPÓSITO*\n\n"
         f"Usuario: `{user_id}`\n"
         f"Nombre: {update.effective_user.full_name}\n"
         f"Monto: *{money(amount)} USDT*\n"
@@ -1777,7 +1781,7 @@ async def finish_deposit(update, context):
             await context.bot.send_photo(
                 chat_id=ADMIN_TELEGRAM_ID,
                 photo=photo_id,
-                caption=f"📸 Comprobante del depósito #{deposit_id}"
+                caption="📸 Comprobante del depósito"
             )
     except Exception as e:
         print(f"Error notificando depósito al admin: {e}")
@@ -2165,7 +2169,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "📥 *DEPÓSITOS PENDIENTES*\n\n"
             for r in rows:
-                text += (f"#{r['id']} — Usuario `{r['telegram_id']}`\n"
+                text += (f"Usuario `{r['telegram_id']}`\n"
                          f"Monto: *{money(r['monto'])} USDT*\n"
                          f"TX: `{r['tx_hash']}`\n\n")
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Depósitos", callback_data="admin_deposits")],[InlineKeyboardButton("🏠 Panel", callback_data="admin_home")]]))
@@ -2362,14 +2366,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid,
             "deposito",
             amount,
-            f"Depósito #{deposit_id} aprobado"
+            "Depósito aprobado"
         )
 
         plan_amount = float(row["plan_monto"] or 0)
         plan_line = f"\n💎 Plan disponible para invertir: *{money(plan_amount)} USDT*" if plan_amount > 0 else ""
 
         await query.edit_message_text(
-            f"✅ *DEPÓSITO #{deposit_id} APROBADO*\n\n"
+            "✅ *DEPÓSITO APROBADO*\n\n"
             f"Monto acreditado: *{money(amount)} USDT*" + plan_line,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -2421,7 +2425,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         await query.edit_message_text(
-            f"❌ *DEPÓSITO #{deposit_id} RECHAZADO*",
+            "❌ *DEPÓSITO RECHAZADO*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -2436,7 +2440,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=row["telegram_id"],
                 text=(
                     "❌ *DEPÓSITO RECHAZADO*\n\n"
-                    f"El depósito #{deposit_id} fue rechazado. "
+                    "El depósito fue rechazado. "
                     "Contacta al administrador si necesitas revisar el caso."
                 ),
                 parse_mode="Markdown"
@@ -3277,20 +3281,71 @@ async def finish_withdraw_manual(update, context, address):
 # =========================================================
 
 def create_excel_backup():
-    conn = db(); wb = Workbook(); wb.remove(wb.active)
+    """Crea el respaldo Excel con los datos de registro al principio de cada hoja de datos."""
+    conn = db()
+    wb = Workbook()
+    wb.remove(wb.active)
     tables = ["usuarios", "depositos", "retiros", "inversiones", "movimientos", "referidos", "pagos_diarios"]
-    identity = {"usuarios":["nombre","username","telegram_id"],"depositos":["telegram_id"],"retiros":["telegram_id"],"inversiones":["telegram_id"],"movimientos":["telegram_id"],"referidos":["referido_id","referidor_id"],"pagos_diarios":[]}
+    identity_headers = ["Nombre", "Nombre de usuario", "ID Telegram", "Teléfono", "Correo"]
+
+    # Para cada tabla obtenemos las columnas reales de SQLite y conservamos todos
+    # sus datos originales después de las cinco columnas de identidad.
     for table in tables:
-        ws=wb.create_sheet(table[:31]); rows=conn.execute(f"SELECT * FROM {table}").fetchall(); columns=[d[1] for d in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-        preferred=identity.get(table,[]); ordered=[c for c in preferred if c in columns]+[c for c in columns if c not in preferred]
+        ws = wb.create_sheet(table[:31])
+        columns = [d[1] for d in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+
+        # En tablas con telegram_id, esa es la persona de la fila. En referidos,
+        # usamos referido_id como la persona principal de la fila. pagos_diarios
+        # no pertenece a un usuario, por lo que las cinco columnas quedan vacías.
+        identity_mode = "telegram_id" if "telegram_id" in columns else ("referido_id" if table == "referidos" else None)
+        data_columns = [c for c in columns if c != "telegram_id"]
+        # Evitamos duplicar referido_id en la zona de datos cuando ya se utilizó
+        # como ID Telegram de identidad; referidor_id y el resto se conservan.
+        if table == "referidos":
+            data_columns = [c for c in columns if c != "referido_id"]
+
+        ordered = identity_headers + data_columns
         ws.append(ordered)
-        for row in rows: ws.append([row[c] for c in ordered])
-        ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
+
+        for row in rows:
+            telegram_id = row[identity_mode] if identity_mode else None
+            identity = {"Nombre": "", "Nombre de usuario": "", "ID Telegram": telegram_id or "", "Teléfono": "", "Correo": ""}
+            if telegram_id:
+                u = conn.execute(
+                    "SELECT nombre, username, telefono, email FROM usuarios WHERE telegram_id=?",
+                    (telegram_id,)
+                ).fetchone()
+                if u:
+                    identity["Nombre"] = u["nombre"] or ""
+                    identity["Nombre de usuario"] = (f"@{u['username']}" if u["username"] else "")
+                    identity["Teléfono"] = u["telefono"] or ""
+                    identity["Correo"] = u["email"] or ""
+
+            values = [identity[h] for h in identity_headers]
+            values.extend(row[c] for c in data_columns)
+            ws.append(values)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
         for col_cells in ws.columns:
-            max_len=max([len(str(c.value or "")) for c in list(col_cells)[:200]]+[12]); ws.column_dimensions[col_cells[0].column_letter].width=min(max_len+2,40)
-    ws=wb.create_sheet("resumen"); active=conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]; daily=float(active)*get_current_quota_decimal()
-    ws.append(["Indicador","Valor"]); ws.append(["Fecha UTC",now_iso()]); ws.append(["Cuota diaria actual",get_current_quota_decimal() if get_current_quota_decimal() else "Sin seleccionar"]); ws.append(["Capital activo invertido (USDT)",float(active)]); ws.append(["Pago diario estimado con cuota actual (USDT)",daily]); ws.append(["Ganancias disponibles para retiro (USDT)",float(conn.execute("SELECT COALESCE(SUM(ganancias_disponibles),0) s FROM usuarios").fetchone()["s"])])
-    conn.close(); output=BytesIO(); wb.save(output); output.seek(0); return output
+            max_len = max([len(str(c.value or "")) for c in list(col_cells)[:200]] + [12])
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 40)
+
+    ws = wb.create_sheet("resumen")
+    active = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+    daily = float(active) * get_current_quota_decimal()
+    ws.append(["Indicador", "Valor"])
+    ws.append(["Fecha UTC", now_iso()])
+    ws.append(["Cuota diaria actual", get_current_quota_decimal() if get_current_quota_decimal() else "Sin seleccionar"])
+    ws.append(["Capital activo invertido (USDT)", float(active)])
+    ws.append(["Pago diario estimado con cuota actual (USDT)", daily])
+    ws.append(["Ganancias disponibles para retiro (USDT)", float(conn.execute("SELECT COALESCE(SUM(ganancias_disponibles),0) s FROM usuarios").fetchone()["s"])])
+    conn.close()
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
 
 async def send_excel_backup(bot, reason="Respaldo automático"):
     filename = f"respaldo_inversion_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.xlsx"
