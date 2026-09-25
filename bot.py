@@ -62,7 +62,10 @@ MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
 WITHDRAWAL_INTERVAL_DAYS = 7
 WITHDRAWAL_FEE_RATE = 0.03
-REFERRAL_BONUS_RATE = float(os.getenv("REFERRAL_BONUS_RATE", "0.03") or "0.03")
+REFERRAL_BONUS_FIRST_RATE = float(os.getenv("REFERRAL_BONUS_FIRST_RATE", "0.03") or "0.03")
+REFERRAL_BONUS_SECOND_RATE = float(os.getenv("REFERRAL_BONUS_SECOND_RATE", "0.015") or "0.015")
+# Compatibilidad: el porcentaje histórico principal queda apuntando al primero.
+REFERRAL_BONUS_RATE = REFERRAL_BONUS_FIRST_RATE
 ADMIN_WALLET_URL = os.getenv("ADMIN_WALLET_URL", "").strip()
 TRONSCAN_TX_URL = "https://tronscan.org/#/transaction/"
 PROFIT_TIMEZONE = os.getenv("PROFIT_TIMEZONE", "America/Sao_Paulo").strip()
@@ -842,19 +845,35 @@ async def show_reinvest(query):
 
 
 def credit_referral_bonus(conn, referred_user_id, investment_amount, investment_id):
+    """Acredita bono únicamente por las dos primeras inversiones del referido.
+    Plan 1 = 3%; Plan 2 = 1,5%; desde Plan 3 no hay más bono.
+    El orden se determina por el ID de activación de la inversión.
+    """
     row = conn.execute("SELECT referido_por FROM usuarios WHERE telegram_id=?", (referred_user_id,)).fetchone()
     if not row or not row["referido_por"]:
-        return 0.0, None
+        return 0.0, None, 0
     referrer = conn.execute("SELECT telegram_id FROM usuarios WHERE codigo_referido=?", (row["referido_por"],)).fetchone()
     if not referrer or int(referrer["telegram_id"]) == int(referred_user_id):
-        return 0.0, None
-    bonus = round(float(investment_amount) * REFERRAL_BONUS_RATE, 2)
+        return 0.0, None, 0
+
+    activation_number = conn.execute(
+        "SELECT COUNT(*) AS c FROM inversiones WHERE telegram_id=? AND id<=?",
+        (referred_user_id, investment_id)
+    ).fetchone()["c"]
+    if activation_number == 1:
+        rate = REFERRAL_BONUS_FIRST_RATE
+    elif activation_number == 2:
+        rate = REFERRAL_BONUS_SECOND_RATE
+    else:
+        return 0.0, None, activation_number
+
+    bonus = round(float(investment_amount) * rate, 2)
     if bonus <= 0:
-        return 0.0, None
+        return 0.0, None, activation_number
     conn.execute("UPDATE usuarios SET saldo=saldo+?, ganancias_disponibles=ganancias_disponibles+?, ganancias=ganancias+? WHERE telegram_id=?", (bonus, bonus, bonus, referrer["telegram_id"]))
     conn.execute("UPDATE referidos SET bono=bono+? WHERE referido_id=? AND referidor_id=?", (bonus, referred_user_id, referrer["telegram_id"]))
-    conn.execute("INSERT INTO movimientos(telegram_id,tipo,monto,descripcion,fecha) VALUES(?,?,?,?,?)", (referrer["telegram_id"], "bono_referido", bonus, f"Bono de referido {REFERRAL_BONUS_RATE*100:.0f}% por inversión #{investment_id}", now_iso()))
-    return bonus, int(referrer["telegram_id"])
+    conn.execute("INSERT INTO movimientos(telegram_id,tipo,monto,descripcion,fecha) VALUES(?,?,?,?,?)", (referrer["telegram_id"], "bono_referido", bonus, f"Bono de referido Plan {activation_number} ({rate*100:.2f}%) por inversión #{investment_id}", now_iso()))
+    return bonus, int(referrer["telegram_id"]), activation_number
 
 
 async def perform_reinvestment(query, amount):
@@ -871,12 +890,12 @@ async def perform_reinvestment(query, amount):
     cur=conn.execute("INSERT INTO inversiones(telegram_id,plan,capital,ganancia_acumulada,tasa_diaria,multiplicador_objetivo,estado,fecha_inicio,ultimo_calculo) VALUES(?,?,?,0,?,2.0,'activa',?,?)",(user_id,f"Plan {money(amount)} USDT",amount,DAILY_RATE,now,now))
     investment_id=cur.lastrowid
     conn.execute("UPDATE usuarios SET saldo=saldo-?, ganancias_disponibles=ganancias_disponibles-? WHERE telegram_id=?",(amount,amount,user_id))
-    bonus, referrer_id=credit_referral_bonus(conn,user_id,amount,investment_id)
+    bonus, referrer_id, referral_plan_number=credit_referral_bonus(conn,user_id,amount,investment_id)
     conn.commit(); conn.close()
     add_movement(user_id,"reinversion",amount,f"Reinversión de ganancias: Plan {money(amount)} USDT")
     if bonus and referrer_id:
         try:
-            await query.get_bot().send_message(chat_id=referrer_id,text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por una inversión de *{money(amount)} USDT* realizada por un usuario que se registró con tu enlace."),parse_mode="Markdown")
+            await query.get_bot().send_message(chat_id=referrer_id,text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por el *Plan {referral_plan_number}* de *{money(amount)} USDT* realizado por un usuario que se registró con tu enlace."),parse_mode="Markdown")
         except Exception as e: print(f"Error notificando bono: {e}")
     await query.edit_message_text("✅ *REINVERSIÓN CREADA*\n\n" f"Plan: *{money(amount)} USDT*\n" f"Ganancias utilizadas: *{money(amount)} USDT*\n" "\nLa inversión es independiente de tus demás planes.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📈 Ver inversiones",callback_data="user_invest")],[InlineKeyboardButton("🏠 Menú Principal",callback_data="user_home")]]))
 
@@ -934,8 +953,8 @@ async def show_referrals(query, context):
         f"`{link}`\n\n"
         f"👥 Personas registradas: *{count}*\n"
         f"🎁 Bonos acumulados: *{money(bonus)} USDT*\n"
-        f"📈 Bonificación por inversión referida: *{REFERRAL_BONUS_RATE*100:.0f}%*\n\n"
-        "La bonificación se acredita cuando el usuario referido realiza la inversión, no cuando solamente deposita.\n\n"
+        f"📈 Bonificación por inversión referida: *Plan 1 = {REFERRAL_BONUS_FIRST_RATE*100:.2f}%* y *Plan 2 = {REFERRAL_BONUS_SECOND_RATE*100:.2f}%*.\n\n"
+        "La bonificación se acredita cuando el usuario referido realiza la inversión, no cuando solamente deposita. Desde el tercer plan no se genera bono.\n\n"
         "Comparte el enlace para que otros puedan registrarse usando tu referencia."
     )
 
@@ -976,7 +995,7 @@ async def show_info(query):
         "🔹 *REINVERSIÓN*\nPuedes reinvertir el saldo acumulado de tus ganancias como un nuevo plan cuando alcances el mínimo de *50 USDT*.",
         "🔹 *TRANSFERENCIAS INTERNAS*\nNo existe transferencia de saldo entre usuarios dentro del sistema.",
         "🔹 *DEPÓSITOS Y RED*\nLos depósitos se realizan en USDT mediante la red TRC20 y son revisados manualmente por el administrador.",
-        f"🔹 *REFERIDOS*\nCuando un usuario se registra mediante tu enlace y realiza una inversión, el sistema acredita al referente una bonificación del *{REFERRAL_BONUS_RATE*100:.0f}%* del importe invertido.",
+        f"🔹 *REFERIDOS*\nEl primer plan que active un referido genera una bonificación del *{REFERRAL_BONUS_FIRST_RATE*100:.2f}%* y el segundo plan genera *{REFERRAL_BONUS_SECOND_RATE*100:.2f}%*. Desde el tercer plan no se genera bono.",
     ]
     texto = "ℹ️ *INFORMACIÓN DEL SISTEMA*\n\n" + "\n\n".join(temas)
     await query.edit_message_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
@@ -1135,14 +1154,14 @@ async def invest_available_plan(query, deposit_id):
         WHERE telegram_id = ?
     """, (amount, amount, user_id))
     conn.execute("UPDATE depositos SET inversion_id = ? WHERE id = ?", (investment_id, deposit_id))
-    bonus, referrer_id = credit_referral_bonus(conn, user_id, amount, investment_id)
+    bonus, referrer_id, referral_plan_number = credit_referral_bonus(conn, user_id, amount, investment_id)
     conn.commit()
     conn.close()
 
     add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT (depósito #{deposit_id})")
     if bonus and referrer_id:
         try:
-            await query.get_bot().send_message(chat_id=referrer_id, text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por una inversión de *{money(amount)} USDT* realizada por un usuario que se registró con tu enlace."), parse_mode="Markdown")
+            await query.get_bot().send_message(chat_id=referrer_id, text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por el *Plan {referral_plan_number}* de *{money(amount)} USDT* realizado por un usuario que se registró con tu enlace."), parse_mode="Markdown")
         except Exception as e:
             print(f"Error notificando bono de referido: {e}")
 
@@ -1208,6 +1227,8 @@ async def show_investments(query):
         ensure_user(query.from_user)
         row = get_user(user_id)
     rows = investment_summary(user_id)
+    # Numeración estable según el orden en que cada inversión fue activada.
+    plan_numbers = {inv["id"]: idx + 1 for idx, inv in enumerate(sorted(rows, key=lambda r: r["id"]))}
 
     conn = db()
     total_deposited = conn.execute("SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'", (user_id,)).fetchone()["s"]
@@ -1237,7 +1258,7 @@ async def show_investments(query):
             target_profit = capital
             progress = min(100.0, gain / target_profit * 100) if target_profit else 0.0
             lines.append(
-                f"💎 *{inv['plan']}*\n"
+                f"💎 *Plan {plan_numbers.get(inv['id'], 1)} — {money(capital)} USDT*\n"
                 f"Capital: {money(capital)} USDT\n"
                 f"Ganancia: {money(gain)} USDT\n"
                 f"Progreso hacia el 200%: {progress:.2f}%\n"
@@ -1270,7 +1291,7 @@ async def show_investments(query):
             capital = float(inv["capital"])
             gain = float(inv["ganancia_acumulada"])
             lines.append(
-                f"• {inv['plan']} — Capital: {money(capital)} USDT — "
+                f"• Plan {plan_numbers.get(inv['id'], 1)} — {inv['plan']} — Capital: {money(capital)} USDT — "
                 f"Ganancia: {money(gain)} USDT — Estado: {inv['estado']}"
             )
 
@@ -1483,7 +1504,11 @@ def process_daily_quota(rate_decimal):
             conn.execute("UPDATE inversiones SET estado='completada' WHERE id=?", (inv["id"],))
         processed += 1; total_profit += profit
         uid = int(inv["telegram_id"]); credited_by_user[uid] = credited_by_user.get(uid, 0.0) + profit
-        details_by_user.setdefault(uid, []).append((str(inv["plan"]), profit))
+        plan_number = conn.execute(
+            "SELECT COUNT(*) AS c FROM inversiones WHERE telegram_id=? AND id<=?",
+            (uid, inv["id"])
+        ).fetchone()["c"]
+        details_by_user.setdefault(uid, []).append((f"Plan {plan_number} — {money(capital)} USDT", profit))
     conn.execute("INSERT INTO pagos_diarios(fecha,fecha_proceso,total,inversiones) VALUES(?,?,?,?)", (date_key, now_iso(), total_profit, processed))
     conn.commit(); conn.close()
     LAST_DAILY_PROFITS = credited_by_user
@@ -2564,6 +2589,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -----------------------------------------------------
 
     if data == "user_home":
+        # Cancelar soporte debe cancelar realmente el modo de captura;
+        # las siguientes opciones del menú no deben interpretarse como soporte.
+        context.user_data.pop("support_waiting", None)
         await send_user_menu(
             user_id,
             context,
@@ -2962,15 +2990,28 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if amount > balance:
             await update.message.reply_text(f"⚠️ Saldo insuficiente.\nDisponible: {money(balance)} USDT")
             return
+        row = get_user(update.effective_user.id)
+        registered_wallet = (row["wallet_retiro"] or "").strip() if row else ""
+        if not registered_wallet:
+            await update.message.reply_text(
+                "⚠️ No tienes una wallet de retiro registrada. Completa tu registro antes de solicitar un retiro."
+            )
+            context.user_data.clear()
+            return
         context.user_data["withdraw_amount"] = amount
-        context.user_data["manual_flow"] = "withdraw_address"
-        await update.message.reply_text("📍 Envía ahora tu dirección *USDT TRC20*.", parse_mode="Markdown")
+        await finish_withdraw_manual(update, context, registered_wallet)
         return
     if flow == "withdraw_address":
-        context.user_data["manual_flow"] = None
-        # Reutilizar la lógica existente de retiro.
+        # Compatibilidad con sesiones antiguas: nunca se solicita una wallet nueva.
+        row = get_user(update.effective_user.id)
+        registered_wallet = (row["wallet_retiro"] or "").strip() if row else ""
+        context.user_data.pop("manual_flow", None)
+        if not registered_wallet:
+            await update.message.reply_text("⚠️ No tienes una wallet de retiro registrada. Completa tu registro.")
+            context.user_data.clear()
+            return
         context.user_data["withdraw_amount"] = context.user_data.get("withdraw_amount", 0)
-        await finish_withdraw_manual(update, context, text)
+        await finish_withdraw_manual(update, context, registered_wallet)
         return
 
 
