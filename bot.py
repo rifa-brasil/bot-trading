@@ -557,6 +557,25 @@ async def registration_text(update, context, text):
         context.user_data.pop("registration_step", None)
         if complete:
             await update.message.reply_text("✅ *REGISTRO COMPLETADO*\n\nYa tienes acceso al panel del sistema.", parse_mode="Markdown")
+            try:
+                registered = get_user(user.id)
+                await context.bot.send_message(
+                    chat_id=ADMIN_TELEGRAM_ID,
+                    text=(
+                        "🆕 *NUEVO USUARIO REGISTRADO*\n\n"
+                        f"👤 Nombre: {registered['nombre'] or '-'}\n"
+                        f"👤 User: @{registered['username'] or '-'}\n"
+                        f"🆔 ID Telegram: `{registered['telegram_id']}`\n"
+                        f"📧 Correo: {registered['email'] or '-'}\n"
+                        f"📱 WhatsApp: {registered['telefono'] or '-'}\n"
+                        f"🌎 País: {registered['pais'] or '-'}\n"
+                        f"💳 Wallet USDT TRC20: `{registered['wallet_retiro'] or '-'}`\n"
+                        f"📅 Registro: {registered['fecha_registro'] or '-'}"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                print(f"⚠️ No se pudo notificar el nuevo registro al admin: {e}")
             await send_user_menu(user.id, context)
         return True
     return False
@@ -768,6 +787,7 @@ async def show_account(query):
     texto = (
         "👤 *MI CUENTA*\n\n"
         f"🆔 ID: `{row['telegram_id']}`\n"
+        f"👤 User: @{row['username'] or '-'}\n"
         f"👤 Nombre: {row['nombre'] or '-'}\n"
         f"💰 Saldo disponible: *{money(row['saldo'])} USDT*\n"
         f"📥 Total depositado: *{money(total_depositado)} USDT*\n"
@@ -977,12 +997,12 @@ async def show_plans(query):
     balance = float(row["saldo"]) if row else 0.0
 
     buttons = []
-    # Telegram no permite imágenes dentro de un botón.
-    # Por eso mostramos el icono USDT TRC20 circular como imagen del panel
-    # y dejamos los botones únicamente con el importe de cada plan.
+    # Telegram no permite colocar una imagen dentro de un botón inline.
+    # Usamos un icono visual junto al importe; la imagen USDT TRC20 completa
+    # se muestra encima del listado de planes.
     row_buttons = []
     for amount in INVESTMENT_PLANS:
-        row_buttons.append(InlineKeyboardButton(f"{money(amount)} USDT", callback_data=f"plan_{amount}"))
+        row_buttons.append(InlineKeyboardButton(f"🟢 {money(amount)} USDT", callback_data=f"plan_{amount}"))
         if len(row_buttons) == 3:
             buttons.append(row_buttons)
             row_buttons = []
@@ -1537,12 +1557,20 @@ async def process_quota_callback(query, context, rate_decimal):
 
 async def show_daily_payment_info(query, context, rate_decimal=None):
     if rate_decimal is None:
-        context.user_data["admin_payment_info"] = True
+        buttons=[]; row_buttons=[]
+        for rate in DAILY_QUOTA_OPTIONS:
+            row_buttons.append(InlineKeyboardButton(DAILY_QUOTA_LABELS[rate], callback_data=f"calcquota_{int(round(rate*100)):02d}"))
+            if len(row_buttons) == 4:
+                buttons.append(row_buttons); row_buttons=[]
+        if row_buttons:
+            buttons.append(row_buttons)
+        buttons.append([InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")])
+        context.user_data.pop("admin_payment_info", None)
         await query.edit_message_text(
-            "💰 *PAGO DIARIO*\n\n"
-            "Escribe la cuota que deseas consultar, por ejemplo: `0,30` para 0,30%.\n\n"
-            "Este botón es solamente informativo: NO acredita ganancias y NO envía imágenes.",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_home")]]) )
+            "💰 *PAGO DIARIO — CONSULTA*\n\n"
+            "Selecciona una de las cuotas disponibles para calcular cuánto correspondería pagar hoy sobre el capital actualmente invertido.\n\n"
+            "ℹ️ Esta opción es *solo informativa*: no acredita fondos, no cambia saldos y no envía imágenes.",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
         return
     conn=db(); active_capital=conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]; active=conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]; conn.close()
     due=float(active_capital)*rate_decimal
@@ -2215,6 +2243,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_profit":
         await show_daily_payment_info(query, context)
+        return
+
+    if data.startswith("calcquota_"):
+        try:
+            code = int(data.rsplit("_", 1)[1])
+            rate_decimal = code / 10000.0
+        except ValueError:
+            await query.answer("Cuota inválida.", show_alert=True)
+            return
+        if rate_decimal not in [round(x/100.0, 6) for x in DAILY_QUOTA_OPTIONS]:
+            await query.answer("Cuota no disponible.", show_alert=True)
+            return
+        conn = db()
+        active_capital = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        active_count = conn.execute("SELECT COUNT(*) c FROM inversiones WHERE estado='activa'").fetchone()["c"]
+        conn.close()
+        due = float(active_capital) * rate_decimal
+        await query.edit_message_text(
+            "💰 *PAGO DIARIO — CÁLCULO INFORMATIVO*\n\n"
+            f"📊 Cuota seleccionada: *{quota_label(rate_decimal)}*\n"
+            f"📈 Capital total actualmente invertido: *{money(active_capital)} USDT*\n"
+            f"👥 Inversiones activas: *{active_count}*\n"
+            f"💵 Total que correspondería pagar hoy: *{money(due)} USDT*\n\n"
+            "ℹ️ Este cálculo *NO acredita fondos*, *NO cambia saldos* y *NO envía imágenes*.\n\n"
+            "Para acreditar las ganancias debes utilizar *📊 Cuotas Diarias*.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Volver a Pago Diario", callback_data="admin_profit")],
+                [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
+            ])
+        )
         return
 
     if data.startswith("quota_"):
@@ -3022,12 +3081,19 @@ async def handle_text_panel_action(update, context, action):
         return
 
     if action == "admin_profit":
-        context.user_data["admin_payment_info"] = True
+        buttons=[]; row_buttons=[]
+        for rate in DAILY_QUOTA_OPTIONS:
+            row_buttons.append(InlineKeyboardButton(DAILY_QUOTA_LABELS[rate], callback_data=f"calcquota_{int(round(rate*100)):02d}"))
+            if len(row_buttons) == 4:
+                buttons.append(row_buttons); row_buttons=[]
+        if row_buttons:
+            buttons.append(row_buttons)
+        buttons.append([InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")])
         await update.message.reply_text(
             "💰 *PAGO DIARIO — CONSULTA*\n\n"
-            "Escribe una cuota, por ejemplo: *0,35* o *0,50*, y te mostraré cuánto corresponde pagar hoy.\n\n"
-            "ℹ️ Esta opción no acredita el pago ni envía imágenes.",
-            parse_mode="Markdown", reply_markup=admin_keyboard())
+            "Selecciona la cuota que deseas utilizar únicamente para calcular cuánto correspondería pagar hoy sobre todo el capital invertido.\n\n"
+            "ℹ️ Esta opción es *solo informativa*: no acredita fondos, no modifica saldos y no envía imágenes.",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if action == "admin_quotas":
