@@ -597,6 +597,19 @@ def is_maintenance():
 def set_maintenance(enabled):
     conn = db(); conn.execute("INSERT OR REPLACE INTO sistema(clave,valor) VALUES('mantenimiento',?)", ("1" if enabled else "0",)); conn.commit(); conn.close()
 
+
+def get_system_value(key, default=""):
+    conn = db()
+    row = conn.execute("SELECT valor FROM sistema WHERE clave=?", (key,)).fetchone()
+    conn.close()
+    return row["valor"] if row else default
+
+
+def set_system_value(key, value):
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO sistema(clave,valor) VALUES(?,?)", (key, str(value)))
+    conn.commit(); conn.close()
+
 async def broadcast_users(bot, text):
     conn = db(); rows = conn.execute("SELECT telegram_id FROM usuarios ORDER BY id ASC").fetchall(); conn.close()
     sent = failed = 0
@@ -990,7 +1003,7 @@ async def show_info(query):
         "🔹 *CUOTAS DIARIAS*\nLas cuotas son variables y dependen de los resultados diarios obtenidos en el mercado.",
         f"🔹 *PLANES DE INVERSIÓN*\nLa inversión mínima es de *{money(MIN_INVESTMENT)} USDT* por plan, mediante la red *TRC20*.",
         "🔹 *FINALIZACIÓN DEL PLAN*\nCada plan termina cuando la ganancia acumulada alcanza el 100% del capital inicial, es decir, cuando el valor total del plan llega al 200% de la inversión inicial.",
-        "🔹 *ACREDITACIÓN DE GANANCIAS*\nLas ganancias se generan de lunes a viernes. No existe una hora exacta para la acreditación; las ganancias serán acreditadas siempre antes de las 20:00.",
+        "🔹 *ACREDITACIÓN DE GANANCIAS*\nLas ganancias se generan de lunes a viernes. La acreditación se realizará durante el día y puede efectuarse hasta las 18:00. No se realizarán acreditaciones después de esa hora.",
         f"🔹 *RETIROS*\nEl retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT* y se permite *una solicitud cada 7 días*. Se aplica una comisión del *3%* por cada retiro realizado.",
         "🔹 *REINVERSIÓN*\nPuedes reinvertir el saldo acumulado de tus ganancias como un nuevo plan cuando alcances el mínimo de *50 USDT*.",
         "🔹 *TRANSFERENCIAS INTERNAS*\nNo existe transferencia de saldo entre usuarios dentro del sistema.",
@@ -1576,6 +1589,9 @@ async def process_quota_callback(query, context, rate_decimal):
     details_by_user = details_or_status
     set_current_quota(rate_decimal)
     notified = await send_daily_quota_notifications(context.application, credited, rate_decimal, details_by_user) if credited else 0
+    # El respaldo posterior es independiente del respaldo diario programado.
+    # Se ejecuta después de completar la acreditación manual.
+    await backup_after_accreditation(context.application, "manual")
     await query.edit_message_text(
         "✅ *CUOTA DIARIA APLICADA*\n\n"
         f"📊 Cuota: *{quota_label(rate_decimal)}*\n"
@@ -2312,6 +2328,62 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await query.answer("Cuota inválida.", show_alert=True); return
         await process_quota_callback(query, context, rate_decimal)
+        return
+
+    if data == "admin_unlock_restore":
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True); return
+        if not is_maintenance():
+            await query.edit_message_text("🔓 El bot ya está desbloqueado.", reply_markup=admin_keyboard()); return
+        try:
+            await restore_lock_backup(context.application)
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ *NO SE PUDO RESTAURAR EL RESPALDO DEL BLOQUEO*\n\n`{e}`\n\n"
+                "El bot sigue bloqueado para evitar cambios accidentales. Puedes usar ♻️ Restaurar respaldo para subir el `.db` manualmente.",
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard()
+            )
+            return
+        set_maintenance(False)
+        sent=failed=0
+        conn=db(); rows=conn.execute("SELECT telegram_id FROM usuarios WHERE telegram_id != ?",(ADMIN_TELEGRAM_ID,)).fetchall(); conn.close()
+        for row in rows:
+            try:
+                if await send_image_to_user(context.bot, row["telegram_id"], UNLOCK_IMAGE):
+                    sent += 1
+                else:
+                    failed += 1
+            except Exception as e: failed+=1; print(e)
+        await query.edit_message_text(
+            f"♻️ *RESPALDO RESTAURADO*\n\n"
+            "La base volvió al estado exacto que tenía cuando el bot fue bloqueado.\n\n"
+            f"🔓 Bot desbloqueado.\nUsuarios notificados: {sent}\nNo enviados: {failed}",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
+        return
+
+    if data == "admin_unlock_no_restore":
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True); return
+        if not is_maintenance():
+            await query.edit_message_text("🔓 El bot ya está desbloqueado.", reply_markup=admin_keyboard()); return
+        set_maintenance(False)
+        sent=failed=0
+        conn=db(); rows=conn.execute("SELECT telegram_id FROM usuarios WHERE telegram_id != ?",(ADMIN_TELEGRAM_ID,)).fetchall(); conn.close()
+        for row in rows:
+            try:
+                if await send_image_to_user(context.bot, row["telegram_id"], UNLOCK_IMAGE):
+                    sent += 1
+                else:
+                    failed += 1
+            except Exception as e: failed+=1; print(e)
+        await query.edit_message_text(
+            f"🔓 *BOT DESBLOQUEADO SIN RESTAURAR*\n\n"
+            "Se conservaron todos los cambios realizados mientras el bot estuvo bloqueado.\n\n"
+            f"Usuarios notificados: {sent}\nNo enviados: {failed}",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
         return
 
     if data == "admin_home":
@@ -3164,6 +3236,16 @@ async def handle_text_panel_action(update, context, action):
     if action == "admin_lock":
         if is_maintenance():
             await update.message.reply_text("🔒 El bot ya está bloqueado.", reply_markup=admin_keyboard()); return
+        # El respaldo se crea ANTES de activar el mantenimiento, para conservar
+        # exactamente el estado al momento de bloquear. Si falla, no se bloquea.
+        try:
+            await create_and_send_lock_backup(context.application)
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ *NO SE PUDO CREAR EL RESPALDO*\n\nEl bot NO fue bloqueado para evitar riesgos.\n\nError: `{e}`",
+                parse_mode="Markdown", reply_markup=admin_keyboard()
+            )
+            return
         set_maintenance(True)
         sent=failed=0
         conn=db(); rows=conn.execute("SELECT telegram_id FROM usuarios WHERE telegram_id != ?",(ADMIN_TELEGRAM_ID,)).fetchall(); conn.close()
@@ -3174,23 +3256,43 @@ async def handle_text_panel_action(update, context, action):
                 else:
                     failed += 1
             except Exception as e: failed+=1; print(e)
-        await update.message.reply_text(f"🔒 *BOT BLOQUEADO*\n\nUsuarios notificados: {sent}\nNo enviados: {failed}", parse_mode="Markdown", reply_markup=admin_keyboard())
+        await update.message.reply_text(
+            f"🔒 *BOT BLOQUEADO*\n\n"
+            "💾 Se creó y envió automáticamente el respaldo del momento del bloqueo.\n"
+            f"\nUsuarios notificados: {sent}\nNo enviados: {failed}\n\n"
+            "Al pulsar *Desbloquear bot* se te pedirá restaurar este respaldo.",
+            parse_mode="Markdown", reply_markup=admin_keyboard()
+        )
         return
 
     if action == "admin_unlock":
         if not is_maintenance():
             await update.message.reply_text("🔓 El bot ya está desbloqueado.", reply_markup=admin_keyboard()); return
-        set_maintenance(False)
-        sent=failed=0
-        conn=db(); rows=conn.execute("SELECT telegram_id FROM usuarios WHERE telegram_id != ?",(ADMIN_TELEGRAM_ID,)).fetchall(); conn.close()
-        for row in rows:
-            try:
-                if await send_image_to_user(context.bot, row["telegram_id"], UNLOCK_IMAGE):
-                    sent += 1
-                else:
-                    failed += 1
-            except Exception as e: failed+=1; print(e)
-        await update.message.reply_text(f"🔓 *BOT DESBLOQUEADO*\n\nUsuarios notificados: {sent}\nNo enviados: {failed}", parse_mode="Markdown", reply_markup=admin_keyboard())
+        lock_path = get_system_value("lock_backup_db", "")
+        if lock_path:
+            await update.message.reply_text(
+                "🔓 *DESBLOQUEAR BOT*\n\n"
+                "Antes de desbloquear, debes decidir qué hacer con el respaldo creado al bloquear.\n\n"
+                "♻️ *Restaurar respaldo del bloqueo*: vuelve la base exactamente al estado que tenía cuando bloqueaste el bot.\n\n"
+                "⚠️ Esto descartará los cambios realizados después del bloqueo.\n\n"
+                "🔓 *Desbloquear sin restaurar*: conserva los cambios realizados durante el bloqueo.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("♻️ Restaurar respaldo del bloqueo", callback_data="admin_unlock_restore")],
+                    [InlineKeyboardButton("🔓 Desbloquear sin restaurar", callback_data="admin_unlock_no_restore")],
+                    [InlineKeyboardButton("⬅️ Cancelar", callback_data="admin_home")],
+                ])
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ No se encontró el respaldo local del último bloqueo.\n\n"
+                "Puedes desbloquear sin restaurar o cancelar y usar ♻️ Restaurar respaldo para subir el `.db` que recibiste.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔓 Desbloquear sin restaurar", callback_data="admin_unlock_no_restore")],
+                    [InlineKeyboardButton("⬅️ Cancelar", callback_data="admin_home")],
+                ])
+            )
         return
 
     if action == "admin_broadcast":
@@ -3356,10 +3458,10 @@ async def send_excel_backup(bot, reason="Respaldo automático"):
         caption=f"💾 {reason}\n📊 Respaldo Excel completo (.xlsx)."
     )
 
-async def send_db_backup(bot, reason="Respaldo de base de datos"):
+async def send_db_backup(bot, reason="Respaldo de base de datos", filename=None):
     os.makedirs(BACKUP_DIR, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"database_backup_{stamp}.db"
+    filename = filename or f"database_backup_{stamp}.db"
     path = os.path.join(BACKUP_DIR, filename)
     conn = db()
     try:
@@ -3368,8 +3470,6 @@ async def send_db_backup(bot, reason="Respaldo de base de datos"):
         backup_conn.close()
     finally:
         conn.close()
-    # Leer el archivo completo a memoria antes de enviarlo para que Telegram
-    # reciba una copia independiente y el archivo .db quede realmente adjunto.
     with open(path, "rb") as f:
         data = f.read()
     stream = BytesIO(data)
@@ -3379,17 +3479,109 @@ async def send_db_backup(bot, reason="Respaldo de base de datos"):
         document=InputFile(stream, filename=filename),
         caption=f"💾 {reason}\n🗄️ Base SQLite completa (.db) para restauración."
     )
+    return path
 
-async def send_full_backup(bot, reason="Respaldo solicitado"):
+
+async def send_full_backup(bot, reason="Respaldo solicitado", db_filename=None):
     # SIEMPRE se envían DOS archivos independientes: primero .db y luego .xlsx.
-    await send_db_backup(bot, reason + " — base SQLite .db")
+    db_path = await send_db_backup(bot, reason + " — base SQLite .db", filename=db_filename)
     await send_excel_backup(bot, reason + " — Excel .xlsx")
+    return db_path
+
+
+async def backup_after_accreditation(application, source):
+    try:
+        await send_full_backup(
+            application.bot,
+            f"Respaldo posterior a la acreditación {source}"
+        )
+        print(f"💾 Respaldo posterior a acreditación enviado al administrador ({source}).")
+    except Exception as e:
+        print(f"❌ Error enviando respaldo posterior a acreditación ({source}): {e}")
+
+
+async def create_and_send_lock_backup(application):
+    """Crea y envía el respaldo EXACTO del estado anterior al bloqueo.
+    El .db se conserva localmente con un nombre estable para poder restaurarlo
+    desde el botón Desbloquear Bot.
+    """
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    filename = "lock_backup.db"
+    path = await send_db_backup(
+        application.bot,
+        "Respaldo automático creado al bloquear el bot — base SQLite .db",
+        filename=filename
+    )
+    await send_excel_backup(
+        application.bot,
+        "Respaldo automático creado al bloquear el bot — Excel .xlsx"
+    )
+    set_system_value("lock_backup_db", path)
+    set_system_value("lock_backup_created_at", now_iso())
+    return path
+
+
+async def restore_lock_backup(application):
+    path = get_system_value("lock_backup_db", "")
+    if not path:
+        raise FileNotFoundError("No existe un respaldo asociado al último bloqueo.")
+    if not os.path.exists(path):
+        raise FileNotFoundError("El respaldo del bloqueo ya no está disponible en el servidor. Puedes usar ♻️ Restaurar respaldo para subir el archivo .db que recibiste.")
+
+    temp = os.path.join(BACKUP_DIR, "lock_restore_temp.db")
+    shutil.copy2(path, temp)
+    try:
+        test = sqlite3.connect(temp)
+        integrity = test.execute("PRAGMA integrity_check").fetchone()[0]
+        tables = {r[0] for r in test.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        test.close()
+        required = {"usuarios", "depositos", "retiros", "inversiones", "movimientos", "referidos"}
+        if integrity != "ok" or not required.issubset(tables):
+            raise ValueError("El respaldo del bloqueo no es una base válida del sistema.")
+
+        # Restaurar directamente el respaldo creado al momento de bloquear.
+        # No se crea otro respaldo aquí: el respaldo del bloqueo es el punto
+        # exacto al que el administrador decidió volver.
+        conn = db(); conn.close()
+        shutil.copy2(temp, DB_FILE)
+        init_db()
+        return True
+    finally:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
 
 
 async def automatic_profit_loop(application):
-    """Compatibilidad: no realiza pagos automáticos. Las cuotas se aplican manualmente desde el panel."""
+    """Respaldo automático diario: a las 18:00 acredita la cuota mínima si aún no se pagó hoy."""
+    AUTO_QUOTA_RATE = min(DAILY_QUOTA_OPTIONS) / 100.0  # 0,25%
     while True:
-        await asyncio.sleep(86400)
+        try:
+            tz = ZoneInfo(PROFIT_TIMEZONE)
+        except Exception:
+            print(f"⚠️ Zona horaria inválida: {PROFIT_TIMEZONE}. Se usará UTC.")
+            tz = timezone.utc
+        try:
+            now = datetime.now(tz)
+            # Solo se acredita de lunes a viernes y nunca antes de las 18:00.
+            if now.weekday() < 5 and (now.hour, now.minute) >= (18, 0):
+                processed, total, credited, already, details_or_status = process_daily_quota(AUTO_QUOTA_RATE)
+                if not already and details_or_status != "weekend":
+                    set_current_quota(AUTO_QUOTA_RATE)
+                    notified = await send_daily_quota_notifications(
+                        application, credited, AUTO_QUOTA_RATE, details_or_status
+                    ) if credited else 0
+                    # Respaldo independiente de la acreditación automática de las 18:00.
+                    await backup_after_accreditation(application, "automática de las 18:00")
+                    print(
+                        f"🤖 Acreditación automática 18:00: cuota {quota_label(AUTO_QUOTA_RATE)}, "
+                        f"inversiones={processed}, total={total:.2f}, usuarios={notified}"
+                    )
+        except Exception as e:
+            print(f"❌ Error en acreditación automática de las 18:00: {e}")
+        # Revisa periódicamente para cubrir también reinicios del bot después de las 18:00.
+        await asyncio.sleep(30)
 
 
 async def automatic_backup_loop(application):
@@ -3696,10 +3888,12 @@ async def main():
     await app.start()
     await app.updater.start_polling()
 
+    profit_task = asyncio.create_task(automatic_profit_loop(app))
     backup_task = asyncio.create_task(automatic_backup_loop(app))
     try:
         await asyncio.Event().wait()
     finally:
+        profit_task.cancel()
         backup_task.cancel()
 
 
