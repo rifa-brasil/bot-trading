@@ -1015,7 +1015,7 @@ async def show_info(query):
         "🔹 *CUOTAS DIARIAS*\nLas cuotas son variables y dependen de los resultados diarios obtenidos en el mercado.",
         f"🔹 *PLANES DE INVERSIÓN*\nLa inversión mínima es de *{money(MIN_INVESTMENT)} USDT* por plan, mediante la red *TRC20*.",
         "🔹 *FINALIZACIÓN DEL PLAN*\nCada plan termina cuando la ganancia acumulada alcanza el 100% del capital inicial, es decir, cuando el valor total del plan llega al 200% de la inversión inicial.",
-        "🔹 *ACREDITACIÓN DE GANANCIAS*\nLas ganancias se generan de lunes a viernes. La acreditación se realizará durante el día y puede efectuarse hasta las 18:00. No se realizarán acreditaciones después de esa hora.",
+        "🔹 *ACREDITACIÓN DE GANANCIAS*\nLas ganancias se generan de lunes a viernes. La acreditación se realizará durante el día y puede efectuarse hasta las 18:00.",
         f"🔹 *RETIROS*\nEl retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT* y se permite *una solicitud cada 7 días*. Se aplica una comisión del *3%* por cada retiro realizado.",
         "🔹 *REINVERSIÓN*\nPuedes reinvertir el saldo acumulado de tus ganancias como un nuevo plan cuando alcances el mínimo de *50 USDT*.",
         "🔹 *TRANSFERENCIAS INTERNAS*\nNo existe transferencia de saldo entre usuarios dentro del sistema.",
