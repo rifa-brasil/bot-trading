@@ -2205,7 +2205,7 @@ async def _send_user_history(query, text, back_callback="user_history"):
 
 
 async def show_user_daily_gains(query):
-    """Muestra al usuario todo su historial de ganancias acreditadas, agrupado por día."""
+    """Muestra al usuario el historial de ganancias, detallado por fecha y por plan."""
     user_id = query.from_user.id
     conn = db()
     rows = conn.execute(
@@ -2213,54 +2213,114 @@ async def show_user_daily_gains(query):
         "WHERE telegram_id=? AND tipo='ganancia' ORDER BY fecha ASC, id ASC",
         (user_id,)
     ).fetchall()
+
+    # Cargamos las inversiones para poder relacionar cada acreditación con su Plan
+    # y mostrar el capital del plan en la misma línea.
+    investments = {
+        int(r["id"]): r for r in conn.execute(
+            "SELECT id,capital FROM inversiones WHERE telegram_id=?",
+            (user_id,)
+        ).fetchall()
+    }
     conn.close()
 
     lines = [
         "📊 *HISTORIAL DE GANANCIAS DIARIAS*",
         "",
-        "📌 Tus ganancias acreditadas, desde el primer día hasta el último:",
+        "📌 Detalle de cada acreditación por fecha y por plan:",
         ""
     ]
 
     if not rows:
         lines.append("No tienes ganancias diarias acreditadas todavía.")
     else:
+        # Agrupamos por fecha local, conservando el orden cronológico de las
+        # acreditaciones y de los planes dentro de cada día.
         grouped = []
-        current_day = None
-        current = None
+        by_day = {}
         for r in rows:
             raw_date = str(r['fecha'])
             try:
                 dt = datetime.fromisoformat(raw_date)
-                day = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE)).strftime('%d/%m/%Y')
+                local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
+                day_key = local_dt.date().isoformat()
+                day_label = local_dt.strftime('%d/%m/%Y')
             except Exception:
-                day = raw_date[:10]
+                day_key = raw_date[:10]
+                day_label = raw_date[:10]
 
-            if day != current_day:
-                current_day = day
-                current = {"day": day, "total": 0.0, "quota": 0.0, "items": []}
-                grouped.append(current)
+            if day_key not in by_day:
+                item = {"day": day_label, "items": [], "total": 0.0}
+                by_day[day_key] = item
+                grouped.append(item)
+            else:
+                item = by_day[day_key]
 
             amount = float(r['monto'] or 0)
             quota = _quota_from_movement_description(r['descripcion'])
-            current['total'] += amount
-            if quota:
-                current['quota'] = quota
-            current['items'].append((amount, r['descripcion']))
+
+            # La descripción de la acreditación guarda el ID de la inversión.
+            match = re.search(r"inversi[oó]n\s+#(\d+)", r['descripcion'] or '', re.IGNORECASE)
+            investment_id = int(match.group(1)) if match else None
+            inv = investments.get(investment_id) if investment_id is not None else None
+
+            if inv:
+                # El número visible del plan es el orden de activación/inversión
+                # del usuario, no el ID interno de SQLite.
+                conn2 = db()
+                plan_row = conn2.execute(
+                    "SELECT COUNT(*) AS c FROM inversiones WHERE telegram_id=? AND id<=?",
+                    (user_id, investment_id)
+                ).fetchone()
+                conn2.close()
+                plan_number = int(plan_row["c"]) if plan_row else investment_id
+                capital = float(inv["capital"] or 0)
+            else:
+                plan_number = None
+                capital = 0.0
+
+            item["total"] += amount
+            item["items"].append({
+                "plan_number": plan_number,
+                "capital": capital,
+                "quota": quota,
+                "amount": amount,
+            })
 
         grand_total = 0.0
         for n, item in enumerate(grouped, 1):
-            grand_total += item['total']
+            grand_total += item["total"]
             lines.append(f"📅 *Día {n} — {item['day']}*")
-            if item['quota']:
-                lines.append(f"📈 Cuota aplicada: *{item['quota']*100:.2f}%*")
-            for amount, desc in item['items']:
-                lines.append(f"💰 Ganancia acreditada: *{money(amount)} USDT*")
-                if desc:
-                    lines.append(f"📝 {desc}")
-            lines += [f"💵 *Total del día: {money(item['total'])} USDT*", ""]
+            lines.append("")
 
-        lines += ["━━━━━━━━━━━━", f"💰 *TOTAL HISTÓRICO DE GANANCIAS: {money(grand_total)} USDT*"]
+            for detail in item["items"]:
+                plan_text = (
+                    f"Plan {detail['plan_number']} de {money(detail['capital'])} USDT"
+                    if detail["plan_number"] is not None
+                    else "Plan no identificado"
+                )
+                quota_text = (
+                    f"{detail['quota']*100:.2f}%"
+                    if detail["quota"]
+                    else "No registrada"
+                )
+                lines.append(
+                    f"🔹 *{plan_text} — cuota {quota_text} — ganancias {money(detail['amount'])} USDT*"
+                )
+
+            # Separación visual clara antes del total del día, igual que el
+            # separador utilizado para el total histórico.
+            lines += [
+                "",
+                "━━━━━━━━━━━━",
+                f"💵 *TOTAL DEL DÍA: {money(item['total'])} USDT*",
+                ""
+            ]
+
+        lines += [
+            "━━━━━━━━━━━━",
+            f"💰 *TOTAL HISTÓRICO DE GANANCIAS: {money(grand_total)} USDT*"
+        ]
 
     await _send_user_history(query, "\n".join(lines))
 
