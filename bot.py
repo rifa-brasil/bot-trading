@@ -686,7 +686,7 @@ def admin_keyboard():
         ["💾 Crear respaldo", "♻️ Restaurar respaldo"],
         ["🔒 Bloquear bot", "🔓 Desbloquear bot"],
         ["💰 Pago Diario", "📊 Cuotas Diarias"],
-        ["📊 Ganancias Diarias"],
+        ["📜 Historial General"],
         ["📊 Estado"],
         ["📢 Enviar mensaje"],
     ], resize_keyboard=True, is_persistent=True)
@@ -1609,75 +1609,20 @@ def _daily_user_gain_history(telegram_id):
     return grouped
 
 
-def _admin_daily_gain_history():
-    conn = db()
-    rows = conn.execute("SELECT fecha,total,inversiones,cuota FROM pagos_diarios ORDER BY fecha ASC").fetchall()
-    # Fallback de cuota para respaldos antiguos que no tenían la columna.
-    movement_rows = conn.execute("SELECT fecha,descripcion FROM movimientos WHERE tipo='ganancia' ORDER BY fecha ASC, id ASC").fetchall()
-    conn.close()
-    fallback = {}
-    for r in movement_rows:
-        try:
-            day = datetime.fromisoformat(r['fecha']).astimezone(ZoneInfo(PROFIT_TIMEZONE)).date().isoformat()
-        except Exception:
-            day = str(r['fecha'])[:10]
-        q = _quota_from_movement_description(r['descripcion'])
-        if q:
-            fallback.setdefault(day, q)
-    out=[]
-    for r in rows:
-        q=float(r['cuota'] or 0) or fallback.get(r['fecha'], 0.0)
-        out.append((r['fecha'], q, float(r['total'] or 0), int(r['inversiones'] or 0)))
-    return out
-
-
-async def show_user_daily_gains(query):
-    uid=query.from_user.id
-    history=_daily_user_gain_history(uid)
-    if not history:
-        text="📊 *GANANCIAS DIARIAS*\n\n*Todavía no tienes ganancias diarias acreditadas.*"
-    else:
-        lines=["📊 *GANANCIAS DIARIAS*", "", "*Detalle cronológico de tus ganancias acreditadas:*", ""]
-        total=0.0
-        ordered_days=list(history.keys())
-        for idx, day in enumerate(ordered_days):
-            data=history[day]
-            total += data['total']
-            q=quota_label(data['quota']) if data['quota'] else 'No registrada'
-            try: display=datetime.fromisoformat(day).strftime('%d/%m/%Y')
-            except Exception: display=day
-            lines += [
-                f"📅 *{display}*",
-                f"📊 *Cuota: {q}*",
-                f"💰 *Ganancia acreditada: {money(data['total'])} USDT*",
-            ]
-            if idx == len(ordered_days) - 1:
-                lines.append("⭐ *ÚLTIMA GANANCIA ACREDITADA HASTA EL MOMENTO DE LA CONSULTA* ⭐")
-            lines.append("")
-        lines += ["━━━━━━━━━━━━", f"💵 *TOTAL ACUMULADO: {money(total)} USDT*"]
-        text='\n'.join(lines)
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Historial", callback_data="user_history")],
-        [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
-    ]))
-
-
-async def show_admin_daily_gains(query):
-    history=_admin_daily_gain_history()
-    total=sum(x[2] for x in history)
-    lines=["📊 *GANANCIAS DIARIAS — GENERAL*", ""]
-    if not history:
-        lines.append("Todavía no se ha acreditado ninguna ganancia.")
-    else:
-        for day,q,amount,count in history:
-            try: display=datetime.fromisoformat(day).strftime('%d/%m/%Y')
-            except Exception: display=day
-            lines += [f"📅 *{display}*", f"📊 Cuota: *{quota_label(q) if q else 'No registrada'}*", f"💰 Total acreditado: *{money(amount)} USDT*", f"📈 Inversiones procesadas: *{count}*", ""]
-        lines += ["━━━━━━━━━━━━", f"💵 *TOTAL GENERAL ACREDITADO: {money(total)} USDT*"]
-    await query.edit_message_text('\n'.join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Consultar por ID", callback_data="admin_daily_user")],
-        [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
-    ]))
+async def show_admin_history_menu(query):
+    """Menú único para todas las consultas históricas por ID de usuario."""
+    await query.edit_message_text(
+        "📜 *HISTORIAL GENERAL*\n\n"
+        "Selecciona qué historial quieres consultar e introduce el ID de Telegram del usuario:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Ganancias Diarias por ID", callback_data="admin_history_daily")],
+            [InlineKeyboardButton("📥 Depósitos por ID", callback_data="admin_history_deposits")],
+            [InlineKeyboardButton("📤 Retiros por ID", callback_data="admin_history_withdrawals")],
+            [InlineKeyboardButton("📈 Inversiones por ID", callback_data="admin_history_investments")],
+            [InlineKeyboardButton("⬅️ Panel Admin", callback_data="admin_home")],
+        ])
+    )
 
 
 async def _send_admin_history(query, text, back_callback, back_label):
@@ -1694,7 +1639,7 @@ async def show_admin_user_daily_gains(query, telegram_id):
     history = _daily_user_gain_history(telegram_id)
     conn=db(); user=conn.execute("SELECT nombre,username FROM usuarios WHERE telegram_id=?",(telegram_id,)).fetchone(); conn.close()
     if not user:
-        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Ganancias Diarias",callback_data="admin_daily_gains")]])); return
+        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
     lines=["📊 *HISTORIAL COMPLETO DE GANANCIAS DIARIAS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todas las acreditaciones registradas, desde la primera hasta la última:*",""]
     total=0.0
     if not history: lines.append("No tiene ganancias diarias acreditadas.")
@@ -1708,12 +1653,12 @@ async def show_admin_user_daily_gains(query, telegram_id):
             if idx==len(ordered)-1: lines.append("⭐ *ÚLTIMA GANANCIA ACREDITADA HASTA EL MOMENTO DE LA CONSULTA* ⭐")
             lines.append("")
         lines += ["━━━━━━━━━━━━",f"💵 *TOTAL ACREDITADO HISTÓRICO: {money(total)} USDT*"]
-    await _send_admin_history(query,'\n'.join(lines),"admin_daily_gains","Ganancias Diarias")
+    await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
 async def show_admin_deposit_history(query, telegram_id):
     user=_user_identity(telegram_id)
     if not user:
-        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Depósitos",callback_data="admin_deposits")]])); return
+        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
     rows=_history_rows('depositos',telegram_id,'id ASC')
     lines=["📥 *HISTORIAL COMPLETO DE DEPÓSITOS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todos los depósitos registrados, desde el primero hasta el último:*",""]
     total=0.0
@@ -1724,12 +1669,12 @@ async def show_admin_deposit_history(query, telegram_id):
         if r['tx_hash']: lines.append(f"🔗 TX: `{r['tx_hash']}`")
         lines.append("")
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE DEPÓSITOS: {money(total)} USDT*"]
-    await _send_admin_history(query,'\n'.join(lines),"admin_deposits","Depósitos")
+    await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
 async def show_admin_withdraw_history(query, telegram_id):
     user=_user_identity(telegram_id)
     if not user:
-        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retiros",callback_data="admin_withdrawals")]])); return
+        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
     rows=_history_rows('retiros',telegram_id,'id ASC')
     lines=["📤 *HISTORIAL COMPLETO DE RETIROS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todos los retiros registrados, desde el primero hasta el último:*",""]
     total=0.0
@@ -1738,12 +1683,12 @@ async def show_admin_withdraw_history(query, telegram_id):
         amount=float(r['monto'] or 0); total+=amount
         lines += [f"📤 *Retiro {idx}*",f"📅 Fecha: *{str(r['fecha'])[:19]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*",f"🏦 Wallet: `{r['direccion']}`",""]
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE RETIROS: {money(total)} USDT*"]
-    await _send_admin_history(query,'\n'.join(lines),"admin_withdrawals","Retiros")
+    await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
 async def show_admin_investment_history(query, telegram_id):
     user=_user_identity(telegram_id)
     if not user:
-        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inversiones",callback_data="admin_investments")]])); return
+        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
     rows=_history_rows('inversiones',telegram_id,'id ASC')
     lines=["📈 *HISTORIAL COMPLETO DE INVERSIONES*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todas las inversiones registradas, desde Plan 1 hasta la última:*",""]
     total=0.0
@@ -1752,7 +1697,7 @@ async def show_admin_investment_history(query, telegram_id):
         capital=float(r['capital'] or 0); total+=capital
         lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{str(r['fecha_inicio'])[:19]}*",f"🎁 Ganancia acumulada: *{money(r['ganancia_acumulada'])} USDT*",f"📌 Estado: *{r['estado']}*",""]
     lines += ["━━━━━━━━━━━━",f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
-    await _send_admin_history(query,'\n'.join(lines),"admin_investments","Inversiones")
+    await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
 
 async def show_daily_quotas(query):
@@ -2384,31 +2329,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # -----------------------------------------------------
-    # GANANCIAS DIARIAS / CONSULTAS
+    # HISTORIAL GENERAL ADMIN
     # -----------------------------------------------------
-    if data == "user_daily_gains":
-        await show_user_daily_gains(query)
-        return
-    if data == "admin_daily_gains":
+    if data == "admin_history_general":
         if not is_admin(user_id):
             await query.answer("⛔ No autorizado.", show_alert=True); return
-        await show_admin_daily_gains(query)
+        for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
+            context.user_data.pop(key, None)
+        await show_admin_history_menu(query)
         return
-    if data == "admin_daily_user":
+
+    admin_history_prompts = {
+        "admin_history_daily": ("await_admin_daily_user_id", "📊 *CONSULTAR GANANCIAS DIARIAS POR ID*"),
+        "admin_history_deposits": ("await_admin_deposit_user_id", "📥 *CONSULTAR DEPÓSITOS POR ID*"),
+        "admin_history_withdrawals": ("await_admin_withdraw_user_id", "📤 *CONSULTAR RETIROS POR ID*"),
+        "admin_history_investments": ("await_admin_invest_user_id", "📈 *CONSULTAR INVERSIONES POR ID*"),
+    }
+    if data in admin_history_prompts:
         if not is_admin(user_id):
             await query.answer("⛔ No autorizado.", show_alert=True); return
-        context.user_data["await_admin_daily_user_id"] = True
-        await query.edit_message_text("🔎 *CONSULTAR GANANCIAS POR ID*\n\nEscribe el ID de Telegram del usuario que quieres consultar.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_daily_gains")]]))
+        flag, title = admin_history_prompts[data]
+        for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
+            context.user_data.pop(key, None)
+        context.user_data[flag] = True
+        await query.edit_message_text(
+            f"{title}\n\nEscribe el ID de Telegram del usuario que quieres consultar.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_history_general")]])
+        )
         return
-    if data == "admin_deposit_user":
-        context.user_data["await_admin_deposit_user_id"] = True
-        await query.edit_message_text("🔎 *CONSULTAR DEPÓSITOS POR ID*\n\nEscribe el ID de Telegram del usuario.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_deposits")]])); return
-    if data == "admin_withdraw_user":
-        context.user_data["await_admin_withdraw_user_id"] = True
-        await query.edit_message_text("🔎 *CONSULTAR RETIROS POR ID*\n\nEscribe el ID de Telegram del usuario.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_withdrawals")]])); return
-    if data == "admin_invest_user":
-        context.user_data["await_admin_invest_user_id"] = True
-        await query.edit_message_text("🔎 *CONSULTAR INVERSIONES POR ID*\n\nEscribe el ID de Telegram del usuario.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_investments")]])); return
 
     # -----------------------------------------------------
     # ADMIN
@@ -2467,7 +2416,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔎 Ver pendientes", callback_data="admin_deposits_pending")],
-                [InlineKeyboardButton("🔎 Consultar por ID", callback_data="admin_deposit_user")],
                 [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]
             ])
         )
@@ -2503,7 +2451,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Rechazados: *{rejected_count}* — *{money(rejected_amount)} USDT*\n\n"
             f"💸 Total retirado aprobado: *{money(approved_amount)} USDT*"
         )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Ver pendientes", callback_data="admin_withdrawals_pending")],[InlineKeyboardButton("🔎 Consultar por ID", callback_data="admin_withdraw_user")],[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]]))
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Ver pendientes", callback_data="admin_withdrawals_pending")],[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]]))
         return
 
     if data == "admin_withdrawals_pending":
@@ -2540,7 +2488,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador.\n"
             f"🎯 Objetivo de cada plan: 200% del capital inicial"
         )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Consultar por ID", callback_data="admin_invest_user")],[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]]))
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]]))
         return
 
     if data == "admin_status":
@@ -3279,7 +3227,9 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
         "💾 Crear respaldo": "admin_backup", "♻️ Restaurar respaldo": "admin_restore",
         "🔒 Bloquear bot": "admin_lock", "🔓 Desbloquear bot": "admin_unlock",
-        "💰 Pago Diario": "admin_profit", "📊 Cuotas Diarias": "admin_quotas", "📊 Ganancias Diarias": "admin_daily_gains",
+        "💰 Pago Diario": "admin_profit", "📊 Cuotas Diarias": "admin_quotas", "📜 Historial General": "admin_history_general",
+        # Compatibilidad con un teclado antiguo que Telegram pudiera conservar temporalmente.
+        "📊 Ganancias Diarias": "admin_history_general",
         "📊 Estado": "admin_status",
         "📢 Enviar mensaje": "admin_broadcast",
     }
@@ -3467,7 +3417,7 @@ async def handle_text_panel_action(update, context, action):
             f"✅ Aprobados: *{ac}* — *{money(aa)} USDT*\n"
             f"⏳ Pendientes: *{pc}* — *{money(pa)} USDT*\n"
             f"❌ Rechazados: *{rc}* — *{money(ra)} USDT*",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Consultar por ID", callback_data="admin_deposit_user")],[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
         )
         return
 
@@ -3485,7 +3435,7 @@ async def handle_text_panel_action(update, context, action):
             f"✅ Aprobados: *{ac}* — *{money(aa)} USDT*\n"
             f"❌ Rechazados: *{rc}* — *{money(ra)} USDT*\n"
             f"💸 Total retirado aprobado: *{money(aa)} USDT*",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Consultar por ID", callback_data="admin_withdraw_user")],[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
         )
         return
 
@@ -3506,17 +3456,19 @@ async def handle_text_panel_action(update, context, action):
             f"🏁 Planes finalizados: *{finished}*\n"
             "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador.\n"
             "🎯 Objetivo por plan: 200% del capital inicial",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 Consultar por ID", callback_data="admin_invest_user")],[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
         )
         return
 
-    if action == "admin_daily_gains":
+    if action == "admin_history_general":
         class TQ:
             def __init__(self, message, user): self.message=message; self.from_user=user
-            async def edit_message_text(self,*args,**kwargs): return await update.message.reply_text(*args,**kwargs)
-            async def answer(self,*args,**kwargs): return None
-        await show_admin_daily_gains(TQ(update.message, update.effective_user))
+        async def _edit(*args, **kwargs): return await update.message.reply_text(*args, **kwargs)
+        TQ.edit_message_text = _edit
+        TQ.answer = lambda *args, **kwargs: None
+        await show_admin_history_menu(TQ(update.message, update.effective_user))
         return
+
 
     if action == "admin_backup":
         await send_full_backup(context.bot, "Respaldo solicitado por el administrador")
