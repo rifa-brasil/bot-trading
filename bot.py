@@ -667,12 +667,14 @@ async def maintenance_guard(update):
 # =========================================================
 
 def user_keyboard():
+    # Las consultas históricas se concentran dentro de 📜 Historial para
+    # mantener el menú principal limpio y evitar botones que Telegram pueda
+    # ocultar según el teclado anterior que conserve el cliente.
     return ReplyKeyboardMarkup([
         ["👤 Mi cuenta", "📈 Inversiones"],
         ["💰 Planes de Inversión"],
         ["🔄 Reinvertir saldo", "💸 Retirar"],
         ["🤝 Referidos", "📜 Historial"],
-        ["🔎 Consultar Ganancias"],
         ["🆘 Soporte", "ℹ️ Información"],
     ], resize_keyboard=True, is_persistent=True)
 
@@ -696,22 +698,11 @@ def back_inline(callback="admin_home"):
 async def send_user_menu(chat_id, context, text=None):
     if text is None:
         text = "🏦 *MENÚ PRINCIPAL*\n\nSelecciona una opción:"
-    # El teclado inferior contiene la opción, pero además mostramos un botón inline
-    # directamente debajo del mensaje para que la consulta de ganancias sea visible
-    # incluso si Telegram conserva temporalmente un teclado anterior.
-    user_menu_inline = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Consultar Ganancias", callback_data="user_daily_gains")]
-    ])
     await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=user_keyboard(),
         parse_mode="Markdown"
-    )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="📊 Consulta tu historial completo de ganancias acreditadas.",
-        reply_markup=user_menu_inline
     )
 
 
@@ -1665,7 +1656,10 @@ async def show_user_daily_gains(query):
             lines.append("")
         lines += ["━━━━━━━━━━━━", f"💵 *TOTAL ACUMULADO: {money(total)} USDT*"]
         text='\n'.join(lines)
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú Principal", callback_data="user_home")]]))
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Historial", callback_data="user_history")],
+        [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
+    ]))
 
 
 async def show_admin_daily_gains(query):
@@ -1726,7 +1720,7 @@ async def show_admin_deposit_history(query, telegram_id):
     if not rows: lines.append("No hay depósitos registrados.")
     for idx,r in enumerate(rows,1):
         amount=float(r['monto'] or 0); total+=amount
-        lines += [f"📥 *Depósito {idx}*",f"📅 Fecha: *{str(r['fecha'])[:19]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*"]
+        lines += ["📥 *Depósito*",f"📅 Fecha: *{str(r['fecha'])[:19]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*"]
         if r['tx_hash']: lines.append(f"🔗 TX: `{r['tx_hash']}`")
         lines.append("")
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE DEPÓSITOS: {money(total)} USDT*"]
@@ -2207,44 +2201,122 @@ async def cancel_withdraw(update, context):
 # HISTORIAL
 # =========================================================
 
-async def show_history(query):
-    user_id = query.from_user.id
+def _history_rows(table, telegram_id, order="id ASC"):
+    allowed = {"depositos", "retiros", "inversiones"}
+    if table not in allowed:
+        raise ValueError("Tabla de historial no permitida")
     conn = db()
-    rows = conn.execute("""
-        SELECT tipo, monto, descripcion, fecha
-        FROM movimientos
-        WHERE telegram_id = ?
-        ORDER BY id ASC
-    """, (user_id,)).fetchall()
+    rows = conn.execute(f"SELECT * FROM {table} WHERE telegram_id=? ORDER BY {order}", (telegram_id,)).fetchall()
     conn.close()
+    return rows
 
-    if not rows:
-        texto = "📜 *HISTORIAL COMPLETO*\n\nTodavía no tienes movimientos."
-    else:
-        texto = "📜 *HISTORIAL COMPLETO*\n\n"
-        for r in rows:
-            try:
-                fecha = datetime.fromisoformat(r["fecha"]).astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M")
-            except Exception:
-                fecha = r["fecha"]
-            texto += (
-                f"🕒 {fecha} UTC\n"
-                f"• *{r['tipo']}* — {money(r['monto'])} USDT\n"
-                f"  {r['descripcion']}\n\n"
-            )
 
-    # Telegram tiene límite de 4096 caracteres; si hay mucho historial, enviamos por páginas.
-    chunks = [texto[i:i+3800] for i in range(0, len(texto), 3800)]
-    if not chunks:
-        chunks = [texto]
+def _user_identity(telegram_id):
+    conn = db()
+    row = conn.execute("SELECT nombre,username FROM usuarios WHERE telegram_id=?", (telegram_id,)).fetchone()
+    conn.close()
+    return row
+
+
+async def show_history(query):
+    """Menú de consultas históricas del usuario."""
     await query.edit_message_text(
-        chunks[0], parse_mode="Markdown",
+        "📜 *HISTORIAL*\n\n"
+        "Selecciona exactamente qué información deseas consultar:",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+            [InlineKeyboardButton("📊 Ganancias Diarias", callback_data="user_history_gains")],
+            [InlineKeyboardButton("📥 Depósitos", callback_data="user_history_deposits")],
+            [InlineKeyboardButton("📤 Retiros", callback_data="user_history_withdrawals")],
+            [InlineKeyboardButton("📈 Inversiones", callback_data="user_history_investments")],
+            [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
+        ])
+    )
+
+
+async def _send_user_history(query, text, back_callback="user_history"):
+    """Envía el historial completo en varios mensajes si supera el límite de Telegram."""
+    chunks = [text[i:i+3800] for i in range(0, len(text), 3800)] or [text]
+    await query.edit_message_text(
+        chunks[0],
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Historial", callback_data=back_callback)],
+            [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
         ])
     )
     for extra in chunks[1:]:
         await query.message.reply_text(extra, parse_mode="Markdown")
+
+
+async def show_user_deposit_history(query):
+    user_id = query.from_user.id
+    rows = _history_rows("depositos", user_id, "id ASC")
+    lines = ["📥 *HISTORIAL COMPLETO DE DEPÓSITOS*", "", "📌 Todos tus depósitos registrados, desde el primero hasta el último:", ""]
+    total = 0.0
+    if not rows:
+        lines.append("No tienes depósitos registrados.")
+    else:
+        for idx, r in enumerate(rows, 1):
+            amount = float(r["monto"] or 0)
+            total += amount
+            lines += [
+                "📥 *Depósito*",
+                f"📅 Fecha: *{str(r['fecha'])[:19]}*",
+                f"💰 Monto: *{money(amount)} USDT*",
+                f"📌 Estado: *{r['estado']}*",
+            ]
+            if r["tx_hash"]:
+                lines.append(f"🔗 TX: `{r['tx_hash']}`")
+            lines.append("")
+        lines += ["━━━━━━━━━━━━", f"💵 *TOTAL HISTÓRICO DE DEPÓSITOS: {money(total)} USDT*"]
+    await _send_user_history(query, "\n".join(lines))
+
+
+async def show_user_withdraw_history(query):
+    user_id = query.from_user.id
+    rows = _history_rows("retiros", user_id, "id ASC")
+    lines = ["📤 *HISTORIAL COMPLETO DE RETIROS*", "", "📌 Todos tus retiros registrados, desde el primero hasta el último:", ""]
+    total = 0.0
+    if not rows:
+        lines.append("No tienes retiros registrados.")
+    else:
+        for idx, r in enumerate(rows, 1):
+            amount = float(r["monto"] or 0)
+            total += amount
+            lines += [
+                "📤 *Retiro*",
+                f"📅 Fecha: *{str(r['fecha'])[:19]}*",
+                f"💰 Monto: *{money(amount)} USDT*",
+                f"📌 Estado: *{r['estado']}*",
+                f"🏦 Wallet TRC20: `{r['direccion']}`",
+                "",
+            ]
+        lines += ["━━━━━━━━━━━━", f"💵 *TOTAL HISTÓRICO DE RETIROS: {money(total)} USDT*"]
+    await _send_user_history(query, "\n".join(lines))
+
+
+async def show_user_investment_history(query):
+    user_id = query.from_user.id
+    rows = _history_rows("inversiones", user_id, "id ASC")
+    lines = ["📈 *HISTORIAL COMPLETO DE INVERSIONES*", "", "📌 Todas tus inversiones, desde Plan 1 hasta la última:", ""]
+    total = 0.0
+    if not rows:
+        lines.append("No tienes inversiones registradas.")
+    else:
+        for plan_number, r in enumerate(rows, 1):
+            capital = float(r["capital"] or 0)
+            accumulated = float(r["ganancia_acumulada"] or 0)
+            total += capital
+            lines += [
+                f"💎 *Plan {plan_number} — {money(capital)} USDT*",
+                f"📅 Inicio: *{str(r['fecha_inicio'])[:19]}*",
+                f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*",
+                f"📌 Estado: *{r['estado']}*",
+                "",
+            ]
+        lines += ["━━━━━━━━━━━━", f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
+    await _send_user_history(query, "\n".join(lines))
 
 
 # =========================================================
@@ -2980,6 +3052,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_history(query)
         return
 
+    if data == "user_history_gains":
+        await show_user_daily_gains(query)
+        return
+
+    if data == "user_history_deposits":
+        await show_user_deposit_history(query)
+        return
+
+    if data == "user_history_withdrawals":
+        await show_user_withdraw_history(query)
+        return
+
+    if data == "user_history_investments":
+        await show_user_investment_history(query)
+        return
+
     if data == "user_info":
         await show_info(query)
         return
@@ -3200,8 +3288,6 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
         "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
         "🔄 Reinvertir saldo": "user_reinvest",
-        "🔎 Consultar Ganancias": "user_daily_gains",
-        "📊 Ganancias Diarias": "user_daily_gains",
         "🆘 Soporte": "user_support",
     }
 
