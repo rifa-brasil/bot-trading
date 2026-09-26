@@ -696,8 +696,22 @@ def back_inline(callback="admin_home"):
 async def send_user_menu(chat_id, context, text=None):
     if text is None:
         text = "🏦 *MENÚ PRINCIPAL*\n\nSelecciona una opción:"
+    # El teclado inferior contiene la opción, pero además mostramos un botón inline
+    # directamente debajo del mensaje para que la consulta de ganancias sea visible
+    # incluso si Telegram conserva temporalmente un teclado anterior.
+    user_menu_inline = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Consultar Ganancias", callback_data="user_daily_gains")]
+    ])
     await context.bot.send_message(
-        chat_id=chat_id, text=text, reply_markup=user_keyboard(), parse_mode="Markdown"
+        chat_id=chat_id,
+        text=text,
+        reply_markup=user_keyboard(),
+        parse_mode="Markdown"
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="📊 Consulta tu historial completo de ganancias acreditadas.",
+        reply_markup=user_menu_inline
     )
 
 
@@ -3185,7 +3199,10 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 Mi cuenta": "user_account", "📈 Inversiones": "user_invest",
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
         "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
-        "🔄 Reinvertir saldo": "user_reinvest", "🔎 Consultar Ganancias": "user_daily_gains", "🆘 Soporte": "user_support",
+        "🔄 Reinvertir saldo": "user_reinvest",
+        "🔎 Consultar Ganancias": "user_daily_gains",
+        "📊 Ganancias Diarias": "user_daily_gains",
+        "🆘 Soporte": "user_support",
     }
 
     # El teclado inferior funciona como panel fijo.
