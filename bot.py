@@ -672,7 +672,7 @@ def user_keyboard():
         ["💰 Planes de Inversión"],
         ["🔄 Reinvertir saldo", "💸 Retirar"],
         ["🤝 Referidos", "📜 Historial"],
-        ["📊 Ganancias Diarias"],
+        ["🔎 Consultar Ganancias"],
         ["🆘 Soporte", "ℹ️ Información"],
     ], resize_keyboard=True, is_persistent=True)
 
@@ -3185,7 +3185,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 Mi cuenta": "user_account", "📈 Inversiones": "user_invest",
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
         "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
-        "🔄 Reinvertir saldo": "user_reinvest", "📊 Ganancias Diarias": "user_daily_gains", "🆘 Soporte": "user_support",
+        "🔄 Reinvertir saldo": "user_reinvest", "🔎 Consultar Ganancias": "user_daily_gains", "🆘 Soporte": "user_support",
     }
 
     # El teclado inferior funciona como panel fijo.
