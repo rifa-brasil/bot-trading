@@ -1612,10 +1612,10 @@ def _daily_user_gain_history(telegram_id):
 async def show_admin_history_menu(query):
     """Menú único y operativo para todas las consultas históricas por ID de usuario."""
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Depósitos por ID", callback_data="admin_history_deposits")],
-        [InlineKeyboardButton("📈 Inversiones por ID", callback_data="admin_history_investments")],
-        [InlineKeyboardButton("📤 Retiros por ID", callback_data="admin_history_withdrawals")],
         [InlineKeyboardButton("📊 Ganancias Diarias por ID", callback_data="admin_history_daily")],
+        [InlineKeyboardButton("📥 Depósitos por ID", callback_data="admin_history_deposits")],
+        [InlineKeyboardButton("📤 Retiros por ID", callback_data="admin_history_withdrawals")],
+        [InlineKeyboardButton("📈 Inversiones por ID", callback_data="admin_history_investments")],
         [InlineKeyboardButton("⬅️ Panel Admin", callback_data="admin_home")],
     ])
     text = (
@@ -1646,24 +1646,138 @@ async def _send_admin_history(query, text, back_callback, back_label):
         await query.message.reply_text(extra, parse_mode="Markdown")
 
 async def show_admin_user_daily_gains(query, telegram_id):
-    history = _daily_user_gain_history(telegram_id)
-    conn=db(); user=conn.execute("SELECT nombre,username FROM usuarios WHERE telegram_id=?",(telegram_id,)).fetchone(); conn.close()
+    """
+    Muestra al administrador el historial de ganancias con EXACTAMENTE
+    el mismo formato que recibe el usuario: por fecha, por plan, cuota
+    y ganancia en una sola línea, ordenado del día más antiguo al más reciente.
+    """
+    conn = db()
+    user = conn.execute(
+        "SELECT nombre, username FROM usuarios WHERE telegram_id=?",
+        (telegram_id,)
+    ).fetchone()
+
     if not user:
-        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
-    lines=["📊 *HISTORIAL COMPLETO DE GANANCIAS DIARIAS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todas las acreditaciones registradas, desde la primera hasta la última:*",""]
-    total=0.0
-    if not history: lines.append("No tiene ganancias diarias acreditadas.")
-    else:
-        ordered=list(history.items())
-        for idx,(day,data) in enumerate(ordered):
-            total+=data['total']
-            try: display=datetime.fromisoformat(day).strftime('%d/%m/%Y')
-            except Exception: display=day
-            lines += [f"📅 *Acreditación {idx+1} — {display}*",f"📊 Cuota: *{quota_label(data['quota']) if data['quota'] else 'No registrada'}*",f"💰 Ganancia acreditada: *{money(data['total'])} USDT*"]
-            if idx==len(ordered)-1: lines.append("⭐ *ÚLTIMA GANANCIA ACREDITADA HASTA EL MOMENTO DE LA CONSULTA* ⭐")
-            lines.append("")
-        lines += ["━━━━━━━━━━━━",f"💵 *TOTAL ACREDITADO HISTÓRICO: {money(total)} USDT*"]
-    await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
+        conn.close()
+        await query.edit_message_text(
+            "⚠️ No se encontró ningún usuario con ese ID.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Historial General", callback_data="admin_history_general")
+            ]])
+        )
+        return
+
+    rows = conn.execute(
+        "SELECT id, fecha, monto, descripcion FROM movimientos "
+        "WHERE telegram_id=? AND tipo='ganancia' ORDER BY fecha ASC, id ASC",
+        (telegram_id,)
+    ).fetchall()
+
+    investments = {
+        int(r["id"]): r for r in conn.execute(
+            "SELECT id, capital FROM inversiones WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchall()
+    }
+    plan_numbers = {}
+    for idx, r in enumerate(conn.execute(
+        "SELECT id FROM inversiones WHERE telegram_id=? ORDER BY id ASC",
+        (telegram_id,)
+    ).fetchall(), 1):
+        plan_numbers[int(r["id"])] = idx
+    conn.close()
+
+    lines = [
+        "📊 *HISTORIAL DE GANANCIAS DIARIAS*",
+        "",
+        f"👤 Nombre: *{user['nombre'] or '-'}*",
+        f"👤 Usuario: @{user['username'] or '-'}",
+        f"🆔 ID: `{telegram_id}`",
+        "",
+        "📌 Detalle de cada acreditación por fecha y por plan:",
+        ""
+    ]
+
+    if not rows:
+        lines.append("No tiene ganancias diarias acreditadas todavía.")
+        await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
+        return
+
+    grouped = []
+    by_day = {}
+    for r in rows:
+        raw_date = str(r["fecha"])
+        try:
+            dt = datetime.fromisoformat(raw_date)
+            local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
+            day_key = local_dt.date().isoformat()
+            day_label = local_dt.strftime("%d/%m/%Y")
+        except Exception:
+            day_key = raw_date[:10]
+            day_label = raw_date[:10]
+
+        if day_key not in by_day:
+            item = {"day": day_label, "items": [], "total": 0.0}
+            by_day[day_key] = item
+            grouped.append(item)
+        else:
+            item = by_day[day_key]
+
+        amount = float(r["monto"] or 0)
+        quota = _quota_from_movement_description(r["descripcion"])
+        match = re.search(r"inversi[oó]n\s+#(\d+)", r["descripcion"] or "", re.IGNORECASE)
+        investment_id = int(match.group(1)) if match else None
+        inv = investments.get(investment_id) if investment_id is not None else None
+
+        if inv:
+            plan_number = plan_numbers.get(investment_id, investment_id)
+            capital = float(inv["capital"] or 0)
+        else:
+            plan_number = None
+            capital = 0.0
+
+        item["total"] += amount
+        item["items"].append({
+            "plan_number": plan_number,
+            "capital": capital,
+            "quota": quota,
+            "amount": amount,
+        })
+
+    grand_total = 0.0
+    for n, item in enumerate(grouped, 1):
+        grand_total += item["total"]
+        lines.append(f"📅 *Día {n} — {item['day']}*")
+        lines.append("")
+
+        for detail in item["items"]:
+            plan_text = (
+                f"Plan {detail['plan_number']} de {money(detail['capital'])} USDT"
+                if detail["plan_number"] is not None
+                else "Plan no identificado"
+            )
+            quota_text = (
+                f"{detail['quota']*100:.2f}%"
+                if detail["quota"]
+                else "No registrada"
+            )
+            lines.append(
+                f"🔹 *{plan_text} — cuota {quota_text} — ganancias {money(detail['amount'])} USDT*"
+            )
+
+        lines += [
+            "",
+            "━━━━━━━━━━━━",
+            f"💵 *TOTAL DEL DÍA: {money(item['total'])} USDT*",
+            ""
+        ]
+
+    lines += [
+        "━━━━━━━━━━━━",
+        f"💰 *TOTAL HISTÓRICO DE GANANCIAS: {money(grand_total)} USDT*"
+    ]
+
+    await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
 
 async def show_admin_deposit_history(query, telegram_id):
     user=_user_identity(telegram_id)
