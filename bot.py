@@ -76,7 +76,7 @@ LOCK_IMAGE = IMAGES_DIR / "bot bloqueado.jpg"
 UNLOCK_IMAGE = IMAGES_DIR / "bot operativo.jpg"
 WITHDRAW_SENT_IMAGE = IMAGES_DIR / "retiro enviado.jpg"
 USDT_ICON_IMAGE = IMAGES_DIR / "usdt_trc20_icon.png"
-USER_GUIDE_PDF = Path(__file__).resolve().parent / "Guia_Usuario_Bot_Inversion_v4_21_FINAL.pdf"
+USER_GUIDE_PDF = Path(__file__).resolve().parent / "Guia de Usuario del bot de Inversion.pdf"
 
 # Usuarios y ganancias acreditadas en la última ejecución manual.
 # Se utiliza para enviar una sola notificación por usuario, aunque tenga varias inversiones.
@@ -258,6 +258,7 @@ def init_db():
     """)
     cur.execute("INSERT OR IGNORE INTO sistema(clave, valor) VALUES ('mantenimiento','0')")
     cur.execute("INSERT OR IGNORE INTO sistema(clave, valor) VALUES ('cuota_diaria_actual','')")
+    cur.execute("INSERT OR IGNORE INTO sistema(clave, valor) VALUES ('acreditacion_fin_de_semana','0')")
     conn.commit()
     conn.close()
 
@@ -696,7 +697,7 @@ def user_keyboard():
         ["👤 Mi cuenta", "💰 Planes de Inversión"],
         ["🔄 Reinvertir saldo", "💸 Retirar"],
         ["🤝 Referidos", "📜 Historial"],
-        ["📘 Guía de Usuario", "🆘 Soporte"],
+        ["📘 Guia de Usuario del bot de Inversion", "🆘 Soporte"],
         ["ℹ️ Información"],
     ], resize_keyboard=True, is_persistent=True)
 
@@ -733,7 +734,7 @@ async def send_user_guide(chat_id, context, registration_button=False):
     if not USER_GUIDE_PDF.exists():
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ La Guía de Usuario no está disponible en este momento."
+            text="⚠️ La Guia de Usuario del bot de Inversion no está disponible en este momento."
         )
         return
 
@@ -747,7 +748,7 @@ async def send_user_guide(chat_id, context, registration_button=False):
         )
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("📝 REGISTRO", callback_data="start_registration")],
-            [InlineKeyboardButton("📘 Guía de Usuario", callback_data="user_guide")]
+            [InlineKeyboardButton("📘 Guia de Usuario del bot de Inversion", callback_data="user_guide")]
         ])
     else:
         caption = (
@@ -814,7 +815,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = get_user(user.id)
 
     # Todo usuario que aún no haya completado el registro recibe primero
-    # la Guía de Usuario y el botón 📝 REGISTRO. Esto también corrige los
+    # la Guia de Usuario del bot de Inversion y el botón 📝 REGISTRO. Esto también corrige los
     # casos de usuarios creados previamente pero que quedaron incompletos.
     step = registration_missing_step(row, user) if row else "username"
     if step:
@@ -1092,7 +1093,7 @@ async def show_info(query):
         "🔹 *CUOTAS DIARIAS*\nLas cuotas son variables y dependen de los resultados diarios obtenidos en el mercado.",
         f"🔹 *PLANES DE INVERSIÓN*\nLa inversión mínima es de *{money(MIN_INVESTMENT)} USDT* por plan, mediante la red *TRC20*.",
         "🔹 *FINALIZACIÓN DEL PLAN*\nCada plan termina cuando la ganancia acumulada alcanza el 100% del capital inicial, es decir, cuando el valor total del plan llega al 200% de la inversión inicial.",
-        "🔹 *ACREDITACIÓN DE GANANCIAS*\nLas ganancias se generan de lunes a viernes. La acreditación se realizará durante el día y puede efectuarse hasta las 18:00.",
+        "🔹 *ACREDITACIÓN DE GANANCIAS*\nLa acreditación ordinaria se realiza de lunes a viernes durante el día y puede efectuarse hasta las 18:00. De forma excepcional, el administrador puede habilitar la acreditación de sábado y domingo mediante un comando privado.",
         f"🔹 *RETIROS*\nEl retiro mínimo es de *{money(MIN_WITHDRAWAL)} USDT* y se permite *una solicitud cada 7 días*. Se aplica una comisión del *3%* por cada retiro realizado.",
         "🔹 *REINVERSIÓN*\nPuedes reinvertir el saldo acumulado de tus ganancias como un nuevo plan cuando alcances el mínimo de *50 USDT*.",
         "🔹 *TRANSFERENCIAS INTERNAS*\nNo existe transferencia de saldo entre usuarios dentro del sistema.",
@@ -1580,9 +1581,12 @@ def process_daily_quota(rate_decimal):
     except Exception:
         tz = timezone.utc
     local_now = datetime.now(tz)
-    # Las ganancias se generan de lunes a viernes.
-    if local_now.weekday() >= 5:
-        return 0, 0.0, {}, False, "weekend"
+    # Por defecto, las ganancias se acreditan de lunes a viernes.
+    # El administrador puede habilitar excepcionalmente sábado y domingo
+    # mediante /fin_de_semana_on.
+    weekend_enabled = get_system_value("acreditacion_fin_de_semana", "0") == "1"
+    if local_now.weekday() >= 5 and not weekend_enabled:
+        return 0, 0.0, {}, False, "weekend_disabled"
     date_key = local_now.date().isoformat()
     conn = db()
     if conn.execute("SELECT 1 FROM pagos_diarios WHERE fecha=?", (date_key,)).fetchone():
@@ -1905,8 +1909,12 @@ async def process_quota_callback(query, context, rate_decimal):
     if already:
         await query.edit_message_text("⚠️ *PAGO DIARIO YA REALIZADO*\n\nLa acreditación de hoy ya fue ejecutada. No se volverá a pagar una segunda vez el mismo día.", parse_mode="Markdown", reply_markup=back_inline())
         return
-    if details_or_status == "weekend":
-        await query.edit_message_text("📅 *PAGOS DE GANANCIAS*\n\nLas ganancias se generan de lunes a viernes. Hoy no corresponde realizar una acreditación diaria.", parse_mode="Markdown", reply_markup=back_inline())
+    if details_or_status == "weekend_disabled":
+        await query.edit_message_text(
+            "📅 *ACREDITACIÓN DE FIN DE SEMANA DESACTIVADA*\n\n"
+            "Hoy es sábado o domingo y el administrador no ha habilitado la acreditación extraordinaria de fin de semana.",
+            parse_mode="Markdown", reply_markup=back_inline()
+        )
         return
     details_by_user = details_or_status
     set_current_quota(rate_decimal)
@@ -3730,7 +3738,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
         "🔄 Reinvertir saldo": "user_reinvest",
         "🆘 Soporte": "user_support",
-        "📘 Guía de Usuario": "user_guide",
+        "📘 Guia de Usuario del bot de Inversion": "user_guide",
         # Compatibilidad temporal con un teclado antiguo: lleva al historial de inversiones.
     }
 
@@ -4113,7 +4121,7 @@ async def handle_text_panel_action(update, context, action):
     if action == "user_account": await show_account(fake)
     elif action == "user_guide": await send_user_guide(update.effective_chat.id, context, registration_button=False)
     elif action == "user_history_investments": await show_user_investment_history(fake)
-    elif action == "user_invest": await show_user_investment_history(fake)
+    elif action == "user_invest": await show_investments(fake)
     elif action == "user_plans": await show_plans(fake)
     elif action == "user_referrals": await show_referrals(fake, context)
     elif action == "user_history": await show_history(fake)
@@ -4493,6 +4501,48 @@ async def restore_database_document(update, context):
         try: os.remove(temp)
         except OSError: pass
 
+async def weekend_on_command(update, context):
+    if not private_only(update) or not is_admin(update.effective_user.id):
+        return
+    set_system_value("acreditacion_fin_de_semana", "1")
+    await update.message.reply_text(
+        "🟢 *ACREDITACIÓN DE FIN DE SEMANA ACTIVADA*\n\n"
+        "El administrador ha habilitado temporalmente la acreditación manual de ganancias para sábado y domingo.\n\n"
+        "📊 Para acreditar, utiliza *📊 Cuotas Diarias* y selecciona la cuota correspondiente.\n"
+        "⚠️ La activación no ejecuta ningún pago por sí sola y no modifica la acreditación automática de las 18:00, que continúa siendo de lunes a viernes.",
+        parse_mode="Markdown", reply_markup=admin_keyboard()
+    )
+
+
+async def weekend_off_command(update, context):
+    if not private_only(update) or not is_admin(update.effective_user.id):
+        return
+    set_system_value("acreditacion_fin_de_semana", "0")
+    await update.message.reply_text(
+        "🔴 *ACREDITACIÓN DE FIN DE SEMANA DESACTIVADA*\n\n"
+        "El sábado y domingo vuelven a quedar bloqueados para la acreditación manual.\n\n"
+        "La configuración ordinaria de lunes a viernes no cambia.",
+        parse_mode="Markdown", reply_markup=admin_keyboard()
+    )
+
+
+async def weekend_status_command(update, context):
+    if not private_only(update) or not is_admin(update.effective_user.id):
+        return
+    enabled = get_system_value("acreditacion_fin_de_semana", "0") == "1"
+    estado = "🟢 ACTIVADA" if enabled else "🔴 DESACTIVADA"
+    await update.message.reply_text(
+        "📅 *ACREDITACIÓN DE FIN DE SEMANA*\n\n"
+        f"Estado actual: *{estado}*\n\n"
+        "Comandos disponibles:\n"
+        "• `/fin_de_semana_on` — activar\n"
+        "• `/fin_de_semana_off` — desactivar\n"
+        "• `/fin_de_semana_estado` — consultar estado\n\n"
+        "La activación solo permite la acreditación manual mediante *📊 Cuotas Diarias*. No realiza pagos automáticamente.",
+        parse_mode="Markdown", reply_markup=admin_keyboard()
+    )
+
+
 async def status_command(update, context):
     if not private_only(update):
         return
@@ -4510,12 +4560,14 @@ async def status_command(update, context):
         "SELECT COUNT(*) AS c FROM retiros WHERE estado='pendiente'"
     ).fetchone()["c"]
     conn.close()
+    weekend_enabled = get_system_value("acreditacion_fin_de_semana", "0") == "1"
 
     await update.message.reply_text(
         "📊 *ESTADO*\n\n"
         f"Usuarios: *{users}*\n"
         f"Depósitos pendientes: *{deposits}*\n"
-        f"Retiros pendientes: *{withdrawals}*",
+        f"Retiros pendientes: *{withdrawals}*\n"
+        f"Acreditación fin de semana: *{'ACTIVADA' if weekend_enabled else 'DESACTIVADA'}*",
         parse_mode="Markdown"
     )
 
@@ -4580,6 +4632,9 @@ async def main():
     app.add_handler(
         CommandHandler("status", status_command, filters=filters.ChatType.PRIVATE)
     )
+    app.add_handler(CommandHandler("fin_de_semana_on", weekend_on_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("fin_de_semana_off", weekend_off_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("fin_de_semana_estado", weekend_status_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("cancelar", cancel_admin_restore, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, restore_database_document), group=0)
 
