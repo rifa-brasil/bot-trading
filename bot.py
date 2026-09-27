@@ -3306,6 +3306,22 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if handled:
                 return
 
+    # HISTORIAL GENERAL ADMIN: procesar este botón antes de cualquier consulta
+    # pendiente por ID, para que una bandera antigua no lo bloquee.
+    if is_admin(update.effective_user.id) and text == "📜 Historial General":
+        for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
+            context.user_data.pop(key, None)
+        class AdminHistoryTextQuery:
+            def __init__(self, message, user):
+                self.message = message
+                self.from_user = user
+            async def edit_message_text(self, *args, **kwargs):
+                return await update.message.reply_text(*args, **kwargs)
+            async def answer(self, *args, **kwargs):
+                return None
+        await show_admin_history_menu(AdminHistoryTextQuery(update.message, update.effective_user))
+        return
+
     if is_admin(update.effective_user.id) and context.user_data.get("support_reply_user_id"):
         target = int(context.user_data.pop("support_reply_user_id"))
         try:
@@ -3865,6 +3881,8 @@ async def handle_text_panel_action(update, context, action):
 
 
 async def finish_withdraw_manual(update, context, address):
+    # Esta es la implementación efectiva del flujo de retiro.
+    # La notificación al administrador siempre incluye comisión y neto.
     user_id = update.effective_user.id
     amount = float(context.user_data.get("withdraw_amount", 0))
     if amount < MIN_WITHDRAWAL:
@@ -3907,8 +3925,23 @@ async def finish_withdraw_manual(update, context, address):
         withdrawal_buttons.append([InlineKeyboardButton("💼 Abrir mi wallet", url=admin_wallet_url())])
     withdrawal_buttons.append([InlineKeyboardButton("✅ Aprobar", callback_data=f"wd_approve_{wid}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"wd_reject_{wid}")])
     kb=InlineKeyboardMarkup(withdrawal_buttons)
+    fee = round(amount * WITHDRAWAL_FEE_RATE, 2)
+    net = round(amount - fee, 2)
     try:
-        await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID,text=("📤 *NUEVO RETIRO PENDIENTE*\n\n" f"ID: `{wid}`\nUsuario: `{user_id}`\nMonto: *{money(amount)} USDT*\nDirección TRC20:\n`{address}`"),parse_mode="Markdown",reply_markup=kb)
+        await context.bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=(
+                "📤 *NUEVO RETIRO PENDIENTE*\n\n"
+                f"ID: `{wid}`\n"
+                f"Usuario: `{user_id}`\n"
+                f"Monto solicitado: *{money(amount)} USDT*\n"
+                f"📉 Comisión de retiro (3%): *{money(fee)} USDT*\n"
+                f"💵 Neto a enviar al usuario: *{money(net)} USDT*\n"
+                f"Dirección TRC20:\n`{address}`"
+            ),
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
     except Exception as e:
         print(f"Error notificando retiro: {e}")
     context.user_data.clear()
