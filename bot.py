@@ -3316,7 +3316,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "user_history_investments":
-        await show_user_investment_history(query)
+        # Consulta directa del historial de inversiones del usuario.
+        # Se protege el callback para que un dato antiguo o una fila incompleta
+        # no deje el botón sin respuesta en Telegram.
+        try:
+            await show_user_investment_history(query)
+        except Exception as e:
+            print(f"❌ Error en Historial → Inversiones del usuario {user_id}: {e}")
+            try:
+                await query.edit_message_text(
+                    "⚠️ *No se pudo cargar el historial de inversiones.*\n\n"
+                    "Inténtalo nuevamente desde 📜 Historial.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Historial", callback_data="user_history")],
+                        [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
+                    ])
+                )
+            except Exception as fallback_error:
+                print(f"❌ Error mostrando fallback del historial de inversiones: {fallback_error}")
         return
 
     if data == "user_info":
