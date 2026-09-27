@@ -1747,7 +1747,7 @@ async def show_admin_user_daily_gains(query, telegram_id):
     grand_total = 0.0
     for n, item in enumerate(grouped, 1):
         grand_total += item["total"]
-        lines.append(f"📅 *Día {n} — {item['day']}*")
+        lines.append(f"📅 *{datetime.strptime(item['day'], '%d/%m/%Y').strftime('%d-%m-%y') if len(item['day']) == 10 and item['day'][2] == '/' else item['day']}*")
         lines.append("")
 
         for detail in item["items"]:
@@ -2358,7 +2358,7 @@ async def show_user_daily_gains(query):
                 dt = datetime.fromisoformat(raw_date)
                 local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
                 day_key = local_dt.date().isoformat()
-                day_label = local_dt.strftime('%d/%m/%Y')
+                day_label = local_dt.strftime('%d-%m-%y')
             except Exception:
                 day_key = raw_date[:10]
                 day_label = raw_date[:10]
@@ -2404,7 +2404,7 @@ async def show_user_daily_gains(query):
         grand_total = 0.0
         for n, item in enumerate(grouped, 1):
             grand_total += item["total"]
-            lines.append(f"📅 *Día {n} — {item['day']}*")
+            lines.append(f"📅 *{datetime.strptime(item['day'], '%d/%m/%Y').strftime('%d-%m-%y') if len(item['day']) == 10 and item['day'][2] == '/' else item['day']}*")
             lines.append("")
 
             for detail in item["items"]:
