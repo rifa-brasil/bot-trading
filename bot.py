@@ -1826,20 +1826,34 @@ async def show_admin_withdraw_history(query, telegram_id):
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
 async def show_admin_investment_history(query, telegram_id):
-    user=_user_identity(telegram_id)
+    user = _user_identity(telegram_id)
     if not user:
-        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
-    rows=_history_rows('inversiones',telegram_id,'fecha_inicio ASC, id ASC')
-    lines=["📈 *HISTORIAL COMPLETO DE INVERSIONES*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todas las inversiones registradas, desde Plan 1 hasta la última:*",""]
-    total=0.0
-    if not rows: lines.append("No hay inversiones registradas.")
-    for plan,r in enumerate(rows,1):
-        capital=float(r['capital'] or 0); total+=capital
-        accumulated=float(r['ganancia_acumulada'] or 0); target_total=capital * TARGET_MULTIPLIER; progress_pct=min(200.0, (accumulated / capital * 100) if capital else 0.0)
-        lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*",f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{progress_pct:.2f}%*",f"📌 Estado: *{r['estado']}*",""]
-    lines += ["━━━━━━━━━━━━",f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
-    await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
-
+        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General", callback_data="admin_history_general")]]))
+        return
+    rows = _history_rows("inversiones", telegram_id, "fecha_inicio ASC, id ASC")
+    lines = ["📈 *HISTORIAL COMPLETO DE INVERSIONES*", "", f"👤 Nombre: *{user['nombre'] or '-'}*", f"👤 Usuario: @{user['username'] or '-'}", f"🆔 ID: `{telegram_id}`", "", "📌 *Todas las inversiones registradas, agrupadas por fecha de activación:*", ""]
+    total = 0.0
+    if not rows:
+        lines.append("No hay inversiones registradas.")
+    else:
+        current_date = None
+        for plan, r in enumerate(rows, 1):
+            capital = float(r["capital"] or 0); total += capital
+            accumulated = float(r["ganancia_acumulada"] or 0)
+            target_total = capital * TARGET_MULTIPLIER
+            progress_pct = min(200.0, (accumulated / capital * 100) if capital else 0.0)
+            date_part, time_part = format_date_time(r["fecha_inicio"])
+            if date_part != current_date:
+                if current_date is not None: lines.append("")
+                lines += [f"📅 *{date_part}*", ""]
+                current_date = date_part
+            paid_rate = float(r["tasa_diaria"] or 0)
+            paid_quota = quota_label(paid_rate) if paid_rate > 0 else "No pagada"
+            status = str(r["estado"] or "-")
+            status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
+            lines += [f"💎 *Plan {plan} — {money(capital)} USDT*", f"🕐 Hora de inicio: *{time_part}*", f"📊 Cuota pagada del día: *{paid_quota}*", f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*", f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{progress_pct:.2f}%*", f"📌 Estado: *{status_label}*", ""]
+    lines += ["━━━━━━━━━━━━", f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
+    await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
 
 async def show_daily_quotas(query):
     current = get_current_quota_decimal()
@@ -2487,71 +2501,33 @@ async def show_user_withdraw_history(query):
 
 
 async def show_user_investment_history(query):
-    """Historial completo de inversiones + resumen general de la cuenta."""
+    """Historial completo de inversiones agrupado por fecha de activación."""
     user_id = query.from_user.id
     rows = _history_rows("inversiones", user_id, "fecha_inicio ASC, id ASC")
-
     conn = db()
-    total_deposited = conn.execute(
-        "SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
-        (user_id,)
-    ).fetchone()["s"]
-    active_invested = conn.execute(
-        "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'",
-        (user_id,)
-    ).fetchone()["s"]
-    total_gains = conn.execute(
-        "SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()["s"]
-    row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
-    conn.close()
-
+    total_deposited = conn.execute("SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'", (user_id,)).fetchone()["s"]
+    active_invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'", (user_id,)).fetchone()["s"]
+    total_gains = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?", (user_id,)).fetchone()["s"]
+    row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone(); conn.close()
     balance = float(row["saldo"] or 0) if row else 0.0
-    lines = [
-        "📈 *HISTORIAL COMPLETO DE INVERSIONES*",
-        "",
-        "📌 Todas tus inversiones, desde Plan 1 hasta la última, en orden cronológico:",
-        ""
-    ]
-
+    lines = ["📈 *HISTORIAL COMPLETO DE INVERSIONES*", "", "📌 Todas tus inversiones, desde Plan 1 hasta la última, agrupadas por fecha de activación:", ""]
     total = 0.0
     if not rows:
         lines.append("No tienes inversiones registradas.")
     else:
+        current_date = None
         for plan_number, r in enumerate(rows, 1):
-            capital = float(r["capital"] or 0)
-            accumulated = float(r["ganancia_acumulada"] or 0)
-            target_total = capital * TARGET_MULTIPLIER
-            total += capital
+            capital = float(r["capital"] or 0); accumulated = float(r["ganancia_acumulada"] or 0); target_total = capital * TARGET_MULTIPLIER; total += capital
             date_part, time_part = format_date_time(r["fecha_inicio"])
-            status = str(r["estado"] or "-")
-            status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
-            lines += [
-                f"💰 *Plan {plan_number} — {money(capital)} USDT*",
-                f"📅 Fecha de inicio: *{date_part}*",
-                f"🕐 Hora de inicio: *{time_part}*",
-                f"🎁 Ganancias acumuladas: *{money(accumulated)} USDT*",
-                f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{min(200.0, (accumulated / capital * 100) if capital else 0.0):.2f}%*",
-                f"📌 Estado: *{status_label}*",
-                ""
-            ]
-
-    # El resumen final utiliza exactamente los mismos datos del antiguo
-    # botón independiente 📈 Inversiones.
-    lines += [
-        "━━━━━━━━━━━━",
-        "📊 *RESUMEN DE LA CUENTA*",
-        "",
-        f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
-        f"💳 Saldo disponible: *{money(balance)} USDT*",
-        f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*",
-        f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
-        "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador."
-    ]
-
+            if date_part != current_date:
+                if current_date is not None: lines.append("")
+                lines += [f"📅 *{date_part}*", ""]
+                current_date = date_part
+            status = str(r["estado"] or "-"); status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
+            paid_rate = float(r["tasa_diaria"] or 0); paid_quota = quota_label(paid_rate) if paid_rate > 0 else "No pagada"
+            lines += [f"💰 *Plan {plan_number} — {money(capital)} USDT*", f"🕐 Hora de inicio: *{time_part}*", f"📊 Cuota pagada del día: *{paid_quota}*", f"🎁 Ganancias acumuladas: *{money(accumulated)} USDT*", f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{min(200.0, (accumulated / capital * 100) if capital else 0.0):.2f}%*", f"📌 Estado: *{status_label}*", ""]
+    lines += ["━━━━━━━━━━━━", "📊 *RESUMEN DE LA CUENTA*", "", f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*", f"💳 Saldo disponible: *{money(balance)} USDT*", f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*", f"💵 Ganancia acumulada: *{money(total_gains)} USDT*", "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador."]
     await _send_user_history(query, "\n".join(lines))
-
 
 # =========================================================
 # CALLBACKS
