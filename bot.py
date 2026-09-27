@@ -2534,30 +2534,31 @@ async def show_user_withdraw_history(query):
 async def show_user_investment_history(query):
     """Historial completo de inversiones agrupado por fecha de activación.
 
-    Esta vista debe ser independiente de cualquier campo opcional o dato antiguo
-    de una inversión. Una fila incompleta no debe impedir que se muestre el resto
-    del historial.
+    Usa únicamente columnas explícitas de la tabla para que una inversión nueva
+    creada por reinversión no pueda romper toda la consulta histórica.
     """
     user_id = query.from_user.id
-
     try:
-        rows = _history_rows("inversiones", user_id, "fecha_inicio ASC, id ASC")
         conn = db()
+        rows = conn.execute(
+            "SELECT id, capital, ganancia_acumulada, tasa_diaria, estado, fecha_inicio "
+            "FROM inversiones WHERE telegram_id=? ORDER BY fecha_inicio ASC, id ASC",
+            (user_id,)
+        ).fetchall()
         total_deposited = conn.execute(
-            "SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
+            "SELECT COALESCE(SUM(monto),0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
             (user_id,)
         ).fetchone()["s"]
         active_invested = conn.execute(
-            "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'",
+            "SELECT COALESCE(SUM(capital),0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'",
             (user_id,)
         ).fetchone()["s"]
         total_gains = conn.execute(
-            "SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?",
+            "SELECT COALESCE(SUM(ganancia_acumulada),0) AS s FROM inversiones WHERE telegram_id=?",
             (user_id,)
         ).fetchone()["s"]
         balance_row = conn.execute(
-            "SELECT saldo FROM usuarios WHERE telegram_id=?",
-            (user_id,)
+            "SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)
         ).fetchone()
         conn.close()
 
@@ -2568,25 +2569,17 @@ async def show_user_investment_history(query):
             "📌 Todas tus inversiones, desde Plan 1 hasta la última, agrupadas por fecha de activación:",
             ""
         ]
-        total = 0.0
 
         if not rows:
             lines.append("No tienes inversiones registradas.")
         else:
             current_date = None
             for plan_number, r in enumerate(rows, 1):
-                try:
-                    capital = float(r["capital"] or 0)
-                except Exception:
-                    capital = 0.0
-                try:
-                    accumulated = float(r["ganancia_acumulada"] or 0)
-                except Exception:
-                    accumulated = 0.0
+                capital = float(r["capital"] or 0)
+                accumulated = float(r["ganancia_acumulada"] or 0)
                 target_total = capital * TARGET_MULTIPLIER
-                total += capital
-
                 date_part, time_part = format_date_time(r["fecha_inicio"])
+
                 if date_part != current_date:
                     if current_date is not None:
                         lines.append("")
@@ -2596,13 +2589,16 @@ async def show_user_investment_history(query):
                 status = str(r["estado"] or "-")
                 status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
 
-                # La cuota solo se muestra cuando existe una ganancia realmente
-                # acreditada en esa inversión. Una reinversión recién creada muestra —.
-                try:
-                    paid_quota = investment_paid_quota_label(r)
-                except Exception as quota_error:
-                    print(f"⚠️ No se pudo calcular la cuota de la inversión {r['id']}: {quota_error}")
+                # Una inversión recién creada por reinversión tiene 0 de ganancia
+                # y todavía no recibió cuota: se muestra una raya.
+                if accumulated <= 0:
                     paid_quota = "—"
+                else:
+                    try:
+                        paid_rate = float(r["tasa_diaria"] or 0)
+                    except Exception:
+                        paid_rate = 0.0
+                    paid_quota = quota_label(paid_rate) if paid_rate > 0 else "—"
 
                 progress_pct = min(100.0, (accumulated / capital * 100) if capital else 0.0)
                 lines += [
@@ -2625,11 +2621,10 @@ async def show_user_investment_history(query):
             f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
             "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador."
         ]
-
         await _send_user_history(query, "\n".join(lines))
 
     except Exception as e:
-        print(f"❌ Error cargando historial de inversiones del usuario {user_id}: {e}")
+        print(f"❌ Error cargando historial de inversiones del usuario {user_id}: {type(e).__name__}: {e}")
         try:
             await query.edit_message_text(
                 "⚠️ *No se pudo cargar el historial de inversiones.*\n\n"
@@ -3323,7 +3318,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "user_invest":
-        await show_user_investment_history(query)
+        await show_investments(query)
         return
 
     if data == "user_plans":
