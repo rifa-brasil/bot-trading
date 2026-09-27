@@ -269,6 +269,32 @@ def money(value):
     return f"{float(value):,.2f}"
 
 
+def format_date_time(value):
+    """Separa fecha y hora de valores ISO y los presenta en zona local."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "-", "-"
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
+        return dt.strftime("%d-%m-%y"), dt.strftime("%H:%M:%S")
+    except Exception:
+        date_part = raw[:10]
+        time_part = raw[11:19] if len(raw) >= 19 else "-"
+        try:
+            date_part = datetime.strptime(date_part, "%Y-%m-%d").strftime("%d-%m-%y")
+        except Exception:
+            pass
+        return date_part or "-", time_part or "-"
+
+
+def date_time_lines(label, value):
+    date_part, time_part = format_date_time(value)
+    return [f"📅 {label}: *{date_part}*", f"🕐 Hora: *{time_part}*"]
+
+
 def tx_explorer_url(tx_hash):
     return TRONSCAN_TX_URL + quote(str(tx_hash).strip(), safe="")
 
@@ -578,7 +604,8 @@ async def registration_text(update, context, text):
                         f"📱 WhatsApp: {registered['telefono'] or '-'}\n"
                         f"🌎 País: {registered['pais'] or '-'}\n"
                         f"💳 Wallet USDT TRC20: `{registered['wallet_retiro'] or '-'}`\n"
-                        f"📅 Registro: {registered['fecha_registro'] or '-'}"
+                        f"📅 Registro: {format_date_time(registered['fecha_registro'])[0]}\n"
+                        f"🕐 Hora de registro: {format_date_time(registered['fecha_registro'])[1]}"
                     ),
                     parse_mode="Markdown"
                 )
@@ -1611,13 +1638,18 @@ def _daily_user_gain_history(telegram_id):
 
 async def show_admin_history_menu(query):
     """Menú único y operativo para todas las consultas históricas por ID de usuario."""
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Ganancias Diarias por ID", callback_data="admin_history_daily")],
-        [InlineKeyboardButton("📥 Depósitos por ID", callback_data="admin_history_deposits")],
-        [InlineKeyboardButton("📤 Retiros por ID", callback_data="admin_history_withdrawals")],
-        [InlineKeyboardButton("📈 Inversiones por ID", callback_data="admin_history_investments")],
-        [InlineKeyboardButton("⬅️ Panel Admin", callback_data="admin_home")],
-    ])
+    # Mismo orden funcional que el historial del usuario:
+    # ganancias, depósitos, retiros e inversiones.
+    history_buttons = [
+        ("📊 Ganancias Diarias por ID", "admin_history_daily"),
+        ("📥 Depósitos por ID", "admin_history_deposits"),
+        ("📤 Retiros por ID", "admin_history_withdrawals"),
+        ("📈 Inversiones por ID", "admin_history_investments"),
+    ]
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=data)] for label, data in history_buttons] +
+        [[InlineKeyboardButton("⬅️ Panel Admin", callback_data="admin_home")]]
+    )
     text = (
         "📜 *HISTORIAL GENERAL*\n\n"
         "Selecciona una consulta. Después introduce el ID de Telegram del usuario.\n\n"
@@ -1711,7 +1743,7 @@ async def show_admin_user_daily_gains(query, telegram_id):
             dt = datetime.fromisoformat(raw_date)
             local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
             day_key = local_dt.date().isoformat()
-            day_label = local_dt.strftime("%d/%m/%Y")
+            day_label = local_dt.strftime("%d-%m-%y")
         except Exception:
             day_key = raw_date[:10]
             day_label = raw_date[:10]
@@ -1747,7 +1779,7 @@ async def show_admin_user_daily_gains(query, telegram_id):
     grand_total = 0.0
     for n, item in enumerate(grouped, 1):
         grand_total += item["total"]
-        lines.append(f"📅 *{datetime.strptime(item['day'], '%d/%m/%Y').strftime('%d-%m-%y') if len(item['day']) == 10 and item['day'][2] == '/' else item['day']}*")
+        lines.append(f"📅 *{item['day']}*")
         lines.append("")
 
         for detail in item["items"]:
@@ -1789,7 +1821,7 @@ async def show_admin_deposit_history(query, telegram_id):
     if not rows: lines.append("No hay depósitos registrados.")
     for idx,r in enumerate(rows,1):
         amount=float(r['monto'] or 0); total+=amount
-        lines += ["📥 *Depósito*",f"📅 Fecha: *{str(r['fecha'])[:19]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*"]
+        lines += ["📥 *Depósito*",f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*"]
         if r['tx_hash']: lines.append(f"🔗 TX: `{r['tx_hash']}`")
         lines.append("")
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE DEPÓSITOS: {money(total)} USDT*"]
@@ -1805,7 +1837,7 @@ async def show_admin_withdraw_history(query, telegram_id):
     if not rows: lines.append("No hay retiros registrados.")
     for idx,r in enumerate(rows,1):
         amount=float(r['monto'] or 0); total+=amount
-        lines += [f"📤 *Retiro {idx}*",f"📅 Fecha: *{str(r['fecha'])[:19]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*",f"🏦 Wallet: `{r['direccion']}`",""]
+        lines += [f"📤 *Retiro {idx}*",f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*",f"🏦 Wallet: `{r['direccion']}`",""]
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE RETIROS: {money(total)} USDT*"]
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
@@ -1819,7 +1851,7 @@ async def show_admin_investment_history(query, telegram_id):
     if not rows: lines.append("No hay inversiones registradas.")
     for plan,r in enumerate(rows,1):
         capital=float(r['capital'] or 0); total+=capital
-        lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{str(r['fecha_inicio'])[:19]}*",f"🎁 Ganancia acumulada: *{money(r['ganancia_acumulada'])} USDT*",f"📌 Estado: *{r['estado']}*",""]
+        lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",f"🎁 Ganancia acumulada: *{money(r['ganancia_acumulada'])} USDT*",f"📌 Estado: *{r['estado']}*",""]
     lines += ["━━━━━━━━━━━━",f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
@@ -2404,7 +2436,7 @@ async def show_user_daily_gains(query):
         grand_total = 0.0
         for n, item in enumerate(grouped, 1):
             grand_total += item["total"]
-            lines.append(f"📅 *{datetime.strptime(item['day'], '%d/%m/%Y').strftime('%d-%m-%y') if len(item['day']) == 10 and item['day'][2] == '/' else item['day']}*")
+            lines.append(f"📅 *{item['day']}*")
             lines.append("")
 
             for detail in item["items"]:
@@ -2452,7 +2484,7 @@ async def show_user_deposit_history(query):
             total += amount
             lines += [
                 "📥 *Depósito*",
-                f"📅 Fecha: *{str(r['fecha'])[:19]}*",
+                f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",
                 f"💰 Monto: *{money(amount)} USDT*",
                 f"📌 Estado: *{r['estado']}*",
             ]
@@ -2476,7 +2508,7 @@ async def show_user_withdraw_history(query):
             total += amount
             lines += [
                 "📤 *Retiro*",
-                f"📅 Fecha: *{str(r['fecha'])[:19]}*",
+                f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",
                 f"💰 Monto: *{money(amount)} USDT*",
                 f"📌 Estado: *{r['estado']}*",
                 f"🏦 Wallet TRC20: `{r['direccion']}`",
@@ -2500,7 +2532,7 @@ async def show_user_investment_history(query):
             total += capital
             lines += [
                 f"💎 *Plan {plan_number} — {money(capital)} USDT*",
-                f"📅 Inicio: *{str(r['fecha_inicio'])[:19]}*",
+                f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",
                 f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*",
                 f"📌 Estado: *{r['estado']}*",
                 "",
