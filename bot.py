@@ -978,7 +978,7 @@ async def perform_reinvestment(query, amount):
         conn.close()
         await query.answer(f"No tienes {money(amount)} USDT de ganancias disponibles para este plan.", show_alert=True); return
     now=now_iso()
-    cur=conn.execute("INSERT INTO inversiones(telegram_id,plan,capital,ganancia_acumulada,tasa_diaria,multiplicador_objetivo,estado,fecha_inicio,ultimo_calculo) VALUES(?,?,?,0,?,2.0,'activa',?,?)",(user_id,f"Plan {money(amount)} USDT",amount,DAILY_RATE,now,now))
+    cur=conn.execute("INSERT INTO inversiones(telegram_id,plan,capital,ganancia_acumulada,tasa_diaria,multiplicador_objetivo,estado,fecha_inicio,ultimo_calculo) VALUES(?,?,?,0,0,2.0,'activa',?,?)",(user_id,f"Plan {money(amount)} USDT",amount,now,now))
     investment_id=cur.lastrowid
     conn.execute("UPDATE usuarios SET saldo=saldo-?, ganancias_disponibles=ganancias_disponibles-? WHERE telegram_id=?",(amount,amount,user_id))
     bonus, referrer_id, referral_plan_number=credit_referral_bonus(conn,user_id,amount,investment_id)
@@ -1235,8 +1235,8 @@ async def invest_available_plan(query, deposit_id):
             telegram_id, plan, capital, ganancia_acumulada,
             tasa_diaria, multiplicador_objetivo, estado,
             fecha_inicio, ultimo_calculo
-        ) VALUES (?, ?, ?, 0, ?, 2.0, 'activa', ?, ?)
-    """, (user_id, f"Plan {money(amount)} USDT", amount, DAILY_RATE, now, now))
+        ) VALUES (?, ?, ?, 0, 0, 2.0, 'activa', ?, ?)
+    """, (user_id, f"Plan {money(amount)} USDT", amount, now, now))
     investment_id = cur.lastrowid
 
     conn.execute("""
@@ -1483,12 +1483,11 @@ async def confirm_investment(query):
             tasa_diaria, multiplicador_objetivo,
             estado, fecha_inicio, ultimo_calculo
         )
-        VALUES (?, ?, ?, 0, ?, ?, 'activa', ?, ?)
+        VALUES (?, ?, ?, 0, 0, ?, 'activa', ?, ?)
     """, (
         user_id,
         PLAN_NAME,
         amount,
-        DAILY_RATE,
         TARGET_MULTIPLIER,
         now_iso(),
         now_iso()
@@ -1825,6 +1824,28 @@ async def show_admin_withdraw_history(query, telegram_id):
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE RETIROS: {money(total)} USDT*"]
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
+def investment_paid_quota_label(row):
+    """Devuelve la última cuota realmente acreditada a la inversión.
+
+    Una inversión recién activada después del pago diario no recibió cuota ese día.
+    En ese caso la ganancia acumulada sigue en 0 y la cuota debe mostrarse como una
+    raya, aunque una versión anterior del bot haya dejado tasa_diaria con un valor
+    por defecto. Después de la primera acreditación real, tasa_diaria pasa a contener
+    la cuota efectivamente pagada y la mostramos normalmente.
+    """
+    try:
+        accumulated = float(row["ganancia_acumulada"] or 0)
+    except Exception:
+        accumulated = 0.0
+    if accumulated <= 0:
+        return "—"
+    try:
+        paid_rate = float(row["tasa_diaria"] or 0)
+    except Exception:
+        paid_rate = 0.0
+    return quota_label(paid_rate) if paid_rate > 0 else "—"
+
+
 async def show_admin_investment_history(query, telegram_id):
     user = _user_identity(telegram_id)
     if not user:
@@ -1847,8 +1868,7 @@ async def show_admin_investment_history(query, telegram_id):
                 if current_date is not None: lines.append("")
                 lines += [f"📅 *{date_part}*", ""]
                 current_date = date_part
-            paid_rate = float(r["tasa_diaria"] or 0)
-            paid_quota = quota_label(paid_rate) if paid_rate > 0 else "No pagada"
+            paid_quota = investment_paid_quota_label(r)
             status = str(r["estado"] or "-")
             status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
             lines += [f"💎 *Plan {plan} — {money(capital)} USDT*", f"🕐 Hora de inicio: *{time_part}*", f"📊 Cuota pagada del día: *{paid_quota}*", f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*", f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{progress_pct:.2f}%*", f"📌 Estado: *{status_label}*", ""]
@@ -2524,7 +2544,7 @@ async def show_user_investment_history(query):
                 lines += [f"📅 *{date_part}*", ""]
                 current_date = date_part
             status = str(r["estado"] or "-"); status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
-            paid_rate = float(r["tasa_diaria"] or 0); paid_quota = quota_label(paid_rate) if paid_rate > 0 else "No pagada"
+            paid_quota = investment_paid_quota_label(r)
             lines += [f"💰 *Plan {plan_number} — {money(capital)} USDT*", f"🕐 Hora de inicio: *{time_part}*", f"📊 Cuota pagada del día: *{paid_quota}*", f"🎁 Ganancias acumuladas: *{money(accumulated)} USDT*", f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{min(200.0, (accumulated / capital * 100) if capital else 0.0):.2f}%*", f"📌 Estado: *{status_label}*", ""]
     lines += ["━━━━━━━━━━━━", "📊 *RESUMEN DE LA CUENTA*", "", f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*", f"💳 Saldo disponible: *{money(balance)} USDT*", f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*", f"💵 Ganancia acumulada: *{money(total_gains)} USDT*", "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador."]
     await _send_user_history(query, "\n".join(lines))
