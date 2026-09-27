@@ -746,7 +746,8 @@ async def send_user_guide(chat_id, context, registration_button=False):
             "Cuando estés listo, pulsa *📝 REGISTRO* para comenzar el registro."
         )
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 REGISTRO", callback_data="start_registration")]
+            [InlineKeyboardButton("📝 REGISTRO", callback_data="start_registration")],
+            [InlineKeyboardButton("📘 Guía de Usuario", callback_data="user_guide")]
         ])
     else:
         caption = (
@@ -812,18 +813,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     row = get_user(user.id)
 
-    # Si el usuario acaba de llegar mediante un enlace de referido válido,
-    # primero recibe la Guía de Usuario y solo inicia el registro cuando
-    # pulsa el botón 📝 REGISTRO.
-    referred_new_user = bool(
-        is_new and row and (row["referido_por"] or "").strip()
-    )
-    if referred_new_user:
-        await send_user_guide(user.id, context, registration_button=True)
-        return
+    # Todo usuario que aún no haya completado el registro recibe primero
+    # la Guía de Usuario y el botón 📝 REGISTRO. Esto también corrige los
+    # casos de usuarios creados previamente pero que quedaron incompletos.
     step = registration_missing_step(row, user) if row else "username"
     if step:
-        await prompt_registration(update, context, step)
+        await send_user_guide(user.id, context, registration_button=True)
         return
 
     mark_registration_complete_if_ready(user.id, user)
@@ -1840,7 +1835,8 @@ async def show_admin_investment_history(query, telegram_id):
     if not rows: lines.append("No hay inversiones registradas.")
     for plan,r in enumerate(rows,1):
         capital=float(r['capital'] or 0); total+=capital
-        lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",f"🎁 Ganancia acumulada: *{money(r['ganancia_acumulada'])} USDT*",f"📌 Estado: *{r['estado']}*",""]
+        accumulated=float(r['ganancia_acumulada'] or 0); target_total=capital * TARGET_MULTIPLIER; progress_pct=min(200.0, (accumulated / capital * 100) if capital else 0.0)
+        lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*",f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{progress_pct:.2f}%*",f"📌 Estado: *{r['estado']}*",""]
     lines += ["━━━━━━━━━━━━",f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
@@ -2527,7 +2523,6 @@ async def show_user_investment_history(query):
             capital = float(r["capital"] or 0)
             accumulated = float(r["ganancia_acumulada"] or 0)
             target_total = capital * TARGET_MULTIPLIER
-            current_total = min(target_total, capital + accumulated)
             total += capital
             date_part, time_part = format_date_time(r["fecha_inicio"])
             status = str(r["estado"] or "-")
@@ -2537,7 +2532,7 @@ async def show_user_investment_history(query):
                 f"📅 Fecha de inicio: *{date_part}*",
                 f"🕐 Hora de inicio: *{time_part}*",
                 f"🎁 Ganancias acumuladas: *{money(accumulated)} USDT*",
-                f"📈 Proceso hacia 200%: *{money(current_total)} / {money(target_total)} USDT*",
+                f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{min(200.0, (accumulated / capital * 100) if capital else 0.0):.2f}%*",
                 f"📌 Estado: *{status_label}*",
                 ""
             ]
@@ -3013,7 +3008,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=(
                     "✅ *DEPÓSITO APROBADO*\n\n"
                     f"Tu depósito de *{money(amount)} USDT* fue aprobado y acreditado a tu saldo."
-                    + (f"\n\n💎 Tu Plan {money(plan_amount)} USDT ya está disponible para invertir desde *📈 Inversiones*." if plan_amount > 0 else "")
+                    + (f"\n\n💎 Tu Plan {money(plan_amount)} USDT ya está disponible para invertir desde *📜 Historial → 📈 Inversiones*." if plan_amount > 0 else "")
                 ),
                 parse_mode="Markdown"
             )
@@ -3610,7 +3605,6 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🆘 Soporte": "user_support",
         "📘 Guía de Usuario": "user_guide",
         # Compatibilidad temporal con un teclado antiguo: lleva al historial de inversiones.
-        "📈 Inversiones": "user_history_investments",
     }
 
     # El teclado inferior funciona como panel fijo.
