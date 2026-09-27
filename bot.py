@@ -76,6 +76,7 @@ LOCK_IMAGE = IMAGES_DIR / "bot bloqueado.jpg"
 UNLOCK_IMAGE = IMAGES_DIR / "bot operativo.jpg"
 WITHDRAW_SENT_IMAGE = IMAGES_DIR / "retiro enviado.jpg"
 USDT_ICON_IMAGE = IMAGES_DIR / "usdt_trc20_icon.png"
+USER_GUIDE_PDF = Path(__file__).resolve().parent / "Guia_Usuario_Bot_Inversion_v4_21_FINAL.pdf"
 
 # Usuarios y ganancias acreditadas en la última ejecución manual.
 # Se utiliza para enviar una sola notificación por usuario, aunque tenga varias inversiones.
@@ -83,7 +84,7 @@ LAST_DAILY_PROFITS = {}
 MAX_INVESTMENT = float(os.getenv("MAX_INVESTMENT", "1000000"))
 
 # Planes de inversión disponibles. El monto del plan queda definido por el botón.
-INVESTMENT_PLANS = [50, 100, 120, 150, 200, 250, 300, 350, 500, 650, 1000, 1500, 2000]
+INVESTMENT_PLANS = [50, 100, 120, 150, 200, 250, 300, 350, 500, 650, 750, 900, 1000, 1500, 2000]
 
 # Estados de conversación
 DEP_AMOUNT, DEP_TX, DEP_PHOTO = range(3)
@@ -692,11 +693,11 @@ def user_keyboard():
     # mantener el menú principal limpio y evitar botones que Telegram pueda
     # ocultar según el teclado anterior que conserve el cliente.
     return ReplyKeyboardMarkup([
-        ["👤 Mi cuenta", "📈 Inversiones"],
-        ["💰 Planes de Inversión"],
+        ["👤 Mi cuenta", "💰 Planes de Inversión"],
         ["🔄 Reinvertir saldo", "💸 Retirar"],
         ["🤝 Referidos", "📜 Historial"],
-        ["🆘 Soporte", "ℹ️ Información"],
+        ["📘 Guía de Usuario", "🆘 Soporte"],
+        ["ℹ️ Información"],
     ], resize_keyboard=True, is_persistent=True)
 
 
@@ -725,6 +726,45 @@ async def send_user_menu(chat_id, context, text=None):
         reply_markup=user_keyboard(),
         parse_mode="Markdown"
     )
+
+
+async def send_user_guide(chat_id, context, registration_button=False):
+    """Envía la guía PDF oficial al usuario con navegación opcional al registro."""
+    if not USER_GUIDE_PDF.exists():
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ La Guía de Usuario no está disponible en este momento."
+        )
+        return
+
+    if registration_button:
+        caption = (
+            "📘 *GUÍA DE USUARIO*\n\n"
+            "Este PDF explica el funcionamiento del sistema, los planes de inversión, "
+            "depósitos, ganancias, referidos, retiros e historial.\n\n"
+            "📚 Te recomendamos estudiarlo antes de registrarte.\n\n"
+            "Cuando estés listo, pulsa *📝 REGISTRO* para comenzar el registro."
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 REGISTRO", callback_data="start_registration")]
+        ])
+    else:
+        caption = (
+            "📘 *GUÍA DE USUARIO*\n\n"
+            "Aquí tienes la guía para consultar y descargar cuando quieras."
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+        ])
+
+    with open(USER_GUIDE_PDF, "rb") as document:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=document,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
 
 
 async def send_admin_menu(chat_id, context, text=None):
@@ -771,6 +811,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"⚠️ No se pudo enviar bienvenida: {e}")
 
     row = get_user(user.id)
+
+    # Si el usuario acaba de llegar mediante un enlace de referido válido,
+    # primero recibe la Guía de Usuario y solo inicia el registro cuando
+    # pulsa el botón 📝 REGISTRO.
+    referred_new_user = bool(
+        is_new and row and (row["referido_por"] or "").strip()
+    )
+    if referred_new_user:
+        await send_user_guide(user.id, context, registration_button=True)
+        return
     step = registration_missing_step(row, user) if row else "username"
     if step:
         await prompt_registration(update, context, step)
@@ -943,7 +993,7 @@ async def perform_reinvestment(query, amount):
         try:
             await query.get_bot().send_message(chat_id=referrer_id,text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por el *Plan {referral_plan_number}* de *{money(amount)} USDT* realizado por un usuario que se registró con tu enlace."),parse_mode="Markdown")
         except Exception as e: print(f"Error notificando bono: {e}")
-    await query.edit_message_text("✅ *REINVERSIÓN CREADA*\n\n" f"Plan: *{money(amount)} USDT*\n" f"Ganancias utilizadas: *{money(amount)} USDT*\n" "\nLa inversión es independiente de tus demás planes.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📈 Ver inversiones",callback_data="user_invest")],[InlineKeyboardButton("🏠 Menú Principal",callback_data="user_home")]]))
+    await query.edit_message_text("✅ *REINVERSIÓN CREADA*\n\n" f"Plan: *{money(amount)} USDT*\n" f"Ganancias utilizadas: *{money(amount)} USDT*\n" "\nLa inversión es independiente de tus demás planes.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📈 Ver inversiones",callback_data="user_history_investments")],[InlineKeyboardButton("🏠 Menú Principal",callback_data="user_home")]]))
 
 
 # =========================================================
@@ -1067,7 +1117,7 @@ async def show_plans(query):
     # se muestra encima del listado de planes.
     row_buttons = []
     for amount in INVESTMENT_PLANS:
-        row_buttons.append(InlineKeyboardButton(f"🟢 {money(amount)} USDT", callback_data=f"plan_{amount}"))
+        row_buttons.append(InlineKeyboardButton(f"💰 {money(amount)} USDT", callback_data=f"plan_{amount}"))
         if len(row_buttons) == 3:
             buttons.append(row_buttons)
             row_buttons = []
@@ -1221,7 +1271,7 @@ async def invest_available_plan(query, deposit_id):
         "Este plan es independiente de tus demás planes y depósitos.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_invest")],
+            [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_history_investments")],
             [InlineKeyboardButton("💎 Elegir otro Plan", callback_data="user_plans")],
             [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
@@ -1375,7 +1425,7 @@ async def create_investment(query):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💰 Depositar", callback_data="user_deposit")],
-                [InlineKeyboardButton("⬅️ Volver", callback_data="user_invest")]
+                [InlineKeyboardButton("⬅️ Volver", callback_data="user_history_investments")]
             ])
         )
         return
@@ -1395,7 +1445,7 @@ async def create_investment(query):
                 "✅ Confirmar inversión",
                 callback_data="user_confirm_invest"
             )],
-            [InlineKeyboardButton("❌ Cancelar", callback_data="user_invest")]
+            [InlineKeyboardButton("❌ Cancelar", callback_data="user_history_investments")]
         ])
     )
 
@@ -1467,7 +1517,7 @@ async def confirm_investment(query):
         "La inversión ya aparece en tu panel.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_invest")],
+            [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_history_investments")],
             [InlineKeyboardButton("🏠 Menú principal", callback_data="user_home")]
         ])
     )
@@ -2441,9 +2491,34 @@ async def show_user_withdraw_history(query):
 
 
 async def show_user_investment_history(query):
+    """Historial completo de inversiones + resumen general de la cuenta."""
     user_id = query.from_user.id
     rows = _history_rows("inversiones", user_id, "fecha_inicio ASC, id ASC")
-    lines = ["📈 *HISTORIAL COMPLETO DE INVERSIONES*", "", "📌 Todas tus inversiones, desde Plan 1 hasta la última:", ""]
+
+    conn = db()
+    total_deposited = conn.execute(
+        "SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
+        (user_id,)
+    ).fetchone()["s"]
+    active_invested = conn.execute(
+        "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'",
+        (user_id,)
+    ).fetchone()["s"]
+    total_gains = conn.execute(
+        "SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()["s"]
+    row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+    conn.close()
+
+    balance = float(row["saldo"] or 0) if row else 0.0
+    lines = [
+        "📈 *HISTORIAL COMPLETO DE INVERSIONES*",
+        "",
+        "📌 Todas tus inversiones, desde Plan 1 hasta la última, en orden cronológico:",
+        ""
+    ]
+
     total = 0.0
     if not rows:
         lines.append("No tienes inversiones registradas.")
@@ -2451,15 +2526,35 @@ async def show_user_investment_history(query):
         for plan_number, r in enumerate(rows, 1):
             capital = float(r["capital"] or 0)
             accumulated = float(r["ganancia_acumulada"] or 0)
+            target_total = capital * TARGET_MULTIPLIER
+            current_total = min(target_total, capital + accumulated)
             total += capital
+            date_part, time_part = format_date_time(r["fecha_inicio"])
+            status = str(r["estado"] or "-")
+            status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
             lines += [
-                f"💎 *Plan {plan_number} — {money(capital)} USDT*",
-                f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",
-                f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*",
-                f"📌 Estado: *{r['estado']}*",
-                "",
+                f"💰 *Plan {plan_number} — {money(capital)} USDT*",
+                f"📅 Fecha de inicio: *{date_part}*",
+                f"🕐 Hora de inicio: *{time_part}*",
+                f"🎁 Ganancias acumuladas: *{money(accumulated)} USDT*",
+                f"📈 Proceso hacia 200%: *{money(current_total)} / {money(target_total)} USDT*",
+                f"📌 Estado: *{status_label}*",
+                ""
             ]
-        lines += ["━━━━━━━━━━━━", f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
+
+    # El resumen final utiliza exactamente los mismos datos del antiguo
+    # botón independiente 📈 Inversiones.
+    lines += [
+        "━━━━━━━━━━━━",
+        "📊 *RESUMEN DE LA CUENTA*",
+        "",
+        f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
+        f"💳 Saldo disponible: *{money(balance)} USDT*",
+        f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*",
+        f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
+        "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador."
+    ]
+
     await _send_user_history(query, "\n".join(lines))
 
 
@@ -2484,6 +2579,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = query.from_user.id
     data = query.data or ""
+
+    # La guía y el botón de registro deben funcionar antes de completar el registro,
+    # especialmente para usuarios nuevos que llegaron mediante un referido.
+    if data == "user_guide":
+        await send_user_guide(user_id, context, registration_button=False)
+        return
+
+    if data == "start_registration":
+        context.user_data.clear()
+        await prompt_registration(query.message, context, user=query.from_user)
+        return
+
     if not is_admin(user_id) and is_maintenance():
         await query.answer("🔧 Bot en mantenimiento. Intenta más tarde.", show_alert=True)
         return
@@ -3130,7 +3237,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "user_invest":
-        await show_investments(query)
+        await show_user_investment_history(query)
         return
 
     if data == "user_plans":
@@ -3496,11 +3603,14 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📢 Enviar mensaje": "admin_broadcast",
     }
     user_actions = {
-        "👤 Mi cuenta": "user_account", "📈 Inversiones": "user_invest",
+        "👤 Mi cuenta": "user_account",
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
         "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
         "🔄 Reinvertir saldo": "user_reinvest",
         "🆘 Soporte": "user_support",
+        "📘 Guía de Usuario": "user_guide",
+        # Compatibilidad temporal con un teclado antiguo: lleva al historial de inversiones.
+        "📈 Inversiones": "user_history_investments",
     }
 
     # El teclado inferior funciona como panel fijo.
@@ -3880,7 +3990,9 @@ async def handle_text_panel_action(update, context, action):
             return None
     fake = FakeQuery(update.message, update.effective_user)
     if action == "user_account": await show_account(fake)
-    elif action == "user_invest": await show_investments(fake)
+    elif action == "user_guide": await send_user_guide(update.effective_chat.id, context, registration_button=False)
+    elif action == "user_history_investments": await show_user_investment_history(fake)
+    elif action == "user_invest": await show_user_investment_history(fake)
     elif action == "user_plans": await show_plans(fake)
     elif action == "user_referrals": await show_referrals(fake, context)
     elif action == "user_history": await show_history(fake)
