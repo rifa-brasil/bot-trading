@@ -61,6 +61,7 @@ BACKUP_TIMEZONE = os.getenv("BACKUP_TIMEZONE", "America/Sao_Paulo").strip()
 TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
+WITHDRAWAL_FEE_RATE = 0.03  # comisión de retiro: 3%
 WITHDRAWAL_INTERVAL_DAYS = 7
 WITHDRAWAL_FEE_RATE = 0.03
 REFERRAL_BONUS_FIRST_RATE = float(os.getenv("REFERRAL_BONUS_FIRST_RATE", "0.03") or "0.03")
@@ -267,32 +268,6 @@ def init_db():
 
 def money(value):
     return f"{float(value):,.2f}"
-
-
-def format_date_time(value):
-    """Separa fecha y hora de valores ISO y los presenta en zona local."""
-    raw = str(value or "").strip()
-    if not raw:
-        return "-", "-"
-    try:
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
-        return dt.strftime("%d-%m-%y"), dt.strftime("%H:%M:%S")
-    except Exception:
-        date_part = raw[:10]
-        time_part = raw[11:19] if len(raw) >= 19 else "-"
-        try:
-            date_part = datetime.strptime(date_part, "%Y-%m-%d").strftime("%d-%m-%y")
-        except Exception:
-            pass
-        return date_part or "-", time_part or "-"
-
-
-def date_time_lines(label, value):
-    date_part, time_part = format_date_time(value)
-    return [f"📅 {label}: *{date_part}*", f"🕐 Hora: *{time_part}*"]
 
 
 def tx_explorer_url(tx_hash):
@@ -604,8 +579,7 @@ async def registration_text(update, context, text):
                         f"📱 WhatsApp: {registered['telefono'] or '-'}\n"
                         f"🌎 País: {registered['pais'] or '-'}\n"
                         f"💳 Wallet USDT TRC20: `{registered['wallet_retiro'] or '-'}`\n"
-                        f"📅 Registro: {format_date_time(registered['fecha_registro'])[0]}\n"
-                        f"🕐 Hora de registro: {format_date_time(registered['fecha_registro'])[1]}"
+                        f"📅 Registro: {registered['fecha_registro'] or '-'}"
                     ),
                     parse_mode="Markdown"
                 )
@@ -1637,191 +1611,62 @@ def _daily_user_gain_history(telegram_id):
 
 
 async def show_admin_history_menu(query):
-    """Menú único y operativo para todas las consultas históricas por ID de usuario."""
-    # Mismo orden funcional que el historial del usuario:
-    # ganancias, depósitos, retiros e inversiones.
-    history_buttons = [
-        ("📊 Ganancias Diarias por ID", "admin_history_daily"),
-        ("📥 Depósitos por ID", "admin_history_deposits"),
-        ("📤 Retiros por ID", "admin_history_withdrawals"),
-        ("📈 Inversiones por ID", "admin_history_investments"),
-    ]
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(label, callback_data=data)] for label, data in history_buttons] +
-        [[InlineKeyboardButton("⬅️ Panel Admin", callback_data="admin_home")]]
-    )
-    text = (
+    """Menú único para todas las consultas históricas por ID de usuario."""
+    await query.edit_message_text(
         "📜 *HISTORIAL GENERAL*\n\n"
-        "Selecciona una consulta. Después introduce el ID de Telegram del usuario.\n\n"
-        "📌 Los registros se mostrarán completos y en orden cronológico: "
-        "el más antiguo primero y el más reciente al final."
+        "Selecciona qué historial quieres consultar e introduce el ID de Telegram del usuario:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Ganancias Diarias por ID", callback_data="admin_history_daily")],
+            [InlineKeyboardButton("📥 Depósitos por ID", callback_data="admin_history_deposits")],
+            [InlineKeyboardButton("📤 Retiros por ID", callback_data="admin_history_withdrawals")],
+            [InlineKeyboardButton("📈 Inversiones por ID", callback_data="admin_history_investments")],
+            [InlineKeyboardButton("⬅️ Panel Admin", callback_data="admin_home")],
+        ])
     )
-    # Funciona tanto desde un callback como desde el botón del teclado de administrador.
-    try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
-    except Exception:
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
 async def _send_admin_history(query, text, back_callback, back_label):
     """Envía todo el historial, dividido en mensajes si supera el límite de Telegram."""
     chunks = [text[i:i+3800] for i in range(0, len(text), 3800)] or [text]
-    markup = InlineKeyboardMarkup([
+    await query.edit_message_text(chunks[0], parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⬅️ {back_label}", callback_data=back_callback)],
         [InlineKeyboardButton("🏠 Panel", callback_data="admin_home")]
-    ])
-    try:
-        await query.edit_message_text(chunks[0], parse_mode="Markdown", reply_markup=markup)
-    except Exception:
-        await query.message.reply_text(chunks[0], parse_mode="Markdown", reply_markup=markup)
+    ]))
     for extra in chunks[1:]:
         await query.message.reply_text(extra, parse_mode="Markdown")
 
 async def show_admin_user_daily_gains(query, telegram_id):
-    """
-    Muestra al administrador el historial de ganancias con EXACTAMENTE
-    el mismo formato que recibe el usuario: por fecha, por plan, cuota
-    y ganancia en una sola línea, ordenado del día más antiguo al más reciente.
-    """
-    conn = db()
-    user = conn.execute(
-        "SELECT nombre, username FROM usuarios WHERE telegram_id=?",
-        (telegram_id,)
-    ).fetchone()
-
+    history = _daily_user_gain_history(telegram_id)
+    conn=db(); user=conn.execute("SELECT nombre,username FROM usuarios WHERE telegram_id=?",(telegram_id,)).fetchone(); conn.close()
     if not user:
-        conn.close()
-        await query.edit_message_text(
-            "⚠️ No se encontró ningún usuario con ese ID.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Historial General", callback_data="admin_history_general")
-            ]])
-        )
-        return
-
-    rows = conn.execute(
-        "SELECT id, fecha, monto, descripcion FROM movimientos "
-        "WHERE telegram_id=? AND tipo='ganancia' ORDER BY fecha ASC, id ASC",
-        (telegram_id,)
-    ).fetchall()
-
-    investments = {
-        int(r["id"]): r for r in conn.execute(
-            "SELECT id, capital FROM inversiones WHERE telegram_id=?",
-            (telegram_id,)
-        ).fetchall()
-    }
-    plan_numbers = {}
-    for idx, r in enumerate(conn.execute(
-        "SELECT id FROM inversiones WHERE telegram_id=? ORDER BY id ASC",
-        (telegram_id,)
-    ).fetchall(), 1):
-        plan_numbers[int(r["id"])] = idx
-    conn.close()
-
-    lines = [
-        "📊 *HISTORIAL DE GANANCIAS DIARIAS*",
-        "",
-        f"👤 Nombre: *{user['nombre'] or '-'}*",
-        f"👤 Usuario: @{user['username'] or '-'}",
-        f"🆔 ID: `{telegram_id}`",
-        "",
-        "📌 Detalle de cada acreditación por fecha y por plan:",
-        ""
-    ]
-
-    if not rows:
-        lines.append("No tiene ganancias diarias acreditadas todavía.")
-        await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
-        return
-
-    grouped = []
-    by_day = {}
-    for r in rows:
-        raw_date = str(r["fecha"])
-        try:
-            dt = datetime.fromisoformat(raw_date)
-            local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
-            day_key = local_dt.date().isoformat()
-            day_label = local_dt.strftime("%d-%m-%y")
-        except Exception:
-            day_key = raw_date[:10]
-            day_label = raw_date[:10]
-
-        if day_key not in by_day:
-            item = {"day": day_label, "items": [], "total": 0.0}
-            by_day[day_key] = item
-            grouped.append(item)
-        else:
-            item = by_day[day_key]
-
-        amount = float(r["monto"] or 0)
-        quota = _quota_from_movement_description(r["descripcion"])
-        match = re.search(r"inversi[oó]n\s+#(\d+)", r["descripcion"] or "", re.IGNORECASE)
-        investment_id = int(match.group(1)) if match else None
-        inv = investments.get(investment_id) if investment_id is not None else None
-
-        if inv:
-            plan_number = plan_numbers.get(investment_id, investment_id)
-            capital = float(inv["capital"] or 0)
-        else:
-            plan_number = None
-            capital = 0.0
-
-        item["total"] += amount
-        item["items"].append({
-            "plan_number": plan_number,
-            "capital": capital,
-            "quota": quota,
-            "amount": amount,
-        })
-
-    grand_total = 0.0
-    for n, item in enumerate(grouped, 1):
-        grand_total += item["total"]
-        lines.append(f"📅 *{item['day']}*")
-        lines.append("")
-
-        for detail in item["items"]:
-            plan_text = (
-                f"Plan {detail['plan_number']} de {money(detail['capital'])} USDT"
-                if detail["plan_number"] is not None
-                else "Plan no identificado"
-            )
-            quota_text = (
-                f"{detail['quota']*100:.2f}%"
-                if detail["quota"]
-                else "No registrada"
-            )
-            lines.append(
-                f"🔹 *{plan_text} — cuota {quota_text} — ganancias {money(detail['amount'])} USDT*"
-            )
-
-        lines += [
-            "",
-            "━━━━━━━━━━━━",
-            f"💵 *TOTAL DEL DÍA: {money(item['total'])} USDT*",
-            ""
-        ]
-
-    lines += [
-        "━━━━━━━━━━━━",
-        f"💰 *TOTAL HISTÓRICO DE GANANCIAS: {money(grand_total)} USDT*"
-    ]
-
-    await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
+        await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
+    lines=["📊 *HISTORIAL COMPLETO DE GANANCIAS DIARIAS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todas las acreditaciones registradas, desde la primera hasta la última:*",""]
+    total=0.0
+    if not history: lines.append("No tiene ganancias diarias acreditadas.")
+    else:
+        ordered=list(history.items())
+        for idx,(day,data) in enumerate(ordered):
+            total+=data['total']
+            try: display=datetime.fromisoformat(day).strftime('%d/%m/%Y')
+            except Exception: display=day
+            lines += [f"📅 *{display}*",f"📊 Cuota: *{quota_label(data['quota']) if data['quota'] else 'No registrada'}*",f"💰 Ganancia acreditada: *{money(data['total'])} USDT*"]
+            if idx==len(ordered)-1: lines.append("⭐ *ÚLTIMA GANANCIA ACREDITADA HASTA EL MOMENTO DE LA CONSULTA* ⭐")
+            lines.append("")
+        lines += ["━━━━━━━━━━━━",f"💵 *TOTAL ACREDITADO HISTÓRICO: {money(total)} USDT*"]
+    await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
 async def show_admin_deposit_history(query, telegram_id):
     user=_user_identity(telegram_id)
     if not user:
         await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
-    rows=_history_rows('depositos',telegram_id,'fecha ASC, id ASC')
+    rows=_history_rows('depositos',telegram_id,'id ASC')
     lines=["📥 *HISTORIAL COMPLETO DE DEPÓSITOS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todos los depósitos registrados, desde el primero hasta el último:*",""]
     total=0.0
     if not rows: lines.append("No hay depósitos registrados.")
     for idx,r in enumerate(rows,1):
         amount=float(r['monto'] or 0); total+=amount
-        lines += ["📥 *Depósito*",f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*"]
+        lines += ["📥 *Depósito*",f"📅 Fecha: *{str(r['fecha'])[:19]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*"]
         if r['tx_hash']: lines.append(f"🔗 TX: `{r['tx_hash']}`")
         lines.append("")
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE DEPÓSITOS: {money(total)} USDT*"]
@@ -1831,13 +1676,13 @@ async def show_admin_withdraw_history(query, telegram_id):
     user=_user_identity(telegram_id)
     if not user:
         await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
-    rows=_history_rows('retiros',telegram_id,'fecha ASC, id ASC')
+    rows=_history_rows('retiros',telegram_id,'id ASC')
     lines=["📤 *HISTORIAL COMPLETO DE RETIROS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todos los retiros registrados, desde el primero hasta el último:*",""]
     total=0.0
     if not rows: lines.append("No hay retiros registrados.")
     for idx,r in enumerate(rows,1):
-        amount=float(r['monto'] or 0); total+=amount
-        lines += [f"📤 *Retiro {idx}*",f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",f"💰 Monto: *{money(amount)} USDT*",f"📌 Estado: *{r['estado']}*",f"🏦 Wallet: `{r['direccion']}`",""]
+        amount=float(r['monto'] or 0); fee=round(amount*WITHDRAWAL_FEE_RATE,2); net=round(amount-fee,2); total+=amount
+        lines += [f"📤 *Retiro {idx}*",f"📅 Fecha: *{str(r['fecha'])[:19]}*",f"💰 Monto solicitado: *{money(amount)} USDT*",f"📉 Comisión (3%): *{money(fee)} USDT*",f"💵 Neto a recibir: *{money(net)} USDT*",f"📌 Estado: *{r['estado']}*",f"🏦 Wallet: `{r['direccion']}`",""]
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE RETIROS: {money(total)} USDT*"]
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
@@ -1845,13 +1690,13 @@ async def show_admin_investment_history(query, telegram_id):
     user=_user_identity(telegram_id)
     if not user:
         await query.edit_message_text("⚠️ No se encontró ningún usuario con ese ID.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General",callback_data="admin_history_general")]])); return
-    rows=_history_rows('inversiones',telegram_id,'fecha_inicio ASC, id ASC')
+    rows=_history_rows('inversiones',telegram_id,'id ASC')
     lines=["📈 *HISTORIAL COMPLETO DE INVERSIONES*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todas las inversiones registradas, desde Plan 1 hasta la última:*",""]
     total=0.0
     if not rows: lines.append("No hay inversiones registradas.")
     for plan,r in enumerate(rows,1):
         capital=float(r['capital'] or 0); total+=capital
-        lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",f"🎁 Ganancia acumulada: *{money(r['ganancia_acumulada'])} USDT*",f"📌 Estado: *{r['estado']}*",""]
+        lines += [f"💎 *Plan {plan} — {money(capital)} USDT*",f"📅 Inicio: *{str(r['fecha_inicio'])[:19]}*",f"🎁 Ganancia acumulada: *{money(r['ganancia_acumulada'])} USDT*",f"📌 Estado: *{r['estado']}*",""]
     lines += ["━━━━━━━━━━━━",f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
@@ -2108,6 +1953,27 @@ async def cancel_deposit(update, context):
 # RETIROS
 # =========================================================
 
+async def show_withdraw_confirmation(update, context, amount):
+    fee = round(amount * WITHDRAWAL_FEE_RATE, 2)
+    net = round(amount - fee, 2)
+    context.user_data["withdraw_amount"] = amount
+    context.user_data["withdraw_fee"] = fee
+    context.user_data["withdraw_net"] = net
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirmar retiro", callback_data="withdraw_confirm")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="withdraw_cancel")]
+    ])
+    await update.message.reply_text(
+        "💸 *RESUMEN DEL RETIRO*\n\n"
+        f"💰 Monto solicitado: *{money(amount)} USDT*\n"
+        f"📉 Comisión de retiro (3%): *{money(fee)} USDT*\n"
+        f"💵 Neto que recibirás: *{money(net)} USDT*\n\n"
+        "La comisión del 3% se descuenta del monto que solicitas. "
+        "Revisa los valores antes de confirmar.",
+        parse_mode="Markdown", reply_markup=keyboard
+    )
+
+
 async def start_withdraw(update, context):
     if not private_only(update):
         return ConversationHandler.END
@@ -2127,8 +1993,9 @@ async def start_withdraw(update, context):
         f"Saldo disponible: *{money(balance)} USDT*\n"
         f"Mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
         "Frecuencia: *1 retiro cada 7 días*\n"
+        "Comisión: *3%* sobre el monto solicitado\n"
         f"Wallet registrada: `{row['wallet_retiro'] if row and row['wallet_retiro'] else 'No registrada'}`\n\n"
-        "Introduce el monto que deseas retirar.",
+        "Introduce el monto que deseas retirar. Al indicar el monto, el bot calculará la comisión y el neto que recibirás.",
         parse_mode="Markdown"
     )
 
@@ -2177,8 +2044,8 @@ async def receive_withdraw_amount(update, context):
     row = get_user(update.effective_user.id)
     registered_wallet = (row["wallet_retiro"] or "").strip() if row else ""
     if registered_wallet:
-        await finish_withdraw_manual(update, context, registered_wallet)
-        return ConversationHandler.END
+        await show_withdraw_confirmation(update, context, amount)
+        return WITHDRAW_AMOUNT
     await update.message.reply_text("📍 Envía ahora tu dirección *USDT TRC20*.", parse_mode="Markdown")
     return WITHDRAW_ADDRESS
 
@@ -2279,7 +2146,9 @@ async def receive_withdraw_address(update, context):
                 "📤 *NUEVO RETIRO PENDIENTE*\n\n"
                 f"ID: `{withdrawal_id}`\n"
                 f"Usuario: `{user_id}`\n"
-                f"Monto: *{money(amount)} USDT*\n"
+                f"Monto solicitado: *{money(amount)} USDT*\n"
+                f"Comisión (3%): *{money(round(amount * WITHDRAWAL_FEE_RATE, 2))} USDT*\n"
+                f"Neto a enviar: *{money(round(amount - round(amount * WITHDRAWAL_FEE_RATE, 2), 2))} USDT*\n"
                 f"Dirección TRC20:\n`{address}`"
             ),
             parse_mode="Markdown",
@@ -2350,127 +2219,6 @@ async def _send_user_history(query, text, back_callback="user_history"):
         await query.message.reply_text(extra, parse_mode="Markdown")
 
 
-async def show_user_daily_gains(query):
-    """Muestra al usuario el historial de ganancias, detallado por fecha y por plan."""
-    user_id = query.from_user.id
-    conn = db()
-    rows = conn.execute(
-        "SELECT id,fecha,monto,descripcion FROM movimientos "
-        "WHERE telegram_id=? AND tipo='ganancia' ORDER BY fecha ASC, id ASC",
-        (user_id,)
-    ).fetchall()
-
-    # Cargamos las inversiones para poder relacionar cada acreditación con su Plan
-    # y mostrar el capital del plan en la misma línea.
-    investments = {
-        int(r["id"]): r for r in conn.execute(
-            "SELECT id,capital FROM inversiones WHERE telegram_id=?",
-            (user_id,)
-        ).fetchall()
-    }
-    conn.close()
-
-    lines = [
-        "📊 *HISTORIAL DE GANANCIAS DIARIAS*",
-        "",
-        "📌 Detalle de cada acreditación por fecha y por plan:",
-        ""
-    ]
-
-    if not rows:
-        lines.append("No tienes ganancias diarias acreditadas todavía.")
-    else:
-        # Agrupamos por fecha local, conservando el orden cronológico de las
-        # acreditaciones y de los planes dentro de cada día.
-        grouped = []
-        by_day = {}
-        for r in rows:
-            raw_date = str(r['fecha'])
-            try:
-                dt = datetime.fromisoformat(raw_date)
-                local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
-                day_key = local_dt.date().isoformat()
-                day_label = local_dt.strftime('%d-%m-%y')
-            except Exception:
-                day_key = raw_date[:10]
-                day_label = raw_date[:10]
-
-            if day_key not in by_day:
-                item = {"day": day_label, "items": [], "total": 0.0}
-                by_day[day_key] = item
-                grouped.append(item)
-            else:
-                item = by_day[day_key]
-
-            amount = float(r['monto'] or 0)
-            quota = _quota_from_movement_description(r['descripcion'])
-
-            # La descripción de la acreditación guarda el ID de la inversión.
-            match = re.search(r"inversi[oó]n\s+#(\d+)", r['descripcion'] or '', re.IGNORECASE)
-            investment_id = int(match.group(1)) if match else None
-            inv = investments.get(investment_id) if investment_id is not None else None
-
-            if inv:
-                # El número visible del plan es el orden de activación/inversión
-                # del usuario, no el ID interno de SQLite.
-                conn2 = db()
-                plan_row = conn2.execute(
-                    "SELECT COUNT(*) AS c FROM inversiones WHERE telegram_id=? AND id<=?",
-                    (user_id, investment_id)
-                ).fetchone()
-                conn2.close()
-                plan_number = int(plan_row["c"]) if plan_row else investment_id
-                capital = float(inv["capital"] or 0)
-            else:
-                plan_number = None
-                capital = 0.0
-
-            item["total"] += amount
-            item["items"].append({
-                "plan_number": plan_number,
-                "capital": capital,
-                "quota": quota,
-                "amount": amount,
-            })
-
-        grand_total = 0.0
-        for n, item in enumerate(grouped, 1):
-            grand_total += item["total"]
-            lines.append(f"📅 *{item['day']}*")
-            lines.append("")
-
-            for detail in item["items"]:
-                plan_text = (
-                    f"Plan {detail['plan_number']} de {money(detail['capital'])} USDT"
-                    if detail["plan_number"] is not None
-                    else "Plan no identificado"
-                )
-                quota_text = (
-                    f"{detail['quota']*100:.2f}%"
-                    if detail["quota"]
-                    else "No registrada"
-                )
-                lines.append(
-                    f"🔹 *{plan_text} — cuota {quota_text} — ganancias {money(detail['amount'])} USDT*"
-                )
-
-            # Separación visual clara antes del total del día, igual que el
-            # separador utilizado para el total histórico.
-            lines += [
-                "",
-                "━━━━━━━━━━━━",
-                f"💵 *TOTAL DEL DÍA: {money(item['total'])} USDT*",
-                ""
-            ]
-
-        lines += [
-            "━━━━━━━━━━━━",
-            f"💰 *TOTAL HISTÓRICO DE GANANCIAS: {money(grand_total)} USDT*"
-        ]
-
-    await _send_user_history(query, "\n".join(lines))
-
-
 async def show_user_deposit_history(query):
     user_id = query.from_user.id
     rows = _history_rows("depositos", user_id, "id ASC")
@@ -2484,7 +2232,7 @@ async def show_user_deposit_history(query):
             total += amount
             lines += [
                 "📥 *Depósito*",
-                f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",
+                f"📅 Fecha: *{str(r['fecha'])[:19]}*",
                 f"💰 Monto: *{money(amount)} USDT*",
                 f"📌 Estado: *{r['estado']}*",
             ]
@@ -2505,11 +2253,15 @@ async def show_user_withdraw_history(query):
     else:
         for idx, r in enumerate(rows, 1):
             amount = float(r["monto"] or 0)
+            fee = round(amount * WITHDRAWAL_FEE_RATE, 2)
+            net = round(amount - fee, 2)
             total += amount
             lines += [
                 "📤 *Retiro*",
-                f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",
-                f"💰 Monto: *{money(amount)} USDT*",
+                f"📅 Fecha: *{str(r['fecha'])[:19]}*",
+                f"💰 Monto solicitado: *{money(amount)} USDT*",
+                f"📉 Comisión (3%): *{money(fee)} USDT*",
+                f"💵 Neto a recibir: *{money(net)} USDT*",
                 f"📌 Estado: *{r['estado']}*",
                 f"🏦 Wallet TRC20: `{r['direccion']}`",
                 "",
@@ -2532,7 +2284,7 @@ async def show_user_investment_history(query):
             total += capital
             lines += [
                 f"💎 *Plan {plan_number} — {money(capital)} USDT*",
-                f"📅 Inicio: *{format_date_time(r['fecha_inicio'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha_inicio'])[1]}*",
+                f"📅 Inicio: *{str(r['fecha_inicio'])[:19]}*",
                 f"🎁 Ganancia acumulada: *{money(accumulated)} USDT*",
                 f"📌 Estado: *{r['estado']}*",
                 "",
@@ -2611,7 +2363,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_history_general":
         if not is_admin(user_id):
             await query.answer("⛔ No autorizado.", show_alert=True); return
-        await query.answer()
         for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
             context.user_data.pop(key, None)
         await show_admin_history_menu(query)
@@ -2626,7 +2377,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in admin_history_prompts:
         if not is_admin(user_id):
             await query.answer("⛔ No autorizado.", show_alert=True); return
-        await query.answer()
         flag, title = admin_history_prompts[data]
         for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
             context.user_data.pop(key, None)
@@ -3089,9 +2839,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Retiro #{withdrawal_id} aprobado"
         )
 
+        fee = round(float(row["monto"]) * WITHDRAWAL_FEE_RATE, 2)
+        net = round(float(row["monto"]) - fee, 2)
         await query.edit_message_text(
             f"✅ *RETIRO #{withdrawal_id} APROBADO*\n\n"
-            f"Monto: *{money(row['monto'])} USDT*\n\n"
+            f"Monto solicitado: *{money(row['monto'])} USDT*\n"
+            f"Comisión (3%): *{money(fee)} USDT*\n"
+            f"Neto enviado: *{money(net)} USDT*\n\n"
             "El administrador debe realizar el envío a la dirección indicada.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -3107,8 +2861,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=row["telegram_id"],
                 text=(
                     "✅ *RETIRO APROBADO*\n\n"
-                    f"Tu solicitud #{withdrawal_id} por "
-                    f"*{money(row['monto'])} USDT* fue aprobada.\n\n"
+                    f"Solicitud #{withdrawal_id}.\n"
+                    f"Monto solicitado: *{money(row['monto'])} USDT*\n"
+                    f"Comisión (3%): *{money(fee)} USDT*\n"
+                    f"Neto a recibir: *{money(net)} USDT*\n\n"
                     "El envío será procesado por el administrador."
                 ),
                 parse_mode="Markdown"
@@ -3312,6 +3068,47 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         context.user_data.clear()
+        return
+
+    if data == "withdraw_cancel":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "❌ *RETIRO CANCELADO*\n\nNo se ha descontado ningún importe de tu saldo.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]])
+        )
+        return
+
+    if data == "withdraw_confirm":
+        amount = float(context.user_data.get("withdraw_amount", 0) or 0)
+        row = get_user(user_id)
+        registered_wallet = (row["wallet_retiro"] or "").strip() if row else ""
+        if amount < MIN_WITHDRAWAL or not registered_wallet:
+            context.user_data.clear()
+            await query.edit_message_text("⚠️ No se pudo confirmar el retiro. Verifica que tengas una wallet TRC20 registrada y que el monto cumpla el mínimo.")
+            return
+        can_withdraw, remaining = withdrawal_wait_info(user_id)
+        if not can_withdraw:
+            context.user_data.clear()
+            await query.edit_message_text(
+                "⏳ *RETIRO SEMANAL*\n\n"
+                f"Ya realizaste una solicitud de retiro.\nPodrás solicitar otro retiro en aproximadamente *{withdrawal_wait_text(remaining)}*.",
+                parse_mode="Markdown"
+            )
+            return
+        gains_available = float(row["ganancias_disponibles"] or 0) if row else 0.0
+        if amount > gains_available:
+            context.user_data.clear()
+            await query.edit_message_text(
+                f"⚠️ Solo puedes retirar ganancias disponibles.\nDisponible para retirar: {money(gains_available)} USDT.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]])
+            )
+            return
+        context.user_data["withdraw_amount"] = amount
+        await query.edit_message_text("⏳ *PROCESANDO SOLICITUD DE RETIRO...*", parse_mode="Markdown")
+        class _FakeUpdate:
+            def __init__(self, message, user): self.message=message; self.effective_user=user
+        await finish_withdraw_manual(_FakeUpdate(query.message, query.from_user), context, registered_wallet)
         return
 
     if data == "user_withdraw":
@@ -3562,8 +3359,9 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💸 *SOLICITAR RETIRO*\n\n"
             f"Saldo disponible: *{money(balance)} USDT*\n"
             f"Mínimo: *{money(MIN_WITHDRAWAL)} USDT*\n"
-            "Frecuencia: *1 retiro cada 7 días*\n\n"
-            "Escribe ahora el monto que deseas retirar.",
+            "Frecuencia: *1 retiro cada 7 días*\n"
+            "Comisión: *3%* sobre el monto solicitado\n\n"
+            "Escribe ahora el monto que deseas retirar. El bot calculará la comisión y el neto que recibirás.",
             parse_mode="Markdown"
         )
         return
@@ -3641,7 +3439,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return
         context.user_data["withdraw_amount"] = amount
-        await finish_withdraw_manual(update, context, registered_wallet)
+        await show_withdraw_confirmation(update, context, amount)
         return
     if flow == "withdraw_address":
         # Compatibilidad con sesiones antiguas: nunca se solicita una wallet nueva.
@@ -4198,9 +3996,11 @@ async def manual_deposit_photo(update, context):
         conn=db(); row=conn.execute("SELECT * FROM retiros WHERE id=? AND estado='pendiente'",(wid,)).fetchone()
         if not row: conn.close(); context.user_data.clear(); await update.message.reply_text("⚠️ Retiro no disponible.",reply_markup=admin_keyboard()); return
         conn.execute("UPDATE retiros SET estado='aprobado',fecha_revision=?,revisado_por=? WHERE id=?",(now_iso(),update.effective_user.id,wid)); conn.execute("UPDATE usuarios SET total_retirado=total_retirado+? WHERE telegram_id=?",(row['monto'],row['telegram_id'])); conn.commit(); conn.close(); add_movement(row['telegram_id'],'retiro',row['monto'],f'Retiro #{wid} aprobado')
-        context.user_data.clear(); await update.message.reply_text(f"✅ Retiro #{wid} aprobado y comprobante enviado.",reply_markup=admin_keyboard())
+        context.user_data.clear(); await update.message.reply_text(f"✅ Retiro #{wid} aprobado y comprobante enviado.\n\nMonto solicitado: {money(row['monto'])} USDT\nComisión (3%): {money(round(float(row['monto']) * WITHDRAWAL_FEE_RATE, 2))} USDT\nNeto enviado: {money(round(float(row['monto']) - round(float(row['monto']) * WITHDRAWAL_FEE_RATE, 2), 2))} USDT",reply_markup=admin_keyboard())
         try:
-            await context.bot.send_message(chat_id=row['telegram_id'],text=f"✅ *RETIRO APROBADO*\n\nSolicitud #{wid}.\nMonto: *{money(row['monto'])} USDT*\n\n{msg}",parse_mode="Markdown")
+            fee = round(float(row["monto"]) * WITHDRAWAL_FEE_RATE, 2)
+            net = round(float(row["monto"]) - fee, 2)
+            await context.bot.send_message(chat_id=row['telegram_id'],text=f"✅ *RETIRO APROBADO*\n\nSolicitud #{wid}.\nMonto solicitado: *{money(row['monto'])} USDT*\nComisión (3%): *{money(fee)} USDT*\nNeto enviado: *{money(net)} USDT*\n\n{msg}",parse_mode="Markdown")
             await context.bot.send_photo(chat_id=row['telegram_id'],photo=photo,caption=f"📸 Comprobante del retiro #{wid}")
             await send_image_to_user(context.bot, row['telegram_id'], WITHDRAW_SENT_IMAGE)
         except Exception as e: print(e)
