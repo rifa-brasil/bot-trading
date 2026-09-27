@@ -1704,16 +1704,20 @@ async def show_admin_user_daily_gains(query, telegram_id):
         raw_date = str(r["fecha"])
         try:
             dt = datetime.fromisoformat(raw_date)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
             day_key = local_dt.date().isoformat()
             day_label = local_dt.strftime("%d-%m-%y")
+            time_label = local_dt.strftime("%H:%M:%S")
         except Exception:
             day_key = raw_date[:10]
             day_label = raw_date[:10]
+            time_label = raw_date[11:19] if len(raw_date) >= 19 else "-"
 
         item = by_day.get(day_key)
         if item is None:
-            item = {"day": day_label, "items": [], "total": 0.0}
+            item = {"day": day_label, "time": time_label, "items": [], "total": 0.0}
             by_day[day_key] = item
             grouped.append(item)
 
@@ -1731,6 +1735,7 @@ async def show_admin_user_daily_gains(query, telegram_id):
     for item in grouped:
         grand_total += item["total"]
         lines.append(f"📅 *{item['day']}*")
+        lines.append(f"🕐 *Hora: {item['time']}*")
         lines.append("")
         for detail in item["items"]:
             plan_text = (
@@ -1769,9 +1774,9 @@ async def show_admin_withdraw_history(query, telegram_id):
     lines=["📤 *HISTORIAL COMPLETO DE RETIROS*","",f"👤 Nombre: *{user['nombre'] or '-'}*",f"👤 Usuario: @{user['username'] or '-'}",f"🆔 ID: `{telegram_id}`","","📌 *Todos los retiros registrados, desde el primero hasta el último:*",""]
     total=0.0
     if not rows: lines.append("No hay retiros registrados.")
-    for idx,r in enumerate(rows,1):
+    for r in rows:
         amount=float(r['monto'] or 0); fee=round(amount*WITHDRAWAL_FEE_RATE,2); net=round(amount-fee,2); total+=amount
-        lines += [f"📤 *Retiro {idx}*",f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",f"💰 Monto solicitado: *{money(amount)} USDT*",f"📉 Comisión (3%): *{money(fee)} USDT*",f"💵 Neto a recibir: *{money(net)} USDT*",f"📌 Estado: *{r['estado']}*",f"🏦 Wallet: `{r['direccion']}`",""]
+        lines += ["📤 *Retiro*",f"📅 Fecha: *{format_date_time(r['fecha'])[0]}*", f"🕐 Hora: *{format_date_time(r['fecha'])[1]}*",f"💰 Monto solicitado: *{money(amount)} USDT*",f"📉 Comisión (3%): *{money(fee)} USDT*",f"💵 Neto a recibir: *{money(net)} USDT*",f"📌 Estado: *{r['estado']}*",f"🏦 Wallet: `{r['direccion']}`",""]
     lines += ["━━━━━━━━━━━━",f"💵 *TOTAL HISTÓRICO DE RETIROS: {money(total)} USDT*"]
     await _send_admin_history(query,'\n'.join(lines),"admin_history_general","Historial General")
 
@@ -2233,11 +2238,11 @@ async def receive_withdraw_address(update, context):
             chat_id=ADMIN_TELEGRAM_ID,
             text=(
                 "📤 *NUEVO RETIRO PENDIENTE*\n\n"
-                f"ID: `{withdrawal_id}`\n"
-                f"Usuario: `{user_id}`\n"
+                f"ID: `{user_id}`\n"
+                f"Usuario: @{(update.effective_user.username or '-').lstrip('@')}\n"
                 f"Monto solicitado: *{money(amount)} USDT*\n"
-                f"Comisión (3%): *{money(round(amount * WITHDRAWAL_FEE_RATE, 2))} USDT*\n"
-                f"Neto a enviar: *{money(round(amount - round(amount * WITHDRAWAL_FEE_RATE, 2), 2))} USDT*\n"
+                f"📉 Comisión de retiro (3%): *{money(round(amount * WITHDRAWAL_FEE_RATE, 2))} USDT*\n"
+                f"💵 Neto a enviar al usuario: *{money(round(amount - round(amount * WITHDRAWAL_FEE_RATE, 2), 2))} USDT*\n"
                 f"Dirección TRC20:\n`{address}`"
             ),
             parse_mode="Markdown",
@@ -2341,15 +2346,19 @@ async def show_user_daily_gains(query):
         raw_date = str(r["fecha"])
         try:
             dt = datetime.fromisoformat(raw_date)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             local_dt = dt.astimezone(ZoneInfo(PROFIT_TIMEZONE))
             day_key = local_dt.date().isoformat()
             day_label = local_dt.strftime("%d-%m-%y")
+            time_label = local_dt.strftime("%H:%M:%S")
         except Exception:
             day_key = raw_date[:10]
             day_label = raw_date[:10]
+            time_label = raw_date[11:19] if len(raw_date) >= 19 else "-"
         item = by_day.get(day_key)
         if item is None:
-            item = {"day": day_label, "items": [], "total": 0.0}
+            item = {"day": day_label, "time": time_label, "items": [], "total": 0.0}
             by_day[day_key] = item
             grouped.append(item)
         amount = float(r["monto"] or 0)
@@ -2366,6 +2375,7 @@ async def show_user_daily_gains(query):
     for item in grouped:
         grand_total += item["total"]
         lines.append(f"📅 *{item['day']}*")
+        lines.append(f"🕐 *Hora: {item['time']}*")
         lines.append("")
         for detail in item["items"]:
             plan_text = (
@@ -3932,8 +3942,8 @@ async def finish_withdraw_manual(update, context, address):
             chat_id=ADMIN_TELEGRAM_ID,
             text=(
                 "📤 *NUEVO RETIRO PENDIENTE*\n\n"
-                f"ID: `{wid}`\n"
-                f"Usuario: `{user_id}`\n"
+                f"ID: `{user_id}`\n"
+                f"Usuario: @{(update.effective_user.username or '-').lstrip('@')}\n"
                 f"Monto solicitado: *{money(amount)} USDT*\n"
                 f"📉 Comisión de retiro (3%): *{money(fee)} USDT*\n"
                 f"💵 Neto a enviar al usuario: *{money(net)} USDT*\n"
