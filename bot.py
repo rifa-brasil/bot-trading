@@ -2389,9 +2389,50 @@ async def show_history(query):
     )
 
 
+def _split_history_markdown(text, max_chars=3800):
+    """Divide un historial respetando líneas completas para no romper Markdown.
+
+    El fallo que podía aparecer después de una reinversión ocurría cuando el
+    historial crecía lo suficiente para superar el límite de un mensaje y el
+    corte por caracteres partía una marca Markdown (por ejemplo *texto* o
+    `código`). Telegram rechazaba entonces el mensaje completo.
+    """
+    lines = text.splitlines()
+    chunks = []
+    current = []
+    current_len = 0
+
+    for line in lines:
+        # +1 por el salto de línea entre líneas.
+        line_len = len(line) + (1 if current else 0)
+
+        # Si una línea aislada supera el límite, la dividimos sin perderla.
+        if len(line) > max_chars:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for start in range(0, len(line), max_chars):
+                chunks.append(line[start:start + max_chars])
+            continue
+
+        if current and current_len + line_len > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current))
+
+    return chunks or [text]
+
+
 async def _send_user_history(query, text, back_callback="user_history"):
-    """Envía el historial completo en varios mensajes si supera el límite de Telegram."""
-    chunks = [text[i:i+3800] for i in range(0, len(text), 3800)] or [text]
+    """Envía el historial completo sin romper el Markdown al superar 4096 caracteres."""
+    chunks = _split_history_markdown(text, 3800)
     await query.edit_message_text(
         chunks[0],
         parse_mode="Markdown",
