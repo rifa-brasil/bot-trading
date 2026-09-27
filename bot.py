@@ -988,7 +988,18 @@ async def perform_reinvestment(query, amount):
         try:
             await query.get_bot().send_message(chat_id=referrer_id,text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por el *Plan {referral_plan_number}* de *{money(amount)} USDT* realizado por un usuario que se registró con tu enlace."),parse_mode="Markdown")
         except Exception as e: print(f"Error notificando bono: {e}")
-    await query.edit_message_text("✅ *REINVERSIÓN CREADA*\n\n" f"Plan: *{money(amount)} USDT*\n" f"Ganancias utilizadas: *{money(amount)} USDT*\n" "\nLa inversión es independiente de tus demás planes.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📈 Ver inversiones",callback_data="user_history_investments")],[InlineKeyboardButton("🏠 Menú Principal",callback_data="user_home")]]))
+    await query.edit_message_text(
+        "✅ *REINVERSIÓN CREADA*\n\n"
+        f"Plan: *{money(amount)} USDT*\n"
+        f"Ganancias utilizadas: *{money(amount)} USDT*\n\n"
+        "La inversión ya quedó activa y es independiente de tus demás planes.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_invest")],
+            [InlineKeyboardButton("📜 Ver historial de inversiones", callback_data="user_history_investments")],
+            [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+        ])
+    )
 
 
 # =========================================================
@@ -2521,33 +2532,117 @@ async def show_user_withdraw_history(query):
 
 
 async def show_user_investment_history(query):
-    """Historial completo de inversiones agrupado por fecha de activación."""
+    """Historial completo de inversiones agrupado por fecha de activación.
+
+    Esta vista debe ser independiente de cualquier campo opcional o dato antiguo
+    de una inversión. Una fila incompleta no debe impedir que se muestre el resto
+    del historial.
+    """
     user_id = query.from_user.id
-    rows = _history_rows("inversiones", user_id, "fecha_inicio ASC, id ASC")
-    conn = db()
-    total_deposited = conn.execute("SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'", (user_id,)).fetchone()["s"]
-    active_invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'", (user_id,)).fetchone()["s"]
-    total_gains = conn.execute("SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?", (user_id,)).fetchone()["s"]
-    row = conn.execute("SELECT saldo FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone(); conn.close()
-    balance = float(row["saldo"] or 0) if row else 0.0
-    lines = ["📈 *HISTORIAL COMPLETO DE INVERSIONES*", "", "📌 Todas tus inversiones, desde Plan 1 hasta la última, agrupadas por fecha de activación:", ""]
-    total = 0.0
-    if not rows:
-        lines.append("No tienes inversiones registradas.")
-    else:
-        current_date = None
-        for plan_number, r in enumerate(rows, 1):
-            capital = float(r["capital"] or 0); accumulated = float(r["ganancia_acumulada"] or 0); target_total = capital * TARGET_MULTIPLIER; total += capital
-            date_part, time_part = format_date_time(r["fecha_inicio"])
-            if date_part != current_date:
-                if current_date is not None: lines.append("")
-                lines += [f"📅 *{date_part}*", ""]
-                current_date = date_part
-            status = str(r["estado"] or "-"); status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
-            paid_quota = investment_paid_quota_label(r)
-            lines += [f"💰 *Plan {plan_number} — {money(capital)} USDT*", f"🕐 Hora de inicio: *{time_part}*", f"📊 Cuota pagada del día: *{paid_quota}*", f"🎁 Ganancias acumuladas: *{money(accumulated)} USDT*", f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{min(200.0, (accumulated / capital * 100) if capital else 0.0):.2f}%*", f"📌 Estado: *{status_label}*", ""]
-    lines += ["━━━━━━━━━━━━", "📊 *RESUMEN DE LA CUENTA*", "", f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*", f"💳 Saldo disponible: *{money(balance)} USDT*", f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*", f"💵 Ganancia acumulada: *{money(total_gains)} USDT*", "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador."]
-    await _send_user_history(query, "\n".join(lines))
+
+    try:
+        rows = _history_rows("inversiones", user_id, "fecha_inicio ASC, id ASC")
+        conn = db()
+        total_deposited = conn.execute(
+            "SELECT COALESCE(SUM(monto), 0) AS s FROM depositos WHERE telegram_id=? AND estado='aprobado'",
+            (user_id,)
+        ).fetchone()["s"]
+        active_invested = conn.execute(
+            "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=? AND estado='activa'",
+            (user_id,)
+        ).fetchone()["s"]
+        total_gains = conn.execute(
+            "SELECT COALESCE(SUM(ganancia_acumulada), 0) AS s FROM inversiones WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()["s"]
+        balance_row = conn.execute(
+            "SELECT saldo FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        conn.close()
+
+        balance = float(balance_row["saldo"] or 0) if balance_row else 0.0
+        lines = [
+            "📈 *HISTORIAL COMPLETO DE INVERSIONES*",
+            "",
+            "📌 Todas tus inversiones, desde Plan 1 hasta la última, agrupadas por fecha de activación:",
+            ""
+        ]
+        total = 0.0
+
+        if not rows:
+            lines.append("No tienes inversiones registradas.")
+        else:
+            current_date = None
+            for plan_number, r in enumerate(rows, 1):
+                try:
+                    capital = float(r["capital"] or 0)
+                except Exception:
+                    capital = 0.0
+                try:
+                    accumulated = float(r["ganancia_acumulada"] or 0)
+                except Exception:
+                    accumulated = 0.0
+                target_total = capital * TARGET_MULTIPLIER
+                total += capital
+
+                date_part, time_part = format_date_time(r["fecha_inicio"])
+                if date_part != current_date:
+                    if current_date is not None:
+                        lines.append("")
+                    lines += [f"📅 *{date_part}*", ""]
+                    current_date = date_part
+
+                status = str(r["estado"] or "-")
+                status_label = "🟢 Activa" if status == "activa" else f"📌 {status.capitalize()}"
+
+                # La cuota solo se muestra cuando existe una ganancia realmente
+                # acreditada en esa inversión. Una reinversión recién creada muestra —.
+                try:
+                    paid_quota = investment_paid_quota_label(r)
+                except Exception as quota_error:
+                    print(f"⚠️ No se pudo calcular la cuota de la inversión {r['id']}: {quota_error}")
+                    paid_quota = "—"
+
+                progress_pct = min(100.0, (accumulated / capital * 100) if capital else 0.0)
+                lines += [
+                    f"💰 *Plan {plan_number} — {money(capital)} USDT*",
+                    f"🕐 Hora de inicio: *{time_part}*",
+                    f"📊 Cuota pagada del día: *{paid_quota}*",
+                    f"🎁 Ganancias acumuladas: *{money(accumulated)} USDT*",
+                    f"📈 Proceso hacia 200%: *{money(accumulated)} / {money(target_total)} USDT* — *{progress_pct:.2f}%*",
+                    f"📌 Estado: *{status_label}*",
+                    ""
+                ]
+
+        lines += [
+            "━━━━━━━━━━━━",
+            "📊 *RESUMEN DE LA CUENTA*",
+            "",
+            f"💰 Total depositado aprobado: *{money(total_deposited)} USDT*",
+            f"💳 Saldo disponible: *{money(balance)} USDT*",
+            f"📊 Capital actualmente invertido: *{money(active_invested)} USDT*",
+            f"💵 Ganancia acumulada: *{money(total_gains)} USDT*",
+            "📅 Rendimiento diario: *variable* según la cuota seleccionada por el administrador."
+        ]
+
+        await _send_user_history(query, "\n".join(lines))
+
+    except Exception as e:
+        print(f"❌ Error cargando historial de inversiones del usuario {user_id}: {e}")
+        try:
+            await query.edit_message_text(
+                "⚠️ *No se pudo cargar el historial de inversiones.*\n\n"
+                "La inversión puede seguir activa. Puedes comprobarla desde *📈 Ver inversiones*.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📈 Ver inversiones", callback_data="user_invest")],
+                    [InlineKeyboardButton("⬅️ Historial", callback_data="user_history")],
+                    [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+                ])
+            )
+        except Exception as fallback_error:
+            print(f"❌ Error mostrando fallback del historial de inversiones: {fallback_error}")
 
 # =========================================================
 # CALLBACKS
@@ -3316,25 +3411,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "user_history_investments":
-        # Consulta directa del historial de inversiones del usuario.
-        # Se protege el callback para que un dato antiguo o una fila incompleta
-        # no deje el botón sin respuesta en Telegram.
-        try:
-            await show_user_investment_history(query)
-        except Exception as e:
-            print(f"❌ Error en Historial → Inversiones del usuario {user_id}: {e}")
-            try:
-                await query.edit_message_text(
-                    "⚠️ *No se pudo cargar el historial de inversiones.*\n\n"
-                    "Inténtalo nuevamente desde 📜 Historial.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ Historial", callback_data="user_history")],
-                        [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
-                    ])
-                )
-            except Exception as fallback_error:
-                print(f"❌ Error mostrando fallback del historial de inversiones: {fallback_error}")
+        await show_user_investment_history(query)
         return
 
     if data == "user_info":
