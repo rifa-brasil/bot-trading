@@ -759,13 +759,20 @@ async def send_user_guide(chat_id, context, registration_button=False):
             [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
 
-    with open(USER_GUIDE_PDF, "rb") as document:
-        await context.bot.send_document(
+    try:
+        with open(USER_GUIDE_PDF, "rb") as document:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=document,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+    except Exception as e:
+        print(f"Error enviando la guía de usuario ({USER_GUIDE_PDF}): {type(e).__name__}: {e}")
+        await context.bot.send_message(
             chat_id=chat_id,
-            document=document,
-            caption=caption,
-            parse_mode="Markdown",
-            reply_markup=markup
+            text="⚠️ No se pudo enviar la guía de usuario en este momento. El administrador debe comprobar que el PDF esté subido junto a bot.py y que el servicio se haya reiniciado."
         )
 
 
@@ -875,6 +882,10 @@ async def show_account(query):
         "SELECT COALESCE(SUM(monto), 0) AS s FROM retiros WHERE telegram_id=? AND estado='aprobado'",
         (user_id,)
     ).fetchone()["s"]
+    total_invertido_acumulado = conn.execute(
+        "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()["s"]
     conn.close()
     total_depositado = max(float(row["total_depositado"] or 0), float(total_depositado_db or 0))
     total_retirado = max(float(row["total_retirado"] or 0), float(total_retirado_db or 0))
@@ -886,7 +897,7 @@ async def show_account(query):
         f"👤 Nombre: {row['nombre'] or '-'}\n"
         f"💰 Saldo disponible: *{money(row['saldo'])} USDT*\n"
         f"📥 Total depositado: *{money(total_depositado)} USDT*\n"
-        f"📈 Capital invertido: *{money(row['invertido'])} USDT*\n"
+        f"📈 Capital invertido acumulado: *{money(total_invertido_acumulado)} USDT*\n"
         f"💵 Ganancias acumuladas: *{money(ganancias)} USDT*\n"
         
         f"📤 Total retirado: *{money(total_retirado)} USDT*\n\n"
@@ -2815,7 +2826,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with_deposit = conn.execute("SELECT COUNT(*) AS c FROM usuarios WHERE total_depositado > 0").fetchone()["c"]
         total = conn.execute("SELECT COALESCE(SUM(total_depositado), 0) AS s FROM usuarios").fetchone()["s"]
         balance = conn.execute("SELECT COALESCE(SUM(saldo), 0) AS s FROM usuarios").fetchone()["s"]
-        invested = conn.execute("SELECT COALESCE(SUM(invertido), 0) AS s FROM usuarios").fetchone()["s"]
+        invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones").fetchone()["s"]
+        active_invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE estado='activa'").fetchone()["s"]
         earnings = conn.execute("SELECT COALESCE(SUM(ganancias), 0) AS s FROM usuarios").fetchone()["s"]
         withdrawn = conn.execute("SELECT COALESCE(SUM(total_retirado), 0) AS s FROM usuarios").fetchone()["s"]
         conn.close()
@@ -2826,7 +2838,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Usuarios que han depositado: *{with_deposit}*\n\n"
             f"📥 Total depositado: *{money(total)} USDT*\n"
             f"💵 Saldo disponible de usuarios: *{money(balance)} USDT*\n"
-            f"📈 Capital actualmente invertido: *{money(invested)} USDT*\n"
+            f"📈 Capital invertido acumulado (incluye reinversiones): *{money(invested)} USDT*\n"
+            f"🟢 Capital actualmente invertido: *{money(active_invested)} USDT*\n"
             f"🎁 Ganancias acumuladas: *{money(earnings)} USDT*\n"
             f"💸 Total retirado: *{money(withdrawn)} USDT*"
         )
@@ -3739,6 +3752,11 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔄 Reinvertir saldo": "user_reinvest",
         "🆘 Soporte": "user_support",
         "📘 Guia de Usuario del bot de Inversion": "user_guide",
+        # Compatibilidad con etiquetas anteriores que pueden seguir visibles en Telegram.
+        "📘 Guía de Usuario": "user_guide",
+        "📘 Guia de Usuario": "user_guide",
+        "📘 Guía de Usuario del bot de Inversión": "user_guide",
+        "📘 Guía de Usuario del bot de Inversion": "user_guide",
         # Compatibilidad temporal con un teclado antiguo: lleva al historial de inversiones.
     }
 
@@ -3747,10 +3765,16 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_text_panel_action(update, context, admin_actions[text])
         return
     if text in user_actions:
+        action = user_actions[text]
+        # La guía es de solo lectura y también puede abrirla el administrador,
+        # incluso si Telegram conserva un teclado de usuario anterior.
+        if action == "user_guide":
+            await send_user_guide(update.effective_chat.id, context, registration_button=False)
+            return
         if is_admin(update.effective_user.id):
             await send_admin_menu(update.effective_chat.id, context, "👑 *PANEL DE ADMINISTRACIÓN*\n\nEste usuario tiene acceso exclusivamente al panel administrativo.")
             return
-        await handle_text_panel_action(update, context, user_actions[text])
+        await handle_text_panel_action(update, context, action)
         return
     if text == "💰 Depositar":
         context.user_data.clear()
@@ -3889,7 +3913,8 @@ async def handle_text_panel_action(update, context, action):
         with_deposit = conn.execute("SELECT COUNT(*) c FROM usuarios WHERE total_depositado > 0").fetchone()["c"]
         total = conn.execute("SELECT COALESCE(SUM(total_depositado),0) s FROM usuarios").fetchone()["s"]
         balance = conn.execute("SELECT COALESCE(SUM(saldo),0) s FROM usuarios").fetchone()["s"]
-        invested = conn.execute("SELECT COALESCE(SUM(invertido),0) s FROM usuarios").fetchone()["s"]
+        invested = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones").fetchone()["s"]
+        active_invested = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
         earnings = conn.execute("SELECT COALESCE(SUM(ganancias),0) s FROM usuarios").fetchone()["s"]
         withdrawn = conn.execute("SELECT COALESCE(SUM(total_retirado),0) s FROM usuarios").fetchone()["s"]
         conn.close()
@@ -3899,7 +3924,8 @@ async def handle_text_panel_action(update, context, action):
             f"💰 Usuarios que han depositado: *{with_deposit}*\n\n"
             f"📥 Total depositado: *{money(total)} USDT*\n"
             f"💵 Saldo disponible: *{money(balance)} USDT*\n"
-            f"📈 Capital invertido: *{money(invested)} USDT*\n"
+            f"📈 Capital invertido acumulado (incluye reinversiones): *{money(invested)} USDT*\n"
+            f"🟢 Capital actualmente invertido: *{money(active_invested)} USDT*\n"
             f"🎁 Ganancias acumuladas: *{money(earnings)} USDT*\n"
             f"💸 Total retirado: *{money(withdrawn)} USDT*",
             parse_mode="Markdown", reply_markup=admin_keyboard()
