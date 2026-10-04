@@ -695,10 +695,10 @@ def user_keyboard():
     # ocultar según el teclado anterior que conserve el cliente.
     return ReplyKeyboardMarkup([
         ["👤 Mi cuenta", "💰 Planes de Inversión"],
-        ["🔄 Reinvertir saldo", "💸 Retirar"],
-        ["🤝 Referidos", "📜 Historial"],
-        ["📘 Guia de Usuario del bot de Inversion", "🆘 Soporte"],
-        ["ℹ️ Información"],
+        ["🚀 Invertir plan", "🔄 Reinvertir saldo"],
+        ["💸 Retirar", "🤝 Referidos"],
+        ["📜 Historial", "📘 Guia de Usuario del bot de Inversion"],
+        ["🆘 Soporte", "ℹ️ Información"],
     ], resize_keyboard=True, is_persistent=True)
 
 
@@ -759,20 +759,13 @@ async def send_user_guide(chat_id, context, registration_button=False):
             [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
         ])
 
-    try:
-        with open(USER_GUIDE_PDF, "rb") as document:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=document,
-                caption=caption,
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
-    except Exception as e:
-        print(f"Error enviando la guía de usuario ({USER_GUIDE_PDF}): {type(e).__name__}: {e}")
-        await context.bot.send_message(
+    with open(USER_GUIDE_PDF, "rb") as document:
+        await context.bot.send_document(
             chat_id=chat_id,
-            text="⚠️ No se pudo enviar la guía de usuario en este momento. El administrador debe comprobar que el PDF esté subido junto a bot.py y que el servicio se haya reiniciado."
+            document=document,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=markup
         )
 
 
@@ -882,10 +875,6 @@ async def show_account(query):
         "SELECT COALESCE(SUM(monto), 0) AS s FROM retiros WHERE telegram_id=? AND estado='aprobado'",
         (user_id,)
     ).fetchone()["s"]
-    total_invertido_acumulado = conn.execute(
-        "SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()["s"]
     conn.close()
     total_depositado = max(float(row["total_depositado"] or 0), float(total_depositado_db or 0))
     total_retirado = max(float(row["total_retirado"] or 0), float(total_retirado_db or 0))
@@ -897,7 +886,7 @@ async def show_account(query):
         f"👤 Nombre: {row['nombre'] or '-'}\n"
         f"💰 Saldo disponible: *{money(row['saldo'])} USDT*\n"
         f"📥 Total depositado: *{money(total_depositado)} USDT*\n"
-        f"📈 Capital invertido acumulado: *{money(total_invertido_acumulado)} USDT*\n"
+        f"📈 Capital invertido: *{money(row['invertido'])} USDT*\n"
         f"💵 Ganancias acumuladas: *{money(ganancias)} USDT*\n"
         
         f"📤 Total retirado: *{money(total_retirado)} USDT*\n\n"
@@ -1332,6 +1321,69 @@ def investment_summary(telegram_id):
     """, (telegram_id,)).fetchall()
     conn.close()
     return rows
+
+
+async def show_available_investment_plans(query):
+    """Muestra únicamente los depósitos aprobados que todavía no se han invertido.
+
+    Cada depósito aparece como una opción independiente, incluso si el usuario
+    tiene varios depósitos del mismo importe. Al seleccionar uno, solo ese
+    depósito se convierte en una inversión activa.
+    """
+    user_id = query.from_user.id
+    conn = db()
+    available_plans = conn.execute("""
+        SELECT id, plan_monto, monto
+        FROM depositos
+        WHERE telegram_id = ?
+          AND estado = 'aprobado'
+          AND COALESCE(plan_monto, 0) > 0
+          AND inversion_id IS NULL
+        ORDER BY id ASC
+    """, (user_id,)).fetchall()
+    conn.close()
+
+    if not available_plans:
+        await query.edit_message_text(
+            "🚀 *INVERTIR PLAN*\n\n"
+            "No tienes ningún plan aprobado pendiente de invertir.\n\n"
+            "Cuando el administrador apruebe un depósito, aparecerá aquí para que "
+            "puedas activarlo. Cada depósito se invierte por separado y solo una vez.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Planes de Inversión", callback_data="user_plans")],
+                [InlineKeyboardButton("📈 Ver inversiones activas", callback_data="user_invest")],
+                [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")],
+            ])
+        )
+        return
+
+    lines = [
+        "🚀 *INVERTIR PLAN*",
+        "",
+        "Selecciona el depósito aprobado que quieres activar como inversión.",
+        "Cada opción corresponde a un depósito individual. Si tienes varios planes, "
+        "puedes activarlos uno por uno.",
+        "",
+        "💎 *PLANES APROBADOS PENDIENTES DE INVERSIÓN*",
+        "",
+    ]
+    buttons = []
+    for dep in available_plans:
+        amount = float(dep["plan_monto"] or dep["monto"])
+        lines.append(f"• Plan de *{money(amount)} USDT* — pendiente de activar")
+        buttons.append([InlineKeyboardButton(
+            f"🚀 Invertir Plan {money(amount)} USDT",
+            callback_data=f"invest_deposit_{dep['id']}"
+        )])
+
+    buttons.append([InlineKeyboardButton("📈 Ver inversiones activas", callback_data="user_invest")])
+    buttons.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")])
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 
 async def show_investments(query):
@@ -2826,8 +2878,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with_deposit = conn.execute("SELECT COUNT(*) AS c FROM usuarios WHERE total_depositado > 0").fetchone()["c"]
         total = conn.execute("SELECT COALESCE(SUM(total_depositado), 0) AS s FROM usuarios").fetchone()["s"]
         balance = conn.execute("SELECT COALESCE(SUM(saldo), 0) AS s FROM usuarios").fetchone()["s"]
-        invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones").fetchone()["s"]
-        active_invested = conn.execute("SELECT COALESCE(SUM(capital), 0) AS s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        invested = conn.execute("SELECT COALESCE(SUM(invertido), 0) AS s FROM usuarios").fetchone()["s"]
         earnings = conn.execute("SELECT COALESCE(SUM(ganancias), 0) AS s FROM usuarios").fetchone()["s"]
         withdrawn = conn.execute("SELECT COALESCE(SUM(total_retirado), 0) AS s FROM usuarios").fetchone()["s"]
         conn.close()
@@ -2838,8 +2889,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Usuarios que han depositado: *{with_deposit}*\n\n"
             f"📥 Total depositado: *{money(total)} USDT*\n"
             f"💵 Saldo disponible de usuarios: *{money(balance)} USDT*\n"
-            f"📈 Capital invertido acumulado (incluye reinversiones): *{money(invested)} USDT*\n"
-            f"🟢 Capital actualmente invertido: *{money(active_invested)} USDT*\n"
+            f"📈 Capital actualmente invertido: *{money(invested)} USDT*\n"
             f"🎁 Ganancias acumuladas: *{money(earnings)} USDT*\n"
             f"💸 Total retirado: *{money(withdrawn)} USDT*"
         )
@@ -3383,6 +3433,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_investments(query)
         return
 
+    if data == "user_invest_plan":
+        await show_available_investment_plans(query)
+        return
+
     if data == "user_plans":
         await show_plans(query)
         return
@@ -3749,14 +3803,10 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 Mi cuenta": "user_account",
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
         "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
+        "🚀 Invertir plan": "user_invest_plan",
         "🔄 Reinvertir saldo": "user_reinvest",
         "🆘 Soporte": "user_support",
         "📘 Guia de Usuario del bot de Inversion": "user_guide",
-        # Compatibilidad con etiquetas anteriores que pueden seguir visibles en Telegram.
-        "📘 Guía de Usuario": "user_guide",
-        "📘 Guia de Usuario": "user_guide",
-        "📘 Guía de Usuario del bot de Inversión": "user_guide",
-        "📘 Guía de Usuario del bot de Inversion": "user_guide",
         # Compatibilidad temporal con un teclado antiguo: lleva al historial de inversiones.
     }
 
@@ -3765,16 +3815,10 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_text_panel_action(update, context, admin_actions[text])
         return
     if text in user_actions:
-        action = user_actions[text]
-        # La guía es de solo lectura y también puede abrirla el administrador,
-        # incluso si Telegram conserva un teclado de usuario anterior.
-        if action == "user_guide":
-            await send_user_guide(update.effective_chat.id, context, registration_button=False)
-            return
         if is_admin(update.effective_user.id):
             await send_admin_menu(update.effective_chat.id, context, "👑 *PANEL DE ADMINISTRACIÓN*\n\nEste usuario tiene acceso exclusivamente al panel administrativo.")
             return
-        await handle_text_panel_action(update, context, action)
+        await handle_text_panel_action(update, context, user_actions[text])
         return
     if text == "💰 Depositar":
         context.user_data.clear()
@@ -3913,8 +3957,7 @@ async def handle_text_panel_action(update, context, action):
         with_deposit = conn.execute("SELECT COUNT(*) c FROM usuarios WHERE total_depositado > 0").fetchone()["c"]
         total = conn.execute("SELECT COALESCE(SUM(total_depositado),0) s FROM usuarios").fetchone()["s"]
         balance = conn.execute("SELECT COALESCE(SUM(saldo),0) s FROM usuarios").fetchone()["s"]
-        invested = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones").fetchone()["s"]
-        active_invested = conn.execute("SELECT COALESCE(SUM(capital),0) s FROM inversiones WHERE estado='activa'").fetchone()["s"]
+        invested = conn.execute("SELECT COALESCE(SUM(invertido),0) s FROM usuarios").fetchone()["s"]
         earnings = conn.execute("SELECT COALESCE(SUM(ganancias),0) s FROM usuarios").fetchone()["s"]
         withdrawn = conn.execute("SELECT COALESCE(SUM(total_retirado),0) s FROM usuarios").fetchone()["s"]
         conn.close()
@@ -3924,8 +3967,7 @@ async def handle_text_panel_action(update, context, action):
             f"💰 Usuarios que han depositado: *{with_deposit}*\n\n"
             f"📥 Total depositado: *{money(total)} USDT*\n"
             f"💵 Saldo disponible: *{money(balance)} USDT*\n"
-            f"📈 Capital invertido acumulado (incluye reinversiones): *{money(invested)} USDT*\n"
-            f"🟢 Capital actualmente invertido: *{money(active_invested)} USDT*\n"
+            f"📈 Capital invertido: *{money(invested)} USDT*\n"
             f"🎁 Ganancias acumuladas: *{money(earnings)} USDT*\n"
             f"💸 Total retirado: *{money(withdrawn)} USDT*",
             parse_mode="Markdown", reply_markup=admin_keyboard()
@@ -4148,6 +4190,7 @@ async def handle_text_panel_action(update, context, action):
     elif action == "user_guide": await send_user_guide(update.effective_chat.id, context, registration_button=False)
     elif action == "user_history_investments": await show_user_investment_history(fake)
     elif action == "user_invest": await show_investments(fake)
+    elif action == "user_invest_plan": await show_available_investment_plans(fake)
     elif action == "user_plans": await show_plans(fake)
     elif action == "user_referrals": await show_referrals(fake, context)
     elif action == "user_history": await show_history(fake)
