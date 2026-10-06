@@ -695,6 +695,7 @@ def user_keyboard():
     # ocultar según el teclado anterior que conserve el cliente.
     return ReplyKeyboardMarkup([
         ["👤 Mi cuenta", "💰 Planes de Inversión"],
+        ["🚀 Invertir Plan"],
         ["🔄 Reinvertir saldo", "💸 Retirar"],
         ["🤝 Referidos", "📜 Historial"],
         ["📘 Guia de Usuario del bot de Inversion", "🆘 Soporte"],
@@ -1409,6 +1410,60 @@ async def show_investments(query):
     buttons.append([InlineKeyboardButton("💎 Elegir otro Plan de Inversión", callback_data="user_plans")])
     buttons.append([InlineKeyboardButton("⬅️ Atrás", callback_data="user_home"), InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")])
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def show_available_plans(query):
+    """Muestra únicamente los depósitos aprobados que todavía no se han invertido."""
+    user_id = query.from_user.id
+    conn = db()
+    rows = conn.execute("""
+        SELECT id, plan_monto, monto
+        FROM depositos
+        WHERE telegram_id = ?
+          AND estado = 'aprobado'
+          AND COALESCE(plan_monto, 0) > 0
+          AND inversion_id IS NULL
+        ORDER BY id ASC
+    """, (user_id,)).fetchall()
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text(
+            "🚀 *INVERTIR PLAN*\n\n"
+            "No tienes ningún plan depositado y aprobado por el administrador "
+            "pendiente de inversión.\n\n"
+            "Cuando un depósito sea aprobado, aparecerá aquí automáticamente "
+            "para que puedas activarlo.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Depositar / Ver Planes", callback_data="user_plans")],
+                [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
+            ])
+        )
+        return
+
+    lines = [
+        "🚀 *PLANES DISPONIBLES PARA INVERTIR*",
+        "",
+        "Estos son los depósitos que ya fueron aprobados por el administrador "
+        "y todavía no han sido convertidos en una inversión:",
+        ""
+    ]
+    buttons = []
+    for row in rows:
+        amount = float(row["plan_monto"] or row["monto"])
+        lines.append(f"💎 Plan disponible: *{money(amount)} USDT*")
+        buttons.append([InlineKeyboardButton(
+            f"🚀 Invertir Plan {money(amount)} USDT",
+            callback_data=f"invest_deposit_{row['id']}"
+        )])
+
+    buttons.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")])
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
 
 async def create_investment(query):
     user_id = query.from_user.id
@@ -3138,29 +3193,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            user_approval_text = (
-                "✅ *DEPÓSITO APROBADO*\n\n"
-                f"Tu depósito de *{money(amount)} USDT* fue aprobado y acreditado a tu saldo."
-            )
-            user_approval_keyboard = None
-            if plan_amount > 0:
-                user_approval_text += (
-                    f"\n\n💎 Tu Plan {money(plan_amount)} USDT ya está disponible para invertir. "
-                    "Pulsa el botón de abajo cuando quieras activarlo."
-                )
-                user_approval_keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        f"🚀 Invertir Plan {money(plan_amount)} USDT",
-                        callback_data=f"invest_deposit_{deposit_id}"
-                    )],
-                    [InlineKeyboardButton("🏠 Menú Principal", callback_data="user_home")]
-                ])
-
             await context.bot.send_message(
                 chat_id=uid,
-                text=user_approval_text,
-                parse_mode="Markdown",
-                reply_markup=user_approval_keyboard
+                text=(
+                    "✅ *DEPÓSITO APROBADO*\n\n"
+                    f"Tu depósito de *{money(amount)} USDT* fue aprobado y acreditado a tu saldo."
+                    + (f"\n\n🚀 Tu Plan {money(plan_amount)} USDT ya está disponible para invertir desde el botón *🚀 Invertir Plan* del menú principal." if plan_amount > 0 else "")
+                ),
+                parse_mode="Markdown"
             )
         except Exception as e:
             print(f"Error notificando aprobación de depósito: {e}")
@@ -3387,6 +3427,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "user_plans":
         await show_plans(query)
+        return
+
+    if data == "user_invest_available":
+        await show_available_plans(query)
         return
 
     if data.startswith("plan_"):
@@ -3751,10 +3795,11 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 Mi cuenta": "user_account",
         "🤝 Referidos": "user_referrals", "📜 Historial": "user_history",
         "ℹ️ Información": "user_info", "💰 Planes de Inversión": "user_plans",
+        "🚀 Invertir Plan": "user_invest_available",
         "🔄 Reinvertir saldo": "user_reinvest",
         "🆘 Soporte": "user_support",
         "📘 Guia de Usuario del bot de Inversion": "user_guide",
-        # Compatibilidad temporal con un teclado antiguo: lleva al historial de inversiones.
+        # Compatibilidad temporal con un teclado antiguo.
     }
 
     # El teclado inferior funciona como panel fijo.
@@ -4138,6 +4183,7 @@ async def handle_text_panel_action(update, context, action):
     elif action == "user_history_investments": await show_user_investment_history(fake)
     elif action == "user_invest": await show_investments(fake)
     elif action == "user_plans": await show_plans(fake)
+    elif action == "user_invest_available": await show_available_plans(fake)
     elif action == "user_referrals": await show_referrals(fake, context)
     elif action == "user_history": await show_history(fake)
     elif action == "user_info": await show_info(fake)
