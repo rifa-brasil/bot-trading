@@ -2110,6 +2110,13 @@ def sustainability_report(rate_decimal=None):
             "SELECT fecha, monto, saldo_cierre FROM fondos_diarios WHERE fecha < ? ORDER BY fecha DESC LIMIT 1",
             (today,)
         ).fetchone()
+        # La reserva acumulada suma el 3% calculado para cada fecha registrada.
+        # Se usa el importe final guardado de cada día, de modo que actualizar el
+        # fondo de hoy no duplica la reserva de ese mismo día.
+        previous_reserve_row = conn.execute(
+            "SELECT COALESCE(SUM(monto * 0.03), 0) total FROM fondos_diarios WHERE fecha < ?",
+            (today,)
+        ).fetchone()
         active = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(capital),0) capital FROM inversiones WHERE estado='activa'").fetchone()
         # Los bonos por referido se generan una sola vez cuando se crea una inversión
         # elegible. Solo se contabilizan los bonos registrados en la fecha local de hoy.
@@ -2156,6 +2163,8 @@ def sustainability_report(rate_decimal=None):
     # El 3% se calcula sobre el fondo externo actualizado que introdujo el administrador.
     # El saldo neto del día (fondo menos salidas) se conserva como referencia para mañana.
     reserve_minimum = fund_amount * 0.03
+    previous_reserve_total = float(previous_reserve_row['total'] or 0)
+    cumulative_reserve = previous_reserve_total + reserve_minimum
     previous_reference = None
     previous_reference_date = None
     previous_reference_estimated = False
@@ -2198,7 +2207,11 @@ def sustainability_report(rate_decimal=None):
         'multilevel': multilevel_amount, 'referral_total': referral_total,
         'pending_wd': pending_amount, 'rate': rate, 'daily_cost': daily_cost,
         'total_outgoing': total_outgoing, 'available_after': available_after,
-        'reserve_minimum': reserve_minimum, 'previous_reference': previous_reference,
+        'reserve_minimum': reserve_minimum,
+        'previous_reserve_total': previous_reserve_total,
+        'cumulative_reserve': cumulative_reserve,
+        'available_tomorrow': available_after,
+        'previous_reference': previous_reference,
         'previous_reference_date': previous_reference_date,
         'previous_reference_estimated': previous_reference_estimated,
         'required_closing': required_closing, 'reserve_margin': reserve_margin,
@@ -2243,15 +2256,18 @@ async def show_sustainability_panel(query, rate_decimal=None):
         f"🌐 Total de bonos indirectos/multinivel registrados: *{money(report['multilevel'])} USDT*",
         f"🎁 Total de bonos directos e indirectos: *{money(report['referral_total'])} USDT*", "",
         f"📉 *Total de salidas calculadas: {money(report['total_outgoing'])} USDT*",
-        f"💰 *Saldo neto estimado después de las salidas: {money(report['available_after'])} USDT*", "",
+        f"💰 *Saldo neto estimado después de las salidas: {money(report['available_after'])} USDT*",
+        f"🚀 *Total disponible para operar mañana: {money(report['available_tomorrow'])} USDT*", "",
         "*Control de reserva del 3%*",
-        f"🛡️ Reserva mínima (3% del fondo actualizado): *{money(report['reserve_minimum'])} USDT*",
+        f"🛡️ Reserva del día (3% del fondo actualizado): *{money(report['reserve_minimum'])} USDT*",
+        f"📚 Reserva acumulada hasta el día anterior: *{money(report['previous_reserve_total'])} USDT*",
+        f"🏦 *Reserva acumulada total (días anteriores + hoy): {money(report['cumulative_reserve'])} USDT*",
         (f"📚 Referencia neta anterior ({report['previous_reference_date']}): *{money(report['previous_reference'])} USDT*" if report['previous_reference'] is not None else "📚 Referencia neta anterior: *aún no disponible; hoy se establecerá la primera referencia*"),
         ("ℹ️ La referencia anterior se estima con el fondo bruto porque ese registro histórico no guardaba el saldo neto." if report['previous_reference_estimated'] else ""),
         (f"🎯 Saldo mínimo requerido después de salidas: *{money(report['required_closing'])} USDT*" if report['previous_reference'] is not None else f"🎯 Reserva mínima inicial: *{money(report['required_closing'])} USDT*"),
         (f"📊 Margen frente al mínimo: *{money(report['reserve_margin'])} USDT*" if report['previous_reference'] is not None else ""), "",
         report['status'],
-        "ℹ️ Los bonos directos e indirectos mostrados son los generados y registrados hoy por nuevas inversiones elegibles; los bonos de fechas anteriores no se vuelven a sumar en este cálculo. El saldo neto calculado se guarda como referencia para el próximo día."
+        "ℹ️ Los bonos directos e indirectos mostrados son los generados y registrados hoy por nuevas inversiones elegibles; los bonos de fechas anteriores no se vuelven a sumar en este cálculo. El saldo neto disponible para operar mañana se guarda como referencia para el próximo día. La reserva acumulada suma el 3% del fondo registrado en cada fecha; si se vuelve a actualizar el fondo del mismo día, ese día se cuenta una sola vez."
     ]
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=sustainability_keyboard())
 
