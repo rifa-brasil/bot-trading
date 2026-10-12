@@ -243,8 +243,7 @@ def init_db():
             registrado_por INTEGER NOT NULL, fecha_registro TEXT NOT NULL
         )
     """)
-    # Saldo neto estimado al cierre, después de las salidas calculadas.
-    # Se guarda para usarlo como referencia del siguiente día.
+    # Saldo neto calculado para operar al día siguiente.
     try:
         cur.execute("ALTER TABLE fondos_diarios ADD COLUMN saldo_cierre REAL")
     except sqlite3.OperationalError:
@@ -2097,34 +2096,31 @@ def local_today_str():
 
 
 def sustainability_report(rate_decimal=None):
-    """Calcula las salidas de hoy y comprueba una reserva del 3% del fondo declarado."""
+    """Informe breve: salidas de hoy, reserva diaria/acumulada y meta +15%."""
     today = local_today_str()
     conn = db()
     try:
         fund = conn.execute(
-            "SELECT monto, fecha_registro, saldo_cierre FROM fondos_diarios WHERE fecha=?", (today,)
+            "SELECT monto, fecha_registro FROM fondos_diarios WHERE fecha=?", (today,)
         ).fetchone()
         if not fund:
             return None
-        previous = conn.execute(
-            "SELECT fecha, monto, saldo_cierre FROM fondos_diarios WHERE fecha < ? ORDER BY fecha DESC LIMIT 1",
-            (today,)
+        active = conn.execute(
+            "SELECT COUNT(*) c, COALESCE(SUM(capital),0) capital "
+            "FROM inversiones WHERE estado='activa'"
         ).fetchone()
-        # La reserva acumulada suma el 3% calculado para cada fecha registrada.
-        # Se usa el importe final guardado de cada día, de modo que actualizar el
-        # fondo de hoy no duplica la reserva de ese mismo día.
-        previous_reserve_row = conn.execute(
-            "SELECT COALESCE(SUM(monto * 0.03), 0) total FROM fondos_diarios WHERE fecha < ?",
-            (today,)
-        ).fetchone()
-        active = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(capital),0) capital FROM inversiones WHERE estado='activa'").fetchone()
-        # Los bonos por referido se generan una sola vez cuando se crea una inversión
-        # elegible. Solo se contabilizan los bonos registrados en la fecha local de hoy.
+        # Cada fecha contribuye una sola vez a la reserva acumulada.
+        prior_reserve = conn.execute(
+            "SELECT COALESCE(SUM(monto * 0.03), 0) total "
+            "FROM fondos_diarios WHERE fecha < ?", (today,)
+        ).fetchone()['total']
         bonus_rows = conn.execute(
             "SELECT tipo, monto, fecha FROM movimientos "
             "WHERE tipo IN ('bono_referido', 'bono_referido_multinivel')"
         ).fetchall()
-        pending_wd = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM retiros WHERE estado='pendiente'").fetchone()['total']
+        pending_wd = conn.execute(
+            "SELECT COALESCE(SUM(monto),0) total FROM retiros WHERE estado='pendiente'"
+        ).fetchone()['total']
     finally:
         conn.close()
 
@@ -2133,91 +2129,74 @@ def sustainability_report(rate_decimal=None):
     except Exception:
         local_tz = timezone.utc
     direct = 0.0
-    multilevel = 0.0
-    for bonus_row in bonus_rows:
+    indirect = 0.0
+    for row in bonus_rows:
         try:
-            bonus_dt = datetime.fromisoformat(str(bonus_row['fecha']).replace('Z', '+00:00'))
-            if bonus_dt.tzinfo is None:
-                bonus_dt = bonus_dt.replace(tzinfo=timezone.utc)
-            bonus_day = bonus_dt.astimezone(local_tz).date().isoformat()
+            dt = datetime.fromisoformat(str(row['fecha']).replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt.astimezone(local_tz).date().isoformat() != today:
+                continue
         except (TypeError, ValueError, OverflowError):
             continue
-        if bonus_day != today:
-            continue
-        if bonus_row['tipo'] == 'bono_referido':
-            direct += float(bonus_row['monto'] or 0)
-        elif bonus_row['tipo'] == 'bono_referido_multinivel':
-            multilevel += float(bonus_row['monto'] or 0)
+        if row['tipo'] == 'bono_referido':
+            direct += float(row['monto'] or 0)
+        elif row['tipo'] == 'bono_referido_multinivel':
+            indirect += float(row['monto'] or 0)
 
     fund_amount = float(fund['monto'] or 0)
     active_capital = float(active['capital'] or 0)
     rate = float(rate_decimal) if rate_decimal is not None else get_current_quota_decimal()
+    daily_payments = active_capital * rate
     pending_amount = float(pending_wd or 0)
     direct_amount = float(direct or 0)
-    multilevel_amount = float(multilevel or 0)
-    daily_cost = active_capital * rate
-    referral_total = direct_amount + multilevel_amount
-    total_outgoing = daily_cost + pending_amount + referral_total
-    available_after = fund_amount - total_outgoing
+    indirect_amount = float(indirect or 0)
+    total_outgoing = daily_payments + pending_amount + direct_amount + indirect_amount
+    reserve_today = fund_amount * 0.03
+    previous_reserve = float(prior_reserve or 0)
+    reserve_accumulated = previous_reserve + reserve_today
+    # Las reservas de días anteriores ya se separaron; solo se resta la reserva nueva de hoy.
+    net_tomorrow = fund_amount - total_outgoing - reserve_today
+    minimum_target = fund_amount * 1.15
+    # Cuota más alta disponible que deja cubiertas las salidas y la reserva del 3%.
+    funds_for_daily_payments = fund_amount - pending_amount - direct_amount - indirect_amount - reserve_today
+    recommended_rate = None
+    if active_capital > 0:
+        eligible = [r for r in DAILY_QUOTA_OPTIONS if active_capital * (r / 100.0) <= funds_for_daily_payments + 1e-9]
+        if eligible:
+            recommended_rate = max(eligible) / 100.0
+    elif funds_for_daily_payments >= 0:
+        recommended_rate = rate
 
-    # El 3% se calcula sobre el fondo externo actualizado que introdujo el administrador.
-    # El saldo neto del día (fondo menos salidas) se conserva como referencia para mañana.
-    reserve_minimum = fund_amount * 0.03
-    previous_reserve_total = float(previous_reserve_row['total'] or 0)
-    cumulative_reserve = previous_reserve_total + reserve_minimum
-    previous_reference = None
-    previous_reference_date = None
-    previous_reference_estimated = False
-    if previous:
-        previous_reference_date = str(previous['fecha'])
-        if previous['saldo_cierre'] is not None:
-            previous_reference = float(previous['saldo_cierre'] or 0)
-        else:
-            # Los registros antiguos de V44 no guardaban saldo neto; usar su fondo declarado
-            # como referencia inicial de transición y señalarlo en el reporte.
-            previous_reference = float(previous['monto'] or 0)
-            previous_reference_estimated = True
-    required_closing = (previous_reference + reserve_minimum) if previous_reference is not None else reserve_minimum
-    reserve_margin = available_after - required_closing
-
-    if fund_amount <= 0:
-        status = '🔴 El fondo declarado debe ser mayor que cero.'
-    elif available_after < 0:
-        status = '🔴 El fondo declarado no alcanza para cubrir todos los importes mostrados.'
-    elif previous_reference is None:
-        status = '🟡 Primera evaluación: se guardará el saldo neto de hoy como referencia. Desde el próximo día se comprobará si se conserva esa referencia más la reserva mínima del 3%.'
-    elif reserve_margin < -0.005:
-        status = f'⚠️ Reserva por debajo del mínimo: faltan {money(abs(reserve_margin))} USDT para conservar la referencia anterior más el 3% del fondo actualizado.'
-    else:
-        status = f'🟢 Sostenibilidad correcta: después de las salidas se conserva la referencia anterior y la reserva mínima del 3%. Margen sobre el mínimo: {money(reserve_margin)} USDT.'
-
-    # Persistir el cierre calculado con la cuota vigente. Las cuotas elegidas desde
-    # los botones solo son vistas previas y no deben cambiar la referencia guardada.
     if rate_decimal is None:
         conn = db()
         try:
-            conn.execute("UPDATE fondos_diarios SET saldo_cierre=? WHERE fecha=?", (available_after, today))
+            conn.execute(
+                "UPDATE fondos_diarios SET saldo_cierre=? WHERE fecha=?",
+                (net_tomorrow, today)
+            )
             conn.commit()
         finally:
             conn.close()
 
+    if fund_amount <= 0:
+        status = '🔴 El fondo declarado debe ser mayor que cero.'
+    elif net_tomorrow < -0.005:
+        status = '⚠️ El fondo no cubre todas las salidas y la reserva del 3%.'
+    else:
+        status = '🟢 Cálculo actualizado.'
     return {
         'date': today, 'fund': fund_amount, 'active_count': int(active['c'] or 0),
         'active_capital': active_capital, 'direct': direct_amount,
-        'multilevel': multilevel_amount, 'referral_total': referral_total,
-        'pending_wd': pending_amount, 'rate': rate, 'daily_cost': daily_cost,
-        'total_outgoing': total_outgoing, 'available_after': available_after,
-        'reserve_minimum': reserve_minimum,
-        'previous_reserve_total': previous_reserve_total,
-        'cumulative_reserve': cumulative_reserve,
-        'available_tomorrow': available_after,
-        'previous_reference': previous_reference,
-        'previous_reference_date': previous_reference_date,
-        'previous_reference_estimated': previous_reference_estimated,
-        'required_closing': required_closing, 'reserve_margin': reserve_margin,
-        'status': status,
+        'indirect': indirect_amount, 'pending_wd': pending_amount,
+        'rate': rate, 'daily_cost': daily_payments,
+        'total_outgoing': total_outgoing, 'reserve_minimum': reserve_today,
+        'previous_reserve_total': previous_reserve,
+        'cumulative_reserve': reserve_accumulated,
+        'available_after': fund_amount - total_outgoing,
+        'available_tomorrow': net_tomorrow, 'minimum_target': minimum_target,
+        'recommended_rate': recommended_rate, 'status': status,
     }
-
 
 def sustainability_keyboard():
     buttons=[]; row=[]
@@ -2236,38 +2215,30 @@ async def show_sustainability_panel(query, rate_decimal=None):
     if report is None:
         await query.edit_message_text(
             "📊 *SOSTENIBILIDAD ECONÓMICA*\n\n"
-            f"⚠️ Falta registrar el fondo real de la billetera externa para hoy (*{local_today_str()}*).\n\n"
-            "Introduce el saldo total actual en USDT. Sin ese dato, no se mostrará una evaluación de sostenibilidad.\n\n"
-            "Envía solo el número, por ejemplo: `12500.75`",
+            f"⚠️ Falta registrar el fondo real de hoy (*{local_today_str()}*).\n\n"
+            "Introduce el total actual de la billetera externa en USDT.\n"
+            "Ejemplo: `12500.75`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Introducir fondo de hoy", callback_data="sustain_enter_fund")], [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
         )
         return
     rate = report['rate']
     lines = [
-        "📊 *SOSTENIBILIDAD ECONÓMICA*", f"📅 Fecha del fondo: *{report['date']}*",
-        f"💼 Fondo externo declarado hoy: *{money(report['fund'])} USDT*",
-        f"📈 Total invertido en planes activos: *{money(report['active_capital'])} USDT* ({report['active_count']} planes)",
-        f"📊 Cuota seleccionada para hoy: *{quota_label(rate) if rate else 'Selecciona una cuota abajo'}*",
-        f"💵 Total a pagar hoy por cuotas: *{money(report['daily_cost'])} USDT*", "",
-        "*Otros importes a descontar*",
+        "📊 *SOSTENIBILIDAD ECONÓMICA*",
+        f"📅 Fecha: *{report['date']}*",
+        f"💼 Total introducido por el administrador: *{money(report['fund'])} USDT*",
+        f"📈 Total invertido en planes activos: *{money(report['active_capital'])} USDT*",
+        f"💵 Total de pagos diarios ({quota_label(rate) if rate else 'cuota sin seleccionar'}): *{money(report['daily_cost'])} USDT*",
         f"📤 Total de retiros pendientes: *{money(report['pending_wd'])} USDT*",
-        f"🎁 Total de bonos directos registrados: *{money(report['direct'])} USDT*",
-        f"🌐 Total de bonos indirectos/multinivel registrados: *{money(report['multilevel'])} USDT*",
-        f"🎁 Total de bonos directos e indirectos: *{money(report['referral_total'])} USDT*", "",
-        f"📉 *Total de salidas calculadas: {money(report['total_outgoing'])} USDT*",
-        f"💰 *Saldo neto estimado después de las salidas: {money(report['available_after'])} USDT*",
-        f"🚀 *Total disponible para operar mañana: {money(report['available_tomorrow'])} USDT*", "",
-        "*Control de reserva del 3%*",
-        f"🛡️ Reserva del día (3% del fondo actualizado): *{money(report['reserve_minimum'])} USDT*",
-        f"📚 Reserva acumulada hasta el día anterior: *{money(report['previous_reserve_total'])} USDT*",
-        f"🏦 *Reserva acumulada total (días anteriores + hoy): {money(report['cumulative_reserve'])} USDT*",
-        (f"📚 Referencia neta anterior ({report['previous_reference_date']}): *{money(report['previous_reference'])} USDT*" if report['previous_reference'] is not None else "📚 Referencia neta anterior: *aún no disponible; hoy se establecerá la primera referencia*"),
-        ("ℹ️ La referencia anterior se estima con el fondo bruto porque ese registro histórico no guardaba el saldo neto." if report['previous_reference_estimated'] else ""),
-        (f"🎯 Saldo mínimo requerido después de salidas: *{money(report['required_closing'])} USDT*" if report['previous_reference'] is not None else f"🎯 Reserva mínima inicial: *{money(report['required_closing'])} USDT*"),
-        (f"📊 Margen frente al mínimo: *{money(report['reserve_margin'])} USDT*" if report['previous_reference'] is not None else ""), "",
+        f"🎁 Bono directo: *{money(report['direct'])} USDT*",
+        f"🌐 Bono indirecto: *{money(report['indirect'])} USDT*",
+        f"📉 *Total de salidas: {money(report['total_outgoing'])} USDT*",
+        f"🛡️ Reserva de hoy (3%): *{money(report['reserve_minimum'])} USDT*",
+        f"🏦 *Reserva acumulada: {money(report['cumulative_reserve'])} USDT*",
+        f"💰 *Neto para operar mañana: {money(report['available_tomorrow'])} USDT*",
+        f"🎯 *OBJETIVO MÍNIMO PARA MAÑANA (+15%): {money(report['minimum_target'])} USDT*",
+        "",
         report['status'],
-        "ℹ️ Los bonos directos e indirectos mostrados son los generados y registrados hoy por nuevas inversiones elegibles; los bonos de fechas anteriores no se vuelven a sumar en este cálculo. El saldo neto disponible para operar mañana se guarda como referencia para el próximo día. La reserva acumulada suma el 3% del fondo registrado en cada fecha; si se vuelve a actualizar el fondo del mismo día, ese día se cuenta una sola vez."
     ]
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=sustainability_keyboard())
 
@@ -4007,16 +3978,15 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         today = local_today_str()
         conn = db()
-        # Se permiten saldos menores que los días anteriores: el control de reserva
-        # debe advertir del déficit, no impedir registrar el saldo real.
-        conn.execute("""
-            INSERT INTO fondos_diarios(fecha,monto,registrado_por,fecha_registro)
-            VALUES(?,?,?,?)
-            ON CONFLICT(fecha) DO UPDATE SET
-                monto=excluded.monto,
-                registrado_por=excluded.registrado_por,
-                fecha_registro=excluded.fecha_registro
-        """, (today, amount, update.effective_user.id, now_iso()))
+        previous = conn.execute("SELECT fecha, monto FROM fondos_diarios WHERE fecha < ? ORDER BY fecha DESC LIMIT 1", (today,)).fetchone()
+        if previous and amount <= float(previous["monto"] or 0):
+            conn.close()
+            await update.message.reply_text(
+                f"⚠️ El fondo declarado para hoy debe ser mayor que el último fondo registrado ({money(float(previous['monto'] or 0))} USDT, fecha {previous['fecha']}).\n\n"
+                "Introduce el saldo real actualizado de la billetera. No declares una cifra mayor si el dinero no existe realmente.",
+                parse_mode="Markdown")
+            return
+        conn.execute("INSERT OR REPLACE INTO fondos_diarios(fecha,monto,registrado_por,fecha_registro) VALUES(?,?,?,?)", (today, amount, update.effective_user.id, now_iso()))
         conn.commit(); conn.close()
         context.user_data.pop("await_sustainability_fund", None)
         await update.message.reply_text(f"✅ Fondo diario registrado: *{money(amount)} USDT* para {today}.", parse_mode="Markdown", reply_markup=admin_keyboard())
