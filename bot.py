@@ -2071,7 +2071,7 @@ def local_today_str():
 
 
 def sustainability_report(rate_decimal=None):
-    """Estimación informativa basada en el saldo externo declarado hoy."""
+    """Evalúa el fondo declarado para hoy, reservando el 3% del fondo de hoy."""
     today = local_today_str()
     conn = db()
     fund = conn.execute("SELECT monto, fecha_registro FROM fondos_diarios WHERE fecha=?", (today,)).fetchone()
@@ -2091,22 +2091,32 @@ def sustainability_report(rate_decimal=None):
         FROM inversiones WHERE estado='activa'
     """).fetchone()['total']
     conn.close()
+
     fund_amount = float(fund['monto'] or 0)
     active_capital = float(active['capital'] or 0)
     rate = float(rate_decimal) if rate_decimal is not None else get_current_quota_decimal()
+    reserve_minimum = fund_amount * 0.03
+    pending_amount = float(pending_wd or 0)
+    spendable_for_profit = max(0.0, fund_amount - reserve_minimum - pending_amount)
     daily_cost = active_capital * rate
-    available_after = fund_amount - float(pending_wd or 0) - daily_cost
+    available_after = fund_amount - pending_amount - daily_cost
+    eligible_rates = [round(x / 100.0, 6) for x in DAILY_QUOTA_OPTIONS
+                      if active_capital * (x / 100.0) <= spendable_for_profit + 1e-9]
+    recommended_rate = max(eligible_rates) if eligible_rates else None
+
     if fund_amount <= 0:
-        status = '⚠️ El fondo declarado es 0; revisa el dato.'
-    elif available_after < 0:
-        status = '🔴 El pago diario estimado más los retiros pendientes supera el fondo declarado.'
+        status = '🔴 El fondo declarado debe ser mayor que cero.'
+    elif available_after < reserve_minimum - 1e-9:
+        status = '🔴 Esta cuota no es sostenible para hoy: dejaría el fondo por debajo de la reserva mínima del 3%.'
     else:
-        status = '🟢 El fondo declarado cubriría el pago diario estimado y los retiros pendientes; esto no garantiza sostenibilidad futura.'
+        status = '🟢 Esta cuota conserva la reserva mínima del 3% para hoy. Esto no garantiza sostenibilidad futura.'
     return {'date':today,'fund':fund_amount,'active_count':int(active['c'] or 0),
         'active_capital':active_capital,'credited':float(credited or 0),'approved_deposits':float(approved_deposits or 0),'paid_withdrawals':float(paid_withdrawals or 0),'direct':float(direct or 0),
-        'multilevel':float(multilevel or 0),'pending_wd':float(pending_wd or 0),
+        'multilevel':float(multilevel or 0),'pending_wd':pending_amount,
         'user_balances':float(user_balances or 0),'remaining':float(remaining or 0),
-        'rate':rate,'daily_cost':daily_cost,'available_after':available_after,'status':status}
+        'rate':rate,'daily_cost':daily_cost,'available_after':available_after,
+        'reserve_minimum':reserve_minimum,'spendable_for_profit':spendable_for_profit,
+        'recommended_rate':recommended_rate,'status':status}
 
 
 def sustainability_keyboard():
@@ -2141,7 +2151,9 @@ async def show_sustainability_panel(query, rate_decimal=None):
         f"📊 Cuota evaluada: *{quota_label(rate) if rate else 'Selecciona una cuota abajo'}*",
         f"💵 Coste diario estimado: *{money(report['daily_cost'])} USDT*",
         f"📤 Retiros pendientes: *{money(report['pending_wd'])} USDT*",
-        f"🧮 Fondo tras cuota estimada y retiros pendientes: *{money(report['available_after'])} USDT*", "",
+        f"🛡️ Reserva mínima diaria (3% del fondo de hoy): *{money(report['reserve_minimum'])} USDT*",
+        f"🧮 Fondo tras cuota estimada y retiros pendientes: *{money(report['available_after'])} USDT*",
+        f"💡 Cuota máxima disponible que respeta la reserva: *{quota_label(report['recommended_rate']) if report['recommended_rate'] else 'ninguna de las cuotas disponibles'}*", "",
         "*Datos acumulados del sistema*",
         f"🎁 Bonos directos registrados: *{money(report['direct'])} USDT*",
         f"🌐 Bonos multinivel registrados: *{money(report['multilevel'])} USDT*",
@@ -2186,6 +2198,24 @@ async def process_quota_callback(query, context, rate_decimal):
         return
     if rate_decimal not in [round(x/100.0, 6) for x in DAILY_QUOTA_OPTIONS]:
         await query.answer("Cuota no disponible.", show_alert=True); return
+    report = sustainability_report(rate_decimal)
+    if report is None:
+        await query.answer("Primero debes registrar el fondo real de la billetera de hoy.", show_alert=True)
+        await show_daily_quotas(query)
+        return
+    if float(report["fund"]) <= 0:
+        await query.answer("El fondo debe ser mayor que cero.", show_alert=True)
+        await show_daily_quotas(query)
+        return
+    if float(report["active_capital"]) > 0 and float(report["available_after"]) < float(report["reserve_minimum"]) - 1e-9:
+        recommended = report["recommended_rate"]
+        rec_text = quota_label(recommended) if recommended else "ninguna de las cuotas disponibles"
+        await query.answer(
+            f"Cuota bloqueada: no conserva el 3% de reserva. Cuota máxima recomendada: {rec_text}.",
+            show_alert=True
+        )
+        await show_sustainability_panel(query, rate_decimal)
+        return
     processed, total, credited, already, details_or_status = process_daily_quota(rate_decimal)
     if already:
         await query.edit_message_text("⚠️ *PAGO DIARIO YA REALIZADO*\n\nLa acreditación de hoy ya fue ejecutada. No se volverá a pagar una segunda vez el mismo día.", parse_mode="Markdown", reply_markup=back_inline())
@@ -3283,6 +3313,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("calcquota_"):
+        if get_today_wallet_fund() is None:
+            await query.answer("Primero debes registrar el fondo real de la billetera de hoy.", show_alert=True)
+            await show_daily_payment_info(query, context)
+            return
         try:
             code = int(data.rsplit("_", 1)[1])
             rate_decimal = code / 10000.0
@@ -3865,12 +3899,20 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             amount = float(text.strip().replace(" ", "").replace(",", "."))
-            if amount < 0 or not math.isfinite(amount): raise ValueError
+            if amount <= 0 or not math.isfinite(amount): raise ValueError
         except (ValueError, TypeError):
-            await update.message.reply_text("⚠️ Importe inválido. Envía un número igual o mayor que cero, por ejemplo `12500.75`, o escribe /cancelar.", parse_mode="Markdown")
+            await update.message.reply_text("⚠️ Importe inválido. Envía un fondo mayor que cero, por ejemplo `12500.75`, o escribe /cancelar.", parse_mode="Markdown")
             return
         today = local_today_str()
         conn = db()
+        previous = conn.execute("SELECT fecha, monto FROM fondos_diarios WHERE fecha < ? ORDER BY fecha DESC LIMIT 1", (today,)).fetchone()
+        if previous and amount <= float(previous["monto"] or 0):
+            conn.close()
+            await update.message.reply_text(
+                f"⚠️ El fondo declarado para hoy debe ser mayor que el último fondo registrado ({money(float(previous['monto'] or 0))} USDT, fecha {previous['fecha']}).\n\n"
+                "Introduce el saldo real actualizado de la billetera. No declares una cifra mayor si el dinero no existe realmente.",
+                parse_mode="Markdown")
+            return
         conn.execute("INSERT OR REPLACE INTO fondos_diarios(fecha,monto,registrado_por,fecha_registro) VALUES(?,?,?,?)", (today, amount, update.effective_user.id, now_iso()))
         conn.commit(); conn.close()
         context.user_data.pop("await_sustainability_fund", None)
