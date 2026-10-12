@@ -2062,6 +2062,26 @@ async def show_admin_investment_history(query, telegram_id):
     lines += ["━━━━━━━━━━━━", f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
     await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
 
+def get_today_wallet_fund():
+    """Devuelve el fondo registrado para la fecha local actual, o None si falta."""
+    today = local_today_str()
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT monto FROM fondos_diarios WHERE fecha = ?",
+            (today,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            amount = float(row["monto"] or 0)
+        except (TypeError, ValueError):
+            return None
+        return amount if math.isfinite(amount) and amount > 0 else None
+    finally:
+        conn.close()
+
+
 def local_today_str():
     try:
         tz = ZoneInfo(PROFIT_TIMEZONE)
