@@ -1,4 +1,5 @@
 import os
+import math
 import sqlite3
 import shutil
 import uuid
@@ -65,6 +66,7 @@ WITHDRAWAL_FEE_RATE = 0.03  # comisión de retiro: 3%
 WITHDRAWAL_INTERVAL_DAYS = 7
 REFERRAL_BONUS_FIRST_RATE = float(os.getenv("REFERRAL_BONUS_FIRST_RATE", "0.03") or "0.03")
 REFERRAL_BONUS_SECOND_RATE = float(os.getenv("REFERRAL_BONUS_SECOND_RATE", "0.015") or "0.015")
+REFERRAL_MULTILEVEL_BONUS_RATE = 0.001  # 0,1% del primer plan invertido, niveles descendientes 5-15 relativos al beneficiario.
 # Compatibilidad: el porcentaje histórico principal queda apuntando al primero.
 REFERRAL_BONUS_RATE = REFERRAL_BONUS_FIRST_RATE
 ADMIN_WALLET_URL = os.getenv("ADMIN_WALLET_URL", "").strip()
@@ -218,8 +220,29 @@ def init_db():
         )
     """)
 
+    # Bonificaciones multinivel: una sola acreditación por usuario referido y beneficiario.
+    # Esta tabla se crea automáticamente sin alterar las tablas ni los registros existentes.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bonos_multinivel (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referido_id INTEGER NOT NULL,
+            beneficiario_id INTEGER NOT NULL,
+            inversion_id INTEGER NOT NULL,
+            monto REAL NOT NULL DEFAULT 0,
+            fecha TEXT NOT NULL,
+            UNIQUE(referido_id, beneficiario_id)
+        )
+    """)
+
     cur.execute("CREATE TABLE IF NOT EXISTS sistema (clave TEXT PRIMARY KEY, valor TEXT NOT NULL DEFAULT '')")
     cur.execute("CREATE TABLE IF NOT EXISTS pagos_diarios (fecha TEXT PRIMARY KEY, fecha_proceso TEXT NOT NULL, total REAL NOT NULL DEFAULT 0, inversiones INTEGER NOT NULL DEFAULT 0)")
+    # Saldo diario declarado por el administrador para la billetera externa.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS fondos_diarios (
+            fecha TEXT PRIMARY KEY, monto REAL NOT NULL CHECK(monto >= 0),
+            registrado_por INTEGER NOT NULL, fecha_registro TEXT NOT NULL
+        )
+    """)
     try:
         cur.execute("ALTER TABLE pagos_diarios ADD COLUMN cuota REAL NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
@@ -710,6 +733,7 @@ def admin_keyboard():
         ["💾 Crear respaldo", "♻️ Restaurar respaldo"],
         ["🔒 Bloquear bot", "🔓 Desbloquear bot"],
         ["💰 Pago Diario", "📊 Cuotas Diarias"],
+        ["📊 Sostenibilidad Económica"],
         ["📜 Historial General"],
         ["📊 Estado"],
         ["📢 Enviar mensaje"],
@@ -969,6 +993,74 @@ def credit_referral_bonus(conn, referred_user_id, investment_amount, investment_
     return bonus, int(referrer["telegram_id"]), activation_number
 
 
+def credit_multilevel_referral_bonuses(conn, referred_user_id, investment_amount, investment_id):
+    """Acredita 0,1% del primer plan a cada antepasado situado a 4-14 enlaces.
+    Así, el nivel 1 recibe por descendientes de niveles 5-15, el nivel 2 por 6-16, etc.
+    Solo se paga una vez por pareja referido/beneficiario.
+    """
+    activation_number = conn.execute(
+        "SELECT COUNT(*) AS c FROM inversiones WHERE telegram_id=? AND id<=?",
+        (referred_user_id, investment_id)
+    ).fetchone()["c"]
+    if activation_number != 1:
+        return []
+
+    row = conn.execute(
+        "SELECT referido_por FROM usuarios WHERE telegram_id=?",
+        (referred_user_id,)
+    ).fetchone()
+    if not row or not row["referido_por"]:
+        return []
+
+    bonuses = []
+    current_code = row["referido_por"]
+    seen = {int(referred_user_id)}
+    distance = 1
+    while current_code and distance <= 14:
+        ancestor = conn.execute(
+            "SELECT telegram_id, referido_por FROM usuarios WHERE codigo_referido=?",
+            (current_code,)
+        ).fetchone()
+        if not ancestor:
+            break
+        beneficiary_id = int(ancestor["telegram_id"])
+        if beneficiary_id in seen:
+            break
+        seen.add(beneficiary_id)
+
+        # El usuario que invita es nivel 1; su referido directo es nivel 2.
+        # Por eso los niveles 5-15 están a 4-14 enlaces del beneficiario.
+        if 4 <= distance <= 14:
+            bonus = round(float(investment_amount) * REFERRAL_MULTILEVEL_BONUS_RATE, 2)
+            if bonus > 0:
+                cur = conn.execute("""
+                    INSERT OR IGNORE INTO bonos_multinivel
+                    (referido_id, beneficiario_id, inversion_id, monto, fecha)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (referred_user_id, beneficiary_id, investment_id, bonus, now_iso()))
+                if cur.rowcount == 1:
+                    conn.execute("""
+                        UPDATE usuarios
+                        SET saldo=saldo+?, ganancias_disponibles=ganancias_disponibles+?,
+                            ganancias=ganancias+?
+                        WHERE telegram_id=?
+                    """, (bonus, bonus, bonus, beneficiary_id))
+                    conn.execute("""
+                        INSERT INTO movimientos
+                        (telegram_id, tipo, monto, descripcion, fecha)
+                        VALUES (?, 'bono_referido_multinivel', ?, ?, ?)
+                    """, (
+                        beneficiary_id, bonus,
+                        f"Bono multinivel 0,1% por primer plan del referido {referred_user_id}, inversión #{investment_id}, distancia {distance}",
+                        now_iso()
+                    ))
+                    bonuses.append((beneficiary_id, bonus, distance))
+        current_code = ancestor["referido_por"]
+        distance += 1
+
+    return bonuses
+
+
 async def perform_reinvestment(query, amount):
     user_id = query.from_user.id
     if amount not in INVESTMENT_PLANS or amount < MIN_INVESTMENT:
@@ -984,12 +1076,23 @@ async def perform_reinvestment(query, amount):
     investment_id=cur.lastrowid
     conn.execute("UPDATE usuarios SET saldo=saldo-?, ganancias_disponibles=ganancias_disponibles-? WHERE telegram_id=?",(amount,amount,user_id))
     bonus, referrer_id, referral_plan_number=credit_referral_bonus(conn,user_id,amount,investment_id)
+    multilevel_bonuses = credit_multilevel_referral_bonuses(conn, user_id, amount, investment_id)
     conn.commit(); conn.close()
     add_movement(user_id,"reinversion",amount,f"Reinversión de ganancias: Plan {money(amount)} USDT")
     if bonus and referrer_id:
         try:
             await query.get_bot().send_message(chat_id=referrer_id,text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por el *Plan {referral_plan_number}* de *{money(amount)} USDT* realizado por un usuario que se registró con tu enlace."),parse_mode="Markdown")
         except Exception as e: print(f"Error notificando bono: {e}")
+    for beneficiary_id, multilevel_bonus, distance in multilevel_bonuses:
+        try:
+            await query.get_bot().send_message(
+                chat_id=beneficiary_id,
+                text=("🎁 *BONO MULTINIVEL ACREDITADO*\\n\\n"
+                      f"Has recibido *{money(multilevel_bonus)} USDT* (0,1%) por el primer plan de inversión de un usuario de tu red, situado a {distance} niveles de distancia."),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Error notificando bono multinivel: {e}")
     await query.edit_message_text(
         "✅ *REINVERSIÓN CREADA*\n\n"
         f"Plan: *{money(amount)} USDT*\n"
@@ -1029,8 +1132,9 @@ async def show_referrals(query, context):
     ).fetchone()["c"]
 
     bonus = conn.execute(
-        "SELECT COALESCE(SUM(bono), 0) AS total "
-        "FROM referidos WHERE referidor_id = ?",
+        "SELECT COALESCE(SUM(monto), 0) AS total "
+        "FROM movimientos WHERE telegram_id = ? "
+        "AND tipo IN ('bono_referido', 'bono_referido_multinivel')",
         (user_id,)
     ).fetchone()["total"]
     conn.close()
@@ -1057,8 +1161,9 @@ async def show_referrals(query, context):
         f"`{link}`\n\n"
         f"👥 Personas registradas: *{count}*\n"
         f"🎁 Bonos acumulados: *{money(bonus)} USDT*\n"
-        f"📈 Bonificación por inversión referida: *Plan 1 = {REFERRAL_BONUS_FIRST_RATE*100:.2f}%* y *Plan 2 = {REFERRAL_BONUS_SECOND_RATE*100:.2f}%*.\n\n"
-        "La bonificación se acredita cuando el usuario referido realiza la inversión, no cuando solamente deposita. Desde el tercer plan no se genera bono.\n\n"
+        f"📈 Bonificación directa: *Plan 1 = {REFERRAL_BONUS_FIRST_RATE*100:.2f}%* y *Plan 2 = {REFERRAL_BONUS_SECOND_RATE*100:.2f}%*.\n"
+        "🎁 Bonificación multinivel adicional: *0,1% del primer plan invertido* de los usuarios situados entre los niveles 5 y 15 de tu red.\n\n"
+        "La bonificación se acredita cuando el plan se invierte, no cuando solamente se deposita.\n\n"
         "Comparte el enlace para que otros puedan registrarse usando tu referencia."
     )
 
@@ -1099,7 +1204,7 @@ async def show_info(query):
         "🔹 *REINVERSIÓN*\nPuedes reinvertir el saldo acumulado de tus ganancias como un nuevo plan cuando alcances el mínimo de *50 USDT*.",
         "🔹 *TRANSFERENCIAS INTERNAS*\nNo existe transferencia de saldo entre usuarios dentro del sistema.",
         "🔹 *DEPÓSITOS Y RED*\nLos depósitos se realizan en USDT mediante la red TRC20 y son revisados manualmente por el administrador.",
-        f"🔹 *REFERIDOS*\nEl primer plan que active un referido genera una bonificación del *{REFERRAL_BONUS_FIRST_RATE*100:.2f}%* y el segundo plan genera *{REFERRAL_BONUS_SECOND_RATE*100:.2f}%*. Desde el tercer plan no se genera bono.",
+        f"🔹 *REFERIDOS*\nEl primer plan que active un referido directo genera una bonificación del *{REFERRAL_BONUS_FIRST_RATE*100:.2f}%* y el segundo plan genera *{REFERRAL_BONUS_SECOND_RATE*100:.2f}%*. Además, puedes recibir un bono multinivel del *0,1% del primer plan invertido* por usuarios situados entre los niveles 5 y 15 de tu red.",
     ]
     texto = "ℹ️ *INFORMACIÓN DEL SISTEMA*\n\n" + "\n\n".join(temas)
     await query.edit_message_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
@@ -1259,8 +1364,20 @@ async def invest_available_plan(query, deposit_id):
     """, (amount, amount, user_id))
     conn.execute("UPDATE depositos SET inversion_id = ? WHERE id = ?", (investment_id, deposit_id))
     bonus, referrer_id, referral_plan_number = credit_referral_bonus(conn, user_id, amount, investment_id)
+    multilevel_bonuses = credit_multilevel_referral_bonuses(conn, user_id, amount, investment_id)
     conn.commit()
     conn.close()
+
+    for beneficiary_id, multilevel_bonus, distance in multilevel_bonuses:
+        try:
+            await query.get_bot().send_message(
+                chat_id=beneficiary_id,
+                text=("🎁 *BONO MULTINIVEL ACREDITADO*\\n\\n"
+                      f"Has recibido *{money(multilevel_bonus)} USDT* (0,1%) por el primer plan de inversión de un usuario de tu red, situado a {distance} niveles de distancia."),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Error notificando bono multinivel: {e}")
 
     add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT")
     if bonus and referrer_id:
@@ -1945,8 +2062,113 @@ async def show_admin_investment_history(query, telegram_id):
     lines += ["━━━━━━━━━━━━", f"💰 *CAPITAL HISTÓRICO INVERTIDO: {money(total)} USDT*"]
     await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
 
+def local_today_str():
+    try:
+        tz = ZoneInfo(PROFIT_TIMEZONE)
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz).date().isoformat()
+
+
+def sustainability_report(rate_decimal=None):
+    """Estimación informativa basada en el saldo externo declarado hoy."""
+    today = local_today_str()
+    conn = db()
+    fund = conn.execute("SELECT monto, fecha_registro FROM fondos_diarios WHERE fecha=?", (today,)).fetchone()
+    if not fund:
+        conn.close()
+        return None
+    active = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(capital),0) capital FROM inversiones WHERE estado='activa'").fetchone()
+    credited = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM movimientos WHERE tipo='ganancia'").fetchone()['total']
+    approved_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM depositos WHERE estado='aprobado'").fetchone()['total']
+    paid_withdrawals = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM retiros WHERE estado='aprobado'").fetchone()['total']
+    direct = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM movimientos WHERE tipo='bono_referido'").fetchone()['total']
+    multilevel = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM movimientos WHERE tipo='bono_referido_multinivel'").fetchone()['total']
+    pending_wd = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM retiros WHERE estado='pendiente'").fetchone()['total']
+    user_balances = conn.execute("SELECT COALESCE(SUM(saldo),0) total FROM usuarios").fetchone()['total']
+    remaining = conn.execute("""
+        SELECT COALESCE(SUM(MAX(0, capital * (multiplicador_objetivo - 1) - ganancia_acumulada)),0) total
+        FROM inversiones WHERE estado='activa'
+    """).fetchone()['total']
+    conn.close()
+    fund_amount = float(fund['monto'] or 0)
+    active_capital = float(active['capital'] or 0)
+    rate = float(rate_decimal) if rate_decimal is not None else get_current_quota_decimal()
+    daily_cost = active_capital * rate
+    available_after = fund_amount - float(pending_wd or 0) - daily_cost
+    if fund_amount <= 0:
+        status = '⚠️ El fondo declarado es 0; revisa el dato.'
+    elif available_after < 0:
+        status = '🔴 El pago diario estimado más los retiros pendientes supera el fondo declarado.'
+    else:
+        status = '🟢 El fondo declarado cubriría el pago diario estimado y los retiros pendientes; esto no garantiza sostenibilidad futura.'
+    return {'date':today,'fund':fund_amount,'active_count':int(active['c'] or 0),
+        'active_capital':active_capital,'credited':float(credited or 0),'approved_deposits':float(approved_deposits or 0),'paid_withdrawals':float(paid_withdrawals or 0),'direct':float(direct or 0),
+        'multilevel':float(multilevel or 0),'pending_wd':float(pending_wd or 0),
+        'user_balances':float(user_balances or 0),'remaining':float(remaining or 0),
+        'rate':rate,'daily_cost':daily_cost,'available_after':available_after,'status':status}
+
+
+def sustainability_keyboard():
+    buttons=[]; row=[]
+    for pct in DAILY_QUOTA_OPTIONS:
+        row.append(InlineKeyboardButton(DAILY_QUOTA_LABELS[pct], callback_data=f"sustain_{int(round(pct*100)):02d}"))
+        if len(row)==4:
+            buttons.append(row); row=[]
+    if row: buttons.append(row)
+    buttons.append([InlineKeyboardButton("✏️ Actualizar fondo de hoy", callback_data="sustain_enter_fund")])
+    buttons.append([InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def show_sustainability_panel(query, rate_decimal=None):
+    report = sustainability_report(rate_decimal)
+    if report is None:
+        await query.edit_message_text(
+            "📊 *SOSTENIBILIDAD ECONÓMICA*\n\n"
+            f"⚠️ Falta registrar el fondo real de la billetera externa para hoy (*{local_today_str()}*).\n\n"
+            "Introduce el saldo total actual en USDT. Sin ese dato, no se mostrará una evaluación de sostenibilidad.\n\n"
+            "Envía solo el número, por ejemplo: `12500.75`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Introducir fondo de hoy", callback_data="sustain_enter_fund")], [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
+        )
+        return
+    rate = report['rate']
+    lines = [
+        "📊 *SOSTENIBILIDAD ECONÓMICA*", f"📅 Fecha del fondo: *{report['date']}*",
+        f"💼 Fondo externo declarado hoy: *{money(report['fund'])} USDT*",
+        f"📈 Capital de inversiones activas: *{money(report['active_capital'])} USDT* ({report['active_count']} planes)",
+        f"📊 Cuota evaluada: *{quota_label(rate) if rate else 'Selecciona una cuota abajo'}*",
+        f"💵 Coste diario estimado: *{money(report['daily_cost'])} USDT*",
+        f"📤 Retiros pendientes: *{money(report['pending_wd'])} USDT*",
+        f"🧮 Fondo tras cuota estimada y retiros pendientes: *{money(report['available_after'])} USDT*", "",
+        "*Datos acumulados del sistema*",
+        f"🎁 Bonos directos registrados: *{money(report['direct'])} USDT*",
+        f"🌐 Bonos multinivel registrados: *{money(report['multilevel'])} USDT*",
+        f"📈 Ganancias acreditadas registradas: *{money(report['credited'])} USDT*",
+        f"💳 Saldos contabilizados de usuarios: *{money(report['user_balances'])} USDT*",
+        f"📌 Ganancias restantes estimadas en planes activos: *{money(report['remaining'])} USDT*", "",
+        "*Entradas y salidas registradas*",
+        f"📥 Depósitos aprobados registrados: *{money(report['approved_deposits'])} USDT* (no son beneficio automáticamente)",
+        f"💸 Retiros aprobados registrados: *{money(report['paid_withdrawals'])} USDT*",
+        "⚠️ Ingresos de trading y gastos externos: no verificables automáticamente con los datos actuales.", "",
+        report['status'],
+        "ℹ️ Estimación informativa: el saldo lo introduce el administrador y no se verifica automáticamente en la billetera. Los gastos externos no registrados no se incluyen."
+    ]
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=sustainability_keyboard())
+
+
 async def show_daily_quotas(query):
     current = get_current_quota_decimal()
+    if get_today_wallet_fund() is None:
+        await query.edit_message_text(
+            "⚠️ *FALTA REGISTRAR EL FONDO DE HOY*\n\n"
+            f"Antes de seleccionar la cuota diaria, el administrador debe registrar el saldo real de la billetera externa correspondiente a *{local_today_str()}*.\n\n"
+            "Después podrás consultar la sostenibilidad estimada desde el apartado *📊 Sostenibilidad Económica*.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Introducir fondo de hoy", callback_data="sustain_enter_fund")], [InlineKeyboardButton("📊 Sostenibilidad Económica", callback_data="admin_sustainability")], [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
+        )
+        return
     await query.edit_message_text(
         "📊 *CUOTAS DIARIAS*\n\n"
         f"Cuota configurada actualmente: *{quota_label(current) if current else 'Sin seleccionar'}*\n\n"
@@ -1958,6 +2180,10 @@ async def show_daily_quotas(query):
 
 
 async def process_quota_callback(query, context, rate_decimal):
+    if get_today_wallet_fund() is None:
+        await query.answer("Primero debes registrar el fondo real de la billetera de hoy.", show_alert=True)
+        await show_daily_quotas(query)
+        return
     if rate_decimal not in [round(x/100.0, 6) for x in DAILY_QUOTA_OPTIONS]:
         await query.answer("Cuota no disponible.", show_alert=True); return
     processed, total, credited, already, details_or_status = process_daily_quota(rate_decimal)
@@ -3018,6 +3244,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "admin_sustainability":
+        await show_sustainability_panel(query)
+        return
+
+    if data == "sustain_enter_fund":
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True); return
+        context.user_data["await_sustainability_fund"] = True
+        await query.edit_message_text(
+            "✏️ *REGISTRO DIARIO DEL FONDO EXTERNO*\n\n"
+            f"Fecha: *{local_today_str()}*\n"
+            "Consulta el saldo total real de la billetera y envía aquí el importe en USDT.\n\n"
+            "Ejemplo: `12500.75`\n\nEscribe /cancelar para salir.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_sustainability")]])
+        )
+        return
+
+    if data.startswith("sustain_") and data != "sustain_enter_fund":
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True); return
+        try:
+            code = int(data.rsplit("_", 1)[1]); rate_decimal = code / 10000.0
+        except ValueError:
+            await query.answer("Cuota inválida.", show_alert=True); return
+        if rate_decimal not in [round(x/100.0, 6) for x in DAILY_QUOTA_OPTIONS]:
+            await query.answer("Cuota no disponible.", show_alert=True); return
+        await show_sustainability_panel(query, rate_decimal)
+        return
+
     if data == "admin_quotas":
         await show_daily_quotas(query)
         return
@@ -3602,6 +3858,30 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    if is_admin(update.effective_user.id) and context.user_data.get("await_sustainability_fund"):
+        if text == "/cancelar":
+            context.user_data.pop("await_sustainability_fund", None)
+            await update.message.reply_text("❌ Registro cancelado.", reply_markup=admin_keyboard())
+            return
+        try:
+            amount = float(text.strip().replace(" ", "").replace(",", "."))
+            if amount < 0 or not math.isfinite(amount): raise ValueError
+        except (ValueError, TypeError):
+            await update.message.reply_text("⚠️ Importe inválido. Envía un número igual o mayor que cero, por ejemplo `12500.75`, o escribe /cancelar.", parse_mode="Markdown")
+            return
+        today = local_today_str()
+        conn = db()
+        conn.execute("INSERT OR REPLACE INTO fondos_diarios(fecha,monto,registrado_por,fecha_registro) VALUES(?,?,?,?)", (today, amount, update.effective_user.id, now_iso()))
+        conn.commit(); conn.close()
+        context.user_data.pop("await_sustainability_fund", None)
+        await update.message.reply_text(f"✅ Fondo diario registrado: *{money(amount)} USDT* para {today}.", parse_mode="Markdown", reply_markup=admin_keyboard())
+        class _SustainabilityTextQuery:
+            def __init__(self, message, user): self.message=message; self.from_user=user
+            async def edit_message_text(self, *args, **kwargs): return await update.message.reply_text(*args, **kwargs)
+            async def answer(self, *args, **kwargs): return None
+        await show_sustainability_panel(_SustainabilityTextQuery(update.message, update.effective_user))
+        return
+
     if not is_admin(update.effective_user.id):
         row = get_user(update.effective_user.id)
         if not row:
@@ -3785,7 +4065,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 Retiros": "admin_withdrawals", "📈 Inversiones": "admin_investments",
         "💾 Crear respaldo": "admin_backup", "♻️ Restaurar respaldo": "admin_restore",
         "🔒 Bloquear bot": "admin_lock", "🔓 Desbloquear bot": "admin_unlock",
-        "💰 Pago Diario": "admin_profit", "📊 Cuotas Diarias": "admin_quotas", "📜 Historial General": "admin_history_general",
+        "💰 Pago Diario": "admin_profit", "📊 Cuotas Diarias": "admin_quotas", "📊 Sostenibilidad Económica": "admin_sustainability", "📜 Historial General": "admin_history_general",
         # Compatibilidad con un teclado antiguo que Telegram pudiera conservar temporalmente.
         "📊 Ganancias Diarias": "admin_history_general",
         "📊 Estado": "admin_status",
@@ -3941,6 +4221,13 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_panel_action(update, context, action):
+    if action == "admin_sustainability":
+        class _SustainabilityTextQuery:
+            def __init__(self, message, user): self.message=message; self.from_user=user
+            async def edit_message_text(self, *args, **kwargs): return await update.message.reply_text(*args, **kwargs)
+            async def answer(self, *args, **kwargs): return None
+        await show_sustainability_panel(_SustainabilityTextQuery(update.message, update.effective_user))
+        return
     # Los botones inferiores del administrador muestran el mismo resumen
     # general que sus respectivos botones inline.
     if action == "admin_users":
