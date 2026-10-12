@@ -2156,10 +2156,19 @@ def sustainability_report(rate_decimal=None):
     previous_reserve = float(prior_reserve or 0)
     reserve_accumulated = previous_reserve + reserve_today
     # Las reservas de días anteriores ya se separaron; solo se resta la reserva nueva de hoy.
-    net_tomorrow = fund_amount - total_outgoing - reserve_today
+    # Validación de consistencia: el fondo declarado no puede respaldar menos capital
+    # que el total de inversiones activas. Si es inferior, se refleja el déficit
+    # frente al capital activo en el neto, en vez de mostrar un saldo positivo engañoso.
+    capital_shortfall = max(0.0, active_capital - fund_amount)
+    if capital_shortfall > 0.005:
+        net_tomorrow = fund_amount - active_capital - total_outgoing - reserve_today
+    else:
+        net_tomorrow = fund_amount - total_outgoing - reserve_today
     minimum_target = fund_amount * 1.15
-    # Cuota más alta disponible que deja cubiertas las salidas y la reserva del 3%.
+    # Si falta respaldo para el capital activo, no se recomienda ninguna cuota.
     funds_for_daily_payments = fund_amount - pending_amount - direct_amount - indirect_amount - reserve_today
+    if capital_shortfall > 0.005:
+        funds_for_daily_payments = -capital_shortfall - pending_amount - direct_amount - indirect_amount - reserve_today
     recommended_rate = None
     if active_capital > 0:
         eligible = [r for r in DAILY_QUOTA_OPTIONS if active_capital * (r / 100.0) <= funds_for_daily_payments + 1e-9]
@@ -2181,6 +2190,9 @@ def sustainability_report(rate_decimal=None):
 
     if fund_amount <= 0:
         status = '🔴 El fondo declarado debe ser mayor que cero.'
+    elif capital_shortfall > 0.005:
+        status = (f'🔴 DÉFICIT DE RESPALDO: el fondo declarado es inferior al capital activo '
+                  f'en {money(capital_shortfall)} USDT. Revisa el importe introducido.')
     elif net_tomorrow < -0.005:
         status = '⚠️ El fondo no cubre todas las salidas y la reserva del 3%.'
     else:
@@ -2194,6 +2206,7 @@ def sustainability_report(rate_decimal=None):
         'previous_reserve_total': previous_reserve,
         'cumulative_reserve': reserve_accumulated,
         'available_after': fund_amount - total_outgoing,
+        'capital_shortfall': capital_shortfall,
         'available_tomorrow': net_tomorrow, 'minimum_target': minimum_target,
         'recommended_rate': recommended_rate, 'status': status,
     }
@@ -2228,6 +2241,10 @@ async def show_sustainability_panel(query, rate_decimal=None):
         f"📅 Fecha: *{report['date']}*",
         f"💼 Total introducido por el administrador: *{money(report['fund'])} USDT*",
         f"📈 Total invertido en planes activos: *{money(report['active_capital'])} USDT*",
+    ]
+    if report['capital_shortfall'] > 0.005:
+        lines.append(f"🚨 *Déficit frente al capital activo: -{money(report['capital_shortfall'])} USDT*")
+    lines += [
         f"💵 Total de pagos diarios ({quota_label(rate) if rate else 'cuota sin seleccionar'}): *{money(report['daily_cost'])} USDT*",
         f"📤 Total de retiros pendientes: *{money(report['pending_wd'])} USDT*",
         f"🎁 Bono directo: *{money(report['direct'])} USDT*",
