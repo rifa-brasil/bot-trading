@@ -2102,8 +2102,34 @@ def sustainability_report(rate_decimal=None):
     credited = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM movimientos WHERE tipo='ganancia'").fetchone()['total']
     approved_deposits = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM depositos WHERE estado='aprobado'").fetchone()['total']
     paid_withdrawals = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM retiros WHERE estado='aprobado'").fetchone()['total']
-    direct = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM movimientos WHERE tipo='bono_referido'").fetchone()['total']
-    multilevel = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM movimientos WHERE tipo='bono_referido_multinivel'").fetchone()['total']
+    # Los bonos por referido se generan una sola vez cuando se crea una inversión
+    # que cumple las condiciones. Para la sostenibilidad diaria solo contamos los
+    # bonos efectivamente registrados en la fecha local de hoy; no se vuelven a
+    # sumar todos los bonos históricos cada vez que se abre esta pantalla.
+    bonus_rows = conn.execute(
+        "SELECT tipo, monto, fecha FROM movimientos "
+        "WHERE tipo IN ('bono_referido', 'bono_referido_multinivel')"
+    ).fetchall()
+    try:
+        local_tz = ZoneInfo(PROFIT_TIMEZONE)
+    except Exception:
+        local_tz = timezone.utc
+    direct = 0.0
+    multilevel = 0.0
+    for bonus_row in bonus_rows:
+        try:
+            bonus_dt = datetime.fromisoformat(str(bonus_row['fecha']).replace('Z', '+00:00'))
+            if bonus_dt.tzinfo is None:
+                bonus_dt = bonus_dt.replace(tzinfo=timezone.utc)
+            bonus_day = bonus_dt.astimezone(local_tz).date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if bonus_day != today:
+            continue
+        if bonus_row['tipo'] == 'bono_referido':
+            direct += float(bonus_row['monto'] or 0)
+        elif bonus_row['tipo'] == 'bono_referido_multinivel':
+            multilevel += float(bonus_row['monto'] or 0)
     pending_wd = conn.execute("SELECT COALESCE(SUM(monto),0) total FROM retiros WHERE estado='pendiente'").fetchone()['total']
     user_balances = conn.execute("SELECT COALESCE(SUM(saldo),0) total FROM usuarios").fetchone()['total']
     remaining = conn.execute("""
@@ -2115,28 +2141,26 @@ def sustainability_report(rate_decimal=None):
     fund_amount = float(fund['monto'] or 0)
     active_capital = float(active['capital'] or 0)
     rate = float(rate_decimal) if rate_decimal is not None else get_current_quota_decimal()
-    reserve_minimum = fund_amount * 0.03
     pending_amount = float(pending_wd or 0)
-    spendable_for_profit = max(0.0, fund_amount - reserve_minimum - pending_amount)
+    direct_amount = float(direct or 0)
+    multilevel_amount = float(multilevel or 0)
     daily_cost = active_capital * rate
-    available_after = fund_amount - pending_amount - daily_cost
-    eligible_rates = [round(x / 100.0, 6) for x in DAILY_QUOTA_OPTIONS
-                      if active_capital * (x / 100.0) <= spendable_for_profit + 1e-9]
-    recommended_rate = max(eligible_rates) if eligible_rates else None
+    referral_total = direct_amount + multilevel_amount
+    total_outgoing = daily_cost + pending_amount + referral_total
+    available_after = fund_amount - total_outgoing
 
     if fund_amount <= 0:
         status = '🔴 El fondo declarado debe ser mayor que cero.'
-    elif available_after < reserve_minimum - 1e-9:
-        status = '🔴 Esta cuota no es sostenible para hoy: dejaría el fondo por debajo de la reserva mínima del 3%.'
+    elif available_after < 0:
+        status = '🔴 El fondo declarado no alcanza para cubrir todos los importes mostrados.'
     else:
-        status = '🟢 Esta cuota conserva la reserva mínima del 3% para hoy. Esto no garantiza sostenibilidad futura.'
+        status = '🟢 El fondo declarado cubre los importes mostrados para esta evaluación.'
     return {'date':today,'fund':fund_amount,'active_count':int(active['c'] or 0),
-        'active_capital':active_capital,'credited':float(credited or 0),'approved_deposits':float(approved_deposits or 0),'paid_withdrawals':float(paid_withdrawals or 0),'direct':float(direct or 0),
-        'multilevel':float(multilevel or 0),'pending_wd':pending_amount,
-        'user_balances':float(user_balances or 0),'remaining':float(remaining or 0),
-        'rate':rate,'daily_cost':daily_cost,'available_after':available_after,
-        'reserve_minimum':reserve_minimum,'spendable_for_profit':spendable_for_profit,
-        'recommended_rate':recommended_rate,'status':status}
+        'active_capital':active_capital,'direct':direct_amount,
+        'multilevel':multilevel_amount,'referral_total':referral_total,
+        'pending_wd':pending_amount,'rate':rate,'daily_cost':daily_cost,
+        'total_outgoing':total_outgoing,'available_after':available_after,
+        'status':status}
 
 
 def sustainability_keyboard():
@@ -2167,25 +2191,18 @@ async def show_sustainability_panel(query, rate_decimal=None):
     lines = [
         "📊 *SOSTENIBILIDAD ECONÓMICA*", f"📅 Fecha del fondo: *{report['date']}*",
         f"💼 Fondo externo declarado hoy: *{money(report['fund'])} USDT*",
-        f"📈 Capital de inversiones activas: *{money(report['active_capital'])} USDT* ({report['active_count']} planes)",
-        f"📊 Cuota evaluada: *{quota_label(rate) if rate else 'Selecciona una cuota abajo'}*",
-        f"💵 Coste diario estimado: *{money(report['daily_cost'])} USDT*",
-        f"📤 Retiros pendientes: *{money(report['pending_wd'])} USDT*",
-        f"🛡️ Reserva mínima diaria (3% del fondo de hoy): *{money(report['reserve_minimum'])} USDT*",
-        f"🧮 Fondo tras cuota estimada y retiros pendientes: *{money(report['available_after'])} USDT*",
-        f"💡 Cuota máxima disponible que respeta la reserva: *{quota_label(report['recommended_rate']) if report['recommended_rate'] else 'ninguna de las cuotas disponibles'}*", "",
-        "*Datos acumulados del sistema*",
-        f"🎁 Bonos directos registrados: *{money(report['direct'])} USDT*",
-        f"🌐 Bonos multinivel registrados: *{money(report['multilevel'])} USDT*",
-        f"📈 Ganancias acreditadas registradas: *{money(report['credited'])} USDT*",
-        f"💳 Saldos contabilizados de usuarios: *{money(report['user_balances'])} USDT*",
-        f"📌 Ganancias restantes estimadas en planes activos: *{money(report['remaining'])} USDT*", "",
-        "*Entradas y salidas registradas*",
-        f"📥 Depósitos aprobados registrados: *{money(report['approved_deposits'])} USDT* (no son beneficio automáticamente)",
-        f"💸 Retiros aprobados registrados: *{money(report['paid_withdrawals'])} USDT*",
-        "⚠️ Ingresos de trading y gastos externos: no verificables automáticamente con los datos actuales.", "",
+        f"📈 Total invertido en planes activos: *{money(report['active_capital'])} USDT* ({report['active_count']} planes)",
+        f"📊 Cuota seleccionada para hoy: *{quota_label(rate) if rate else 'Selecciona una cuota abajo'}*",
+        f"💵 Total a pagar hoy por cuotas: *{money(report['daily_cost'])} USDT*", "",
+        "*Otros importes a descontar*",
+        f"📤 Total de retiros pendientes: *{money(report['pending_wd'])} USDT*",
+        f"🎁 Total de bonos directos registrados: *{money(report['direct'])} USDT*",
+        f"🌐 Total de bonos indirectos/multinivel registrados: *{money(report['multilevel'])} USDT*",
+        f"🎁 Total de bonos directos e indirectos: *{money(report['referral_total'])} USDT*", "",
+        f"📉 *Total de salidas calculadas: {money(report['total_outgoing'])} USDT*",
+        f"💰 *Total que queda disponible: {money(report['available_after'])} USDT*", "",
         report['status'],
-        "ℹ️ Estimación informativa: el saldo lo introduce el administrador y no se verifica automáticamente en la billetera. Los gastos externos no registrados no se incluyen."
+        "ℹ️ Los bonos directos e indirectos mostrados son los generados y registrados hoy por nuevas inversiones elegibles; los bonos de fechas anteriores no se vuelven a sumar en este cálculo. El fondo es introducido por el administrador."
     ]
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=sustainability_keyboard())
 
