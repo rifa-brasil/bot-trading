@@ -905,10 +905,23 @@ async def show_account(query):
         "SELECT COALESCE(SUM(monto), 0) AS s FROM retiros WHERE telegram_id=? AND estado='aprobado'",
         (user_id,)
     ).fetchone()["s"]
+    ganancias_diarias_db = conn.execute(
+        "SELECT COALESCE(SUM(monto),0) AS s FROM movimientos WHERE telegram_id=? AND tipo='ganancia'",
+        (user_id,)
+    ).fetchone()["s"]
+    bonos_directos_db = conn.execute(
+        "SELECT COALESCE(SUM(monto),0) AS s FROM movimientos WHERE telegram_id=? AND tipo='bono_referido'",
+        (user_id,)
+    ).fetchone()["s"]
+    bonos_indirectos_db = conn.execute(
+        "SELECT COALESCE(SUM(monto),0) AS s FROM movimientos WHERE telegram_id=? AND tipo='bono_referido_multinivel'",
+        (user_id,)
+    ).fetchone()["s"]
     conn.close()
     total_depositado = max(float(row["total_depositado"] or 0), float(total_depositado_db or 0))
     total_retirado = max(float(row["total_retirado"] or 0), float(total_retirado_db or 0))
-    ganancias = float(row["ganancias"] or 0)
+    ganancias_diarias = float(ganancias_diarias_db or 0)
+    bonos_referidos = float(bonos_directos_db or 0) + float(bonos_indirectos_db or 0)
     texto = (
         "👤 *MI CUENTA*\n\n"
         f"🆔 ID: `{row['telegram_id']}`\n"
@@ -917,8 +930,8 @@ async def show_account(query):
         f"💰 Saldo disponible: *{money(row['saldo'])} USDT*\n"
         f"📥 Total depositado: *{money(total_depositado)} USDT*\n"
         f"📈 Capital invertido: *{money(row['invertido'])} USDT*\n"
-        f"💵 Ganancias acumuladas: *{money(ganancias)} USDT*\n"
-        
+        f"💵 Total ganancias diarias: *{money(ganancias_diarias)} USDT*\n"
+        f"🎁 Total por bonos referidos: *{money(bonos_referidos)} USDT*\n"
         f"📤 Total retirado: *{money(total_retirado)} USDT*\n\n"
         "El saldo disponible es el dinero acreditado que todavía no está invertido y puede utilizarse según los planes disponibles."
     )
@@ -1874,6 +1887,8 @@ async def show_admin_history_menu(query):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Ganancias Diarias por ID", callback_data="admin_history_daily")],
+            [InlineKeyboardButton("🎁 Ganancias por Referidos Directos", callback_data="admin_history_ref_direct")],
+            [InlineKeyboardButton("🌐 Ganancias por Referidos Indirectos", callback_data="admin_history_ref_indirect")],
             [InlineKeyboardButton("📥 Depósitos por ID", callback_data="admin_history_deposits")],
             [InlineKeyboardButton("📤 Retiros por ID", callback_data="admin_history_withdrawals")],
             [InlineKeyboardButton("📈 Inversiones por ID", callback_data="admin_history_investments")],
@@ -1985,6 +2000,43 @@ async def show_admin_user_daily_gains(query, telegram_id):
         lines += ["", "━━━━━━━━━━━━", f"💵 *TOTAL DEL DÍA: {money(item['total'])} USDT*", ""]
     lines += ["━━━━━━━━━━━━", f"💰 *TOTAL HISTÓRICO DE GANANCIAS: {money(grand_total)} USDT*"]
     await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
+
+async def show_admin_referral_history(query, telegram_id, indirect=False):
+    """Muestra las acreditaciones históricas de bonos directos o indirectos de un usuario."""
+    user = _user_identity(telegram_id)
+    if not user:
+        await query.edit_message_text(
+            "⚠️ No se encontró ningún usuario con ese ID.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Historial General", callback_data="admin_history_general")]])
+        )
+        return
+    movement_type = "bono_referido_multinivel" if indirect else "bono_referido"
+    title = "GANANCIAS POR REFERIDOS INDIRECTOS" if indirect else "GANANCIAS POR REFERIDOS DIRECTOS"
+    conn = db()
+    rows = conn.execute(
+        "SELECT fecha,monto,descripcion FROM movimientos WHERE telegram_id=? AND tipo=? ORDER BY fecha ASC, id ASC",
+        (telegram_id, movement_type)
+    ).fetchall()
+    conn.close()
+    lines = [f"🎁 *HISTORIAL DE {title}*", "",
+             f"👤 Nombre: *{user['nombre'] or '-'}*",
+             f"👤 Usuario: @{user['username'] or '-'}",
+             f"🆔 ID: `{telegram_id}`", ""]
+    total = 0.0
+    if not rows:
+        lines.append("No tiene ganancias de este tipo registradas todavía.")
+    for row in rows:
+        amount = float(row["monto"] or 0)
+        total += amount
+        date_label, time_label = format_date_time(row["fecha"])
+        lines.extend(["🎁 *Bono acreditado*", f"📅 Fecha: *{date_label}*",
+                      f"🕐 Hora: *{time_label}*", f"💰 Monto: *{money(amount)} USDT*"])
+        if row["descripcion"]:
+            lines.append(f"📌 Detalle: {row['descripcion']}")
+        lines.append("")
+    lines.extend(["━━━━━━━━━━━━", f"💵 *TOTAL HISTÓRICO: {money(total)} USDT*"])
+    await _send_admin_history(query, "\n".join(lines), "admin_history_general", "Historial General")
+
 
 async def show_admin_deposit_history(query, telegram_id):
     user=_user_identity(telegram_id)
@@ -2114,44 +2166,21 @@ def sustainability_report(rate_decimal=None):
             "SELECT COALESCE(SUM(monto * 0.03), 0) total "
             "FROM fondos_diarios WHERE fecha < ?", (today,)
         ).fetchone()['total']
-        bonus_rows = conn.execute(
-            "SELECT tipo, monto, fecha FROM movimientos "
-            "WHERE tipo IN ('bono_referido', 'bono_referido_multinivel')"
-        ).fetchall()
         pending_wd = conn.execute(
             "SELECT COALESCE(SUM(monto),0) total FROM retiros WHERE estado='pendiente'"
         ).fetchone()['total']
     finally:
         conn.close()
 
-    try:
-        local_tz = ZoneInfo(PROFIT_TIMEZONE)
-    except Exception:
-        local_tz = timezone.utc
-    direct = 0.0
-    indirect = 0.0
-    for row in bonus_rows:
-        try:
-            dt = datetime.fromisoformat(str(row['fecha']).replace('Z', '+00:00'))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            if dt.astimezone(local_tz).date().isoformat() != today:
-                continue
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if row['tipo'] == 'bono_referido':
-            direct += float(row['monto'] or 0)
-        elif row['tipo'] == 'bono_referido_multinivel':
-            indirect += float(row['monto'] or 0)
-
     fund_amount = float(fund['monto'] or 0)
     active_capital = float(active['capital'] or 0)
     rate = float(rate_decimal) if rate_decimal is not None else get_current_quota_decimal()
     daily_payments = active_capital * rate
     pending_amount = float(pending_wd or 0)
-    direct_amount = float(direct or 0)
-    indirect_amount = float(indirect or 0)
-    total_outgoing = daily_payments + pending_amount + direct_amount + indirect_amount
+    # La reserva del 3% está destinada a cubrir las ganancias diarias; por eso
+    # no se resta también daily_payments por separado, evitando descontarlas dos veces.
+    # Los bonos por referidos no son una salida de este cálculo.
+    total_outgoing = pending_amount
     reserve_today = fund_amount * 0.03
     previous_reserve = float(prior_reserve or 0)
     reserve_accumulated = previous_reserve + reserve_today
@@ -2166,9 +2195,9 @@ def sustainability_report(rate_decimal=None):
         net_tomorrow = fund_amount - total_outgoing - reserve_today
     minimum_target = fund_amount * 1.15
     # Si falta respaldo para el capital activo, no se recomienda ninguna cuota.
-    funds_for_daily_payments = fund_amount - pending_amount - direct_amount - indirect_amount - reserve_today
+    funds_for_daily_payments = fund_amount - pending_amount - reserve_today
     if capital_shortfall > 0.005:
-        funds_for_daily_payments = -capital_shortfall - pending_amount - direct_amount - indirect_amount - reserve_today
+        funds_for_daily_payments = -capital_shortfall - pending_amount - reserve_today
     recommended_rate = None
     if active_capital > 0:
         eligible = [r for r in DAILY_QUOTA_OPTIONS if active_capital * (r / 100.0) <= funds_for_daily_payments + 1e-9]
@@ -2199,8 +2228,7 @@ def sustainability_report(rate_decimal=None):
         status = '🟢 Cálculo actualizado.'
     return {
         'date': today, 'fund': fund_amount, 'active_count': int(active['c'] or 0),
-        'active_capital': active_capital, 'direct': direct_amount,
-        'indirect': indirect_amount, 'pending_wd': pending_amount,
+        'active_capital': active_capital, 'pending_wd': pending_amount,
         'rate': rate, 'daily_cost': daily_payments,
         'total_outgoing': total_outgoing, 'reserve_minimum': reserve_today,
         'previous_reserve_total': previous_reserve,
@@ -2247,10 +2275,8 @@ async def show_sustainability_panel(query, rate_decimal=None):
     lines += [
         f"💵 Total de pagos diarios ({quota_label(rate) if rate else 'cuota sin seleccionar'}): *{money(report['daily_cost'])} USDT*",
         f"📤 Total de retiros pendientes: *{money(report['pending_wd'])} USDT*",
-        f"🎁 Bono directo: *{money(report['direct'])} USDT*",
-        f"🌐 Bono indirecto: *{money(report['indirect'])} USDT*",
-        f"📉 *Total de salidas: {money(report['total_outgoing'])} USDT*",
-        f"🛡️ Reserva de hoy (3%): *{money(report['reserve_minimum'])} USDT*",
+        f"📉 *Salidas a descontar (retiros pendientes): {money(report['total_outgoing'])} USDT*",
+        f"🛡️ Reserva de hoy (3%, incluye cobertura de ganancias diarias): *{money(report['reserve_minimum'])} USDT*",
         f"🏦 *Reserva acumulada: {money(report['cumulative_reserve'])} USDT*",
         f"💰 *Neto para operar mañana: {money(report['available_tomorrow'])} USDT*",
         f"🎯 *OBJETIVO MÍNIMO PARA MAÑANA (+15%): {money(report['minimum_target'])} USDT*",
@@ -2334,6 +2360,18 @@ async def process_quota_callback(query, context, rate_decimal):
 
 
 async def show_daily_payment_info(query, context, rate_decimal=None):
+    if get_today_wallet_fund() is None:
+        try:
+            await query.answer("Por favor, registre primero el monto en Sostenibilidad Económica.", show_alert=True)
+        except Exception:
+            pass
+        await query.edit_message_text(
+            "⚠️ *FALTA REGISTRAR EL FONDO DE HOY*\n\n"
+            "Por favor, introduzca primero el monto en *Sostenibilidad Económica* para poder consultar los pagos diarios.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Sostenibilidad Económica", callback_data="admin_sustainability")], [InlineKeyboardButton("✏️ Introducir fondo de hoy", callback_data="sustain_enter_fund")], [InlineKeyboardButton("⬅️ Panel", callback_data="admin_home")]])
+        )
+        return
     if rate_decimal is None:
         buttons=[]; row_buttons=[]
         for rate in DAILY_QUOTA_OPTIONS:
@@ -2428,8 +2466,18 @@ async def receive_deposit_tx(update, context):
 
     await update.message.reply_text(
         "📸 Ahora envía una *captura del comprobante* del depósito.\n\n"
-        "Si no puedes enviar captura, escribe /skip.",
+        "La captura es obligatoria para registrar el depósito. No se puede omitir.",
         parse_mode="Markdown"
+    )
+    return DEP_PHOTO
+
+
+async def remind_deposit_photo_required(update, context):
+    if not private_only(update):
+        return DEP_PHOTO
+    await update.message.reply_text(
+        "⚠️ La captura del comprobante es obligatoria para registrar el depósito. "
+        "Envía una imagen del comprobante para continuar; no se puede omitir."
     )
     return DEP_PHOTO
 
@@ -2441,14 +2489,6 @@ async def receive_deposit_photo(update, context):
     photo = update.message.photo[-1]
     context.user_data["deposit_photo"] = photo.file_id
 
-    return await finish_deposit(update, context)
-
-
-async def skip_deposit_photo(update, context):
-    if not private_only(update):
-        return ConversationHandler.END
-
-    context.user_data["deposit_photo"] = ""
     return await finish_deposit(update, context)
 
 
@@ -3171,13 +3211,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_history_general":
         if not is_admin(user_id):
             await query.answer("⛔ No autorizado.", show_alert=True); return
-        for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
+        for key in ("await_admin_daily_user_id", "await_admin_ref_direct_user_id", "await_admin_ref_indirect_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
             context.user_data.pop(key, None)
         await show_admin_history_menu(query)
         return
 
     admin_history_prompts = {
         "admin_history_daily": ("await_admin_daily_user_id", "📊 *CONSULTAR GANANCIAS DIARIAS POR ID*"),
+        "admin_history_ref_direct": ("await_admin_ref_direct_user_id", "🎁 *CONSULTAR GANANCIAS POR REFERIDOS DIRECTOS POR ID*"),
+        "admin_history_ref_indirect": ("await_admin_ref_indirect_user_id", "🌐 *CONSULTAR GANANCIAS POR REFERIDOS INDIRECTOS POR ID*"),
         "admin_history_deposits": ("await_admin_deposit_user_id", "📥 *CONSULTAR DEPÓSITOS POR ID*"),
         "admin_history_withdrawals": ("await_admin_withdraw_user_id", "📤 *CONSULTAR RETIROS POR ID*"),
         "admin_history_investments": ("await_admin_invest_user_id", "📈 *CONSULTAR INVERSIONES POR ID*"),
@@ -3186,7 +3228,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             await query.answer("⛔ No autorizado.", show_alert=True); return
         flag, title = admin_history_prompts[data]
-        for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
+        for key in ("await_admin_daily_user_id", "await_admin_ref_direct_user_id", "await_admin_ref_indirect_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
             context.user_data.pop(key, None)
         context.user_data[flag] = True
         await query.edit_message_text(
@@ -3368,6 +3410,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_sustainability_panel(query)
         return
 
+    if data == "sustain_cancel":
+        if not is_admin(user_id):
+            await query.answer("⛔ No autorizado.", show_alert=True); return
+        context.user_data.pop("await_sustainability_fund", None)
+        await query.answer("Registro del fondo cancelado.")
+        await send_admin_menu(user_id, context)
+        return
+
     if data == "sustain_enter_fund":
         if not is_admin(user_id):
             await query.answer("⛔ No autorizado.", show_alert=True); return
@@ -3378,7 +3428,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Consulta el saldo total real de la billetera y envía aquí el importe en USDT.\n\n"
             "Ejemplo: `12500.75`\n\nEscribe /cancelar para salir.",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="admin_sustainability")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="sustain_cancel")]])
         )
         return
 
@@ -3404,7 +3454,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("calcquota_"):
         if get_today_wallet_fund() is None:
-            await query.answer("Primero debes registrar el fondo real de la billetera de hoy.", show_alert=True)
+            await query.answer("Por favor, registre primero el monto en Sostenibilidad Económica.", show_alert=True)
             await show_daily_payment_info(query, context)
             return
         try:
@@ -4027,7 +4077,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # HISTORIAL GENERAL ADMIN: procesar este botón antes de cualquier consulta
     # pendiente por ID, para que una bandera antigua no lo bloquee.
     if is_admin(update.effective_user.id) and text == "📜 Historial General":
-        for key in ("await_admin_daily_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
+        for key in ("await_admin_daily_user_id", "await_admin_ref_direct_user_id", "await_admin_ref_indirect_user_id", "await_admin_deposit_user_id", "await_admin_withdraw_user_id", "await_admin_invest_user_id"):
             context.user_data.pop(key, None)
         class AdminHistoryTextQuery:
             def __init__(self, message, user):
@@ -4151,6 +4201,8 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
         query_flags = [
             ("await_admin_daily_user_id", show_admin_user_daily_gains, "Ganancias"),
+            ("await_admin_ref_direct_user_id", lambda q, uid: show_admin_referral_history(q, uid, False), "Referidos directos"),
+            ("await_admin_ref_indirect_user_id", lambda q, uid: show_admin_referral_history(q, uid, True), "Referidos indirectos"),
             ("await_admin_deposit_user_id", show_admin_deposit_history, "Depósitos"),
             ("await_admin_withdraw_user_id", show_admin_withdraw_history, "Retiros"),
             ("await_admin_invest_user_id", show_admin_investment_history, "Inversiones"),
@@ -4264,6 +4316,9 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     flow = context.user_data.get("manual_flow")
+    if flow == "deposit_photo":
+        await update.message.reply_text("⚠️ La captura del comprobante es obligatoria. Envía una imagen del comprobante para continuar; no se puede omitir.")
+        return
     if flow == "deposit_tx_fixed":
         if len(text) < 5:
             await update.message.reply_text("⚠️ El TXID parece demasiado corto. Envíalo nuevamente.")
@@ -4271,7 +4326,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["deposit_tx"] = text
         context.user_data["manual_flow"] = "deposit_photo"
         await update.message.reply_text(
-            "📸 Ahora envía una *captura del comprobante*.\n\nSi no puedes enviar captura, escribe /skip.",
+            "📸 Ahora envía una *captura del comprobante*.\n\nLa captura es obligatoria para registrar el depósito. No se puede omitir.",
             parse_mode="Markdown"
         )
         return
@@ -4296,7 +4351,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["deposit_tx"] = text
         context.user_data["manual_flow"] = "deposit_photo"
         await update.message.reply_text(
-            "📸 Ahora envía una *captura del comprobante*.\n\nSi no puedes enviar captura, escribe /skip.",
+            "📸 Ahora envía una *captura del comprobante*.\n\nLa captura es obligatoria para registrar el depósito. No se puede omitir.",
             parse_mode="Markdown"
         )
         # La captura será atendida por el ConversationHandler cuando se use /depositar;
@@ -4936,12 +4991,6 @@ async def manual_deposit_photo(update, context):
     await finish_deposit(update, context)
 
 
-async def skip_manual_deposit_photo(update, context):
-    if context.user_data.get("deposit_amount") and context.user_data.get("deposit_tx") and context.user_data.get("manual_flow") == "deposit_photo":
-        context.user_data["deposit_photo"] = ""
-        await finish_deposit(update, context)
-
-
 async def backup_command(update, context):
     if not private_only(update) or not is_admin(update.effective_user.id):
         return
@@ -5147,11 +5196,10 @@ async def main():
                     filters.PHOTO & filters.ChatType.PRIVATE,
                     receive_deposit_photo
                 ),
-                CommandHandler(
-                    "skip",
-                    skip_deposit_photo,
-                    filters=filters.ChatType.PRIVATE
-                )
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                    remind_deposit_photo_required
+                ),
             ],
         },
         fallbacks=[
@@ -5201,7 +5249,6 @@ async def main():
     )
     app.add_handler(withdraw_handler)
 
-    app.add_handler(CommandHandler("skip", skip_manual_deposit_photo, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, manual_deposit_photo))
 
     # -------------------------------
