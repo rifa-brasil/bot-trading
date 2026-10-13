@@ -2177,10 +2177,9 @@ def sustainability_report(rate_decimal=None):
     rate = float(rate_decimal) if rate_decimal is not None else get_current_quota_decimal()
     daily_payments = active_capital * rate
     pending_amount = float(pending_wd or 0)
-    # La reserva del 3% está destinada a cubrir las ganancias diarias; por eso
-    # no se resta también daily_payments por separado, evitando descontarlas dos veces.
-    # Los bonos por referidos no son una salida de este cálculo.
-    total_outgoing = pending_amount
+    # Se descuentan únicamente los dos conceptos acordados: pagos diarios y retiros pendientes.
+    # La reserva nueva del 3% se separa aparte más abajo. Los bonos por referidos no se descuentan.
+    total_outgoing = pending_amount + daily_payments
     reserve_today = fund_amount * 0.03
     previous_reserve = float(prior_reserve or 0)
     reserve_accumulated = previous_reserve + reserve_today
@@ -2275,8 +2274,7 @@ async def show_sustainability_panel(query, rate_decimal=None):
     lines += [
         f"💵 Total de pagos diarios ({quota_label(rate) if rate else 'cuota sin seleccionar'}): *{money(report['daily_cost'])} USDT*",
         f"📤 Total de retiros pendientes: *{money(report['pending_wd'])} USDT*",
-        f"📉 *Salidas a descontar (retiros pendientes): {money(report['total_outgoing'])} USDT*",
-        f"🛡️ Reserva de hoy (3%, incluye cobertura de ganancias diarias): *{money(report['reserve_minimum'])} USDT*",
+        f"🛡️ Reserva de hoy (3%): *{money(report['reserve_minimum'])} USDT*",
         f"🏦 *Reserva acumulada: {money(report['cumulative_reserve'])} USDT*",
         f"💰 *Neto para operar mañana: {money(report['available_tomorrow'])} USDT*",
         f"🎯 *OBJETIVO MÍNIMO PARA MAÑANA (+15%): {money(report['minimum_target'])} USDT*",
