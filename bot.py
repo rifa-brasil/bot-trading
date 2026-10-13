@@ -835,12 +835,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if is_new and WELCOME_IMAGE.exists():
+    # La imagen de bienvenida se envía a todo usuario creado por primera vez
+    # mediante /start, incluidos quienes llegan con un enlace de referido.
+    if is_new:
         try:
-            with open(WELCOME_IMAGE, "rb") as photo:
-                await context.bot.send_photo(chat_id=user.id, photo=photo)
+            if WELCOME_IMAGE.is_file():
+                with open(WELCOME_IMAGE, "rb") as photo:
+                    await context.bot.send_photo(
+                        chat_id=user.id,
+                        photo=photo,
+                        caption=f"👋 ¡Bienvenido/a, {user.first_name or 'usuario'}! Gracias por unirte."
+                    )
+            else:
+                print(f"⚠️ No se encontró la imagen de bienvenida: {WELCOME_IMAGE}")
         except Exception as e:
-            print(f"⚠️ No se pudo enviar bienvenida: {e}")
+            print(f"⚠️ No se pudo enviar bienvenida al usuario {user.id}: {type(e).__name__}: {e}")
 
     row = get_user(user.id)
 
@@ -2828,6 +2837,7 @@ async def show_history(query):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Ganancias Diarias", callback_data="user_history_gains")],
+            [InlineKeyboardButton("🎁 Ganancias por Referidos", callback_data="user_history_referrals")],
             [InlineKeyboardButton("📥 Depósitos", callback_data="user_history_deposits")],
             [InlineKeyboardButton("📤 Retiros", callback_data="user_history_withdrawals")],
             [InlineKeyboardButton("📈 Inversiones", callback_data="user_history_investments")],
@@ -2966,6 +2976,65 @@ async def show_user_daily_gains(query):
         lines += ["", "━━━━━━━━━━━━", f"💵 *TOTAL DEL DÍA: {money(item['total'])} USDT*", ""]
     lines += ["━━━━━━━━━━━━", f"💰 *TOTAL HISTÓRICO DE GANANCIAS: {money(grand_total)} USDT*"]
     await _send_user_history(query, "\n".join(lines))
+
+
+async def show_user_referral_bonus_history(query):
+    """Muestra al usuario sus bonos directos e indirectos, con detalle y totales."""
+    user_id = query.from_user.id
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, fecha, tipo, monto, descripcion FROM movimientos "
+        "WHERE telegram_id=? AND tipo IN ('bono_referido', 'bono_referido_multinivel') "
+        "ORDER BY fecha ASC, id ASC",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+
+    direct_total = 0.0
+    indirect_total = 0.0
+    lines = [
+        "🎁 *HISTORIAL DE GANANCIAS POR REFERIDOS*", "",
+        "Aquí puedes consultar los bonos directos e indirectos que se te han acreditado.", ""
+    ]
+
+    if not rows:
+        lines.extend([
+            "Todavía no tienes bonos por referidos acreditados.", "",
+            "━━━━━━━━━━━━",
+            "🤝 Bonos directos: *0.00 USDT*",
+            "🌐 Bonos indirectos: *0.00 USDT*",
+            "💰 *TOTAL DE BONOS: 0.00 USDT*"
+        ])
+        await _send_user_history(query, "\\n".join(lines))
+        return
+
+    for row in rows:
+        amount = float(row["monto"] or 0)
+        is_indirect = row["tipo"] == "bono_referido_multinivel"
+        if is_indirect:
+            indirect_total += amount
+            kind = "🌐 Bono indirecto"
+        else:
+            direct_total += amount
+            kind = "🤝 Bono directo"
+
+        date_label, time_label = format_date_time(row["fecha"])
+        lines.extend([
+            f"{kind}: *{money(amount)} USDT*",
+            f"📅 Fecha: *{date_label}*",
+            f"🕐 Hora: *{time_label}*"
+        ])
+        if row["descripcion"]:
+            lines.append(f"📌 Detalle: {row['descripcion']}")
+        lines.append("")
+
+    lines.extend([
+        "━━━━━━━━━━━━",
+        f"🤝 *TOTAL BONOS DIRECTOS: {money(direct_total)} USDT*",
+        f"🌐 *TOTAL BONOS INDIRECTOS: {money(indirect_total)} USDT*",
+        f"💰 *TOTAL DE BONOS POR REFERIDOS: {money(direct_total + indirect_total)} USDT*"
+    ])
+    await _send_user_history(query, "\\n".join(lines))
 
 
 async def show_user_deposit_history(query):
@@ -3933,6 +4002,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_user_daily_gains(query)
         return
 
+    if data == "user_history_referrals":
+        await show_user_referral_bonus_history(query)
+        return
+
     if data == "user_history_deposits":
         await show_user_deposit_history(query)
         return
@@ -4658,6 +4731,7 @@ async def handle_text_panel_action(update, context, action):
     elif action == "user_invest_available": await show_available_plans(fake)
     elif action == "user_referrals": await show_referrals(fake, context)
     elif action == "user_history": await show_history(fake)
+    elif action == "user_history_referrals": await show_user_referral_bonus_history(fake)
     elif action == "user_info": await show_info(fake)
     elif action == "user_reinvest": await show_reinvest(fake)
     elif action == "user_daily_gains": await show_user_daily_gains(fake)
