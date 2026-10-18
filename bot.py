@@ -57,8 +57,11 @@ DAILY_QUOTA_LABELS = {
     0.65: "0,65%", 0.70: "0,70%", 0.75: "0,75%", 0.80: "0,80%",
     0.85: "0,85%", 0.90: "0,90%", 0.95: "0,95%", 1.00: "1,00%",
 }
-BACKUP_TIME = os.getenv("BACKUP_TIME", "06:00").strip()
+BACKUP_TIME = os.getenv("BACKUP_TIME", "08:00").strip()
 BACKUP_TIMEZONE = os.getenv("BACKUP_TIMEZONE", "America/Sao_Paulo").strip()
+# Canales opcionales de anuncios. Admite ID numérico (-100...) o @nombrepublico.
+INVESTMENT_CHANNEL_ID = os.getenv("INVESTMENT_CHANNEL_ID", "").strip() or "@inversiones_invest_trading"
+WITHDRAWAL_CHANNEL_ID = os.getenv("WITHDRAWAL_CHANNEL_ID", "").strip() or "@retiros_invest_trading"
 TARGET_MULTIPLIER = float(os.getenv("TARGET_MULTIPLIER", "2.0"))
 MIN_INVESTMENT = 50.0  # inversión mínima: 50 USDT
 MIN_WITHDRAWAL = 15.0  # retiro mínimo: 15 USDT
@@ -235,6 +238,7 @@ def init_db():
     """)
 
     cur.execute("CREATE TABLE IF NOT EXISTS sistema (clave TEXT PRIMARY KEY, valor TEXT NOT NULL DEFAULT '')")
+    cur.execute("CREATE TABLE IF NOT EXISTS bienvenidas_canales (telegram_id INTEGER PRIMARY KEY, fecha TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS pagos_diarios (fecha TEXT PRIMARY KEY, fecha_proceso TEXT NOT NULL, total REAL NOT NULL DEFAULT 0, inversiones INTEGER NOT NULL DEFAULT 0)")
     # Saldo diario declarado por el administrador para la billetera externa.
     cur.execute("""
@@ -615,7 +619,7 @@ async def registration_text(update, context, text):
         complete = mark_registration_complete_if_ready(user.id, user)
         context.user_data.pop("registration_step", None)
         if complete:
-            await update.message.reply_text("✅ *REGISTRO COMPLETADO*\n\nYa tienes acceso al panel del sistema.", parse_mode="Markdown")
+            await update.message.reply_text("✅ *REGISTRO COMPLETADO*\n\nAhora debes unirte a los dos canales oficiales para habilitar el panel.", parse_mode="Markdown")
             try:
                 registered = get_user(user.id)
                 await context.bot.send_message(
@@ -635,7 +639,7 @@ async def registration_text(update, context, text):
                 )
             except Exception as e:
                 print(f"⚠️ No se pudo notificar el nuevo registro al admin: {e}")
-            await send_user_menu(user.id, context)
+            await send_channel_join_gate(user.id, context, user.id)
         return True
     return False
 
@@ -712,6 +716,116 @@ async def maintenance_guard(update):
             await update.callback_query.answer("🔧 Bot en mantenimiento. Intenta más tarde.", show_alert=True)
         return True
     return False
+
+# =========================================================
+# SUSCRIPCIÓN OBLIGATORIA A LOS CANALES PÚBLICOS
+# =========================================================
+
+INVESTMENT_CHANNEL_URL = "https://t.me/inversiones_invest_trading"
+WITHDRAWAL_CHANNEL_URL = "https://t.me/retiros_invest_trading"
+
+
+async def channel_membership_status(bot, user_id, channel_id):
+    """Devuelve True si el usuario pertenece al canal; falla cerrado si no se puede verificar."""
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        status = str(getattr(member, "status", ""))
+        if status in ("creator", "administrator", "member"):
+            return True
+        if status == "restricted":
+            return bool(getattr(member, "is_member", False))
+        return False
+    except Exception as exc:
+        print(f"No se pudo verificar membresía: canal={channel_id}, usuario={user_id}, error={type(exc).__name__}: {exc}")
+        return False
+
+
+async def user_joined_required_channels(bot, user_id):
+    investment_ok = await channel_membership_status(bot, user_id, INVESTMENT_CHANNEL_ID)
+    withdrawal_ok = await channel_membership_status(bot, user_id, WITHDRAWAL_CHANNEL_ID)
+    return investment_ok and withdrawal_ok, investment_ok, withdrawal_ok
+
+
+async def send_channel_join_gate(chat_id, context, user_id, edit_message=None):
+    """Muestra los dos canales y bloquea el acceso al panel hasta verificar la membresía."""
+    _, investment_ok, withdrawal_ok = await user_joined_required_channels(context.bot, user_id)
+    status_lines = [
+        f"{'✅' if investment_ok else '❌'} Canal de inversiones",
+        f"{'✅' if withdrawal_ok else '❌'} Canal de retiros",
+    ]
+    text = (
+        "🔐 *SUSCRIPCIÓN OBLIGATORIA*\n\n"
+        "Tu registro está completo. Para acceder al panel, debes unirte a los dos canales oficiales.\n\n"
+        + "\n".join(status_lines)
+        + "\n\nDespués de unirte a ambos, pulsa *Ya me uní, verificar*."
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Unirme al canal de inversiones", url=INVESTMENT_CHANNEL_URL)],
+        [InlineKeyboardButton("💸 Unirme al canal de retiros", url=WITHDRAWAL_CHANNEL_URL)],
+        [InlineKeyboardButton("🔄 Ya me uní, verificar", callback_data="verify_channels")],
+    ])
+    if edit_message is not None:
+        try:
+            await edit_message.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+            return
+        except Exception:
+            pass
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=markup)
+
+
+async def publish_registration_welcome_once(bot, user):
+    """Publica bienvenida en el canal de inversiones una sola vez tras verificar ambos canales."""
+    conn = db()
+    existing = conn.execute("SELECT telegram_id FROM bienvenidas_canales WHERE telegram_id=?", (user.id,)).fetchone()
+    if existing:
+        conn.close()
+        return
+    conn.execute("INSERT OR IGNORE INTO bienvenidas_canales(telegram_id, fecha) VALUES(?, ?)", (user.id, now_iso()))
+    conn.commit()
+    conn.close()
+    username = (getattr(user, "username", "") or "").strip()
+    public_user = f"@{username}" if username else "Un nuevo miembro"
+    try:
+        await bot.send_message(
+            chat_id=INVESTMENT_CHANNEL_ID,
+            text=(
+                "🎉 ¡NUEVO USUARIO BIENVENIDO!\n\n"
+                f"👤 {public_user} se ha registrado en Invest Trading y ya pertenece a nuestros dos canales oficiales.\n"
+                "🤝 ¡Le damos la bienvenida a nuestra comunidad de inversión!"
+            ),
+        )
+    except Exception as exc:
+        conn = db()
+        conn.execute("DELETE FROM bienvenidas_canales WHERE telegram_id=?", (user.id,))
+        conn.commit()
+        conn.close()
+        print(f"No se pudo publicar bienvenida en canal de inversiones: {type(exc).__name__}: {exc}")
+
+
+async def verify_channels_callback(query, context):
+    user = query.from_user
+    if is_admin(user.id):
+        await query.edit_message_text("👑 El administrador no necesita verificar la suscripción de usuario.")
+        return
+    if not registration_complete(user.id):
+        await query.answer("Primero debes completar el registro.", show_alert=True)
+        return
+    all_joined, investment_ok, withdrawal_ok = await user_joined_required_channels(context.bot, user.id)
+    if not all_joined:
+        missing = []
+        if not investment_ok:
+            missing.append("canal de inversiones")
+        if not withdrawal_ok:
+            missing.append("canal de retiros")
+        await send_channel_join_gate(user.id, context, user.id, edit_message=query)
+        return
+    await publish_registration_welcome_once(context.bot, user)
+    await query.edit_message_text(
+        "✅ *SUSCRIPCIÓN VERIFICADA*\n\nYa perteneces a los dos canales oficiales. Tu acceso al panel está habilitado.",
+        parse_mode="Markdown",
+    )
+    await send_user_menu(user.id, context, "👋 *Bienvenido a Invest Trading*\n\nTu registro y suscripción están verificados. Selecciona una opción:")
+
 
 # =========================================================
 # MENÚS
@@ -862,11 +976,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mark_registration_complete_if_ready(user.id, user)
+    all_joined, _, _ = await user_joined_required_channels(context.bot, user.id)
+    if not all_joined:
+        await send_channel_join_gate(user.id, context, user.id)
+        return
+    await publish_registration_welcome_once(context.bot, user)
     await send_user_menu(
         user.id,
         context,
         f"👋 *Bienvenido, {user.first_name or 'usuario'}*\n\n"
-        "Tu registro está completo. Selecciona una opción:"
+        "Tu registro y suscripción a los canales están verificados. Selecciona una opción:"
     )
 
 
@@ -1407,6 +1526,25 @@ async def invest_available_plan(query, deposit_id):
             print(f"Error notificando bono multinivel: {e}")
 
     add_movement(user_id, "inversion", amount, f"Inversión creada: Plan {money(amount)} USDT")
+
+    # Anuncio opcional en el canal: solo después de registrar la inversión activa.
+    if INVESTMENT_CHANNEL_ID:
+        try:
+            public_user = (query.from_user.username or "").strip()
+            public_name = f"@{public_user}" if public_user else "Un usuario"
+            await query.get_bot().send_message(
+                chat_id=INVESTMENT_CHANNEL_ID,
+                text=(
+                    "📈 NUEVA INVERSIÓN\n\n"
+                    f"👤 Usuario: {public_name}\n"
+                    f"💰 Importe invertido: {money(amount)} USDT\n"
+                    f"🆔 Operación: #{investment_id}\n"
+                    f"📅 Fecha: {datetime.now(ZoneInfo(BACKUP_TIMEZONE)).strftime('%d/%m/%Y %H:%M')}"
+                )
+            )
+        except Exception as e:
+            print(f"Error publicando nueva inversión en el canal: {e}")
+
     if bonus and referrer_id:
         try:
             await query.get_bot().send_message(chat_id=referrer_id, text=("🎁 *BONO DE REFERIDO ACREDITADO*\n\n" f"Has recibido *{money(bonus)} USDT* por el *Plan {referral_plan_number}* de *{money(amount)} USDT* realizado por un usuario que se registró con tu enlace."), parse_mode="Markdown")
@@ -2421,6 +2559,11 @@ async def start_deposit(update, context):
     if not is_admin(update.effective_user.id) and not registration_complete(update.effective_user.id):
         await prompt_registration(update, context)
         return ConversationHandler.END
+    if not is_admin(update.effective_user.id):
+        joined, _, _ = await user_joined_required_channels(context.bot, update.effective_user.id)
+        if not joined:
+            await send_channel_join_gate(update.effective_chat.id, context, update.effective_user.id)
+            return ConversationHandler.END
 
     context.user_data.clear()
     await update.message.reply_text(
@@ -2625,6 +2768,11 @@ async def start_withdraw(update, context):
     if not is_admin(update.effective_user.id) and not registration_complete(update.effective_user.id):
         await prompt_registration(update, context)
         return ConversationHandler.END
+    if not is_admin(update.effective_user.id):
+        joined, _, _ = await user_joined_required_channels(context.bot, update.effective_user.id)
+        if not joined:
+            await send_channel_join_gate(update.effective_chat.id, context, update.effective_user.id)
+            return ConversationHandler.END
 
     row = get_user(update.effective_user.id)
     balance = float(row["saldo"]) if row else 0
@@ -3229,6 +3377,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await prompt_registration(query.message, context, user=query.from_user)
         return
 
+    if data == "verify_channels":
+        await verify_channels_callback(query, context)
+        return
+
     if not is_admin(user_id) and is_maintenance():
         await query.answer("🔧 Bot en mantenimiento. Intenta más tarde.", show_alert=True)
         return
@@ -3236,6 +3388,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("📝 Primero debes completar tu registro.", show_alert=True)
         await prompt_registration(query.message, context, user=query.from_user)
         return
+    if not is_admin(user_id):
+        joined, _, _ = await user_joined_required_channels(context.bot, user_id)
+        if not joined:
+            await send_channel_join_gate(user_id, context, user_id, edit_message=query)
+            return
 
     print(
         f"[CALLBACK] user_id={user_id} "
@@ -4144,6 +4301,11 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             handled = await registration_text(update, context, text)
             if handled:
                 return
+            return
+        joined, _, _ = await user_joined_required_channels(context.bot, update.effective_user.id)
+        if not joined:
+            await send_channel_join_gate(update.effective_chat.id, context, update.effective_user.id)
+            return
 
     # HISTORIAL GENERAL ADMIN: procesar este botón antes de cualquier consulta
     # pendiente por ID, para que una bandera antigua no lo bloquee.
@@ -5020,8 +5182,10 @@ async def automatic_backup_loop(application):
         now = datetime.now(tz)
         try:
             hour, minute = [int(x) for x in BACKUP_TIME.split(":", 1)]
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("Hora de respaldo fuera de rango")
         except Exception:
-            hour, minute = 6, 0
+            hour, minute = 8, 0
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
@@ -5054,6 +5218,24 @@ async def manual_deposit_photo(update, context):
             await context.bot.send_message(chat_id=row['telegram_id'],text=f"✅ *RETIRO APROBADO*\n\nSolicitud #{wid}.\nMonto solicitado: *{money(row['monto'])} USDT*\nComisión (3%): *{money(fee)} USDT*\nNeto enviado: *{money(net)} USDT*\n\n{msg}",parse_mode="Markdown")
             await context.bot.send_photo(chat_id=row['telegram_id'],photo=photo,caption=f"📸 Comprobante del retiro #{wid}")
             await send_image_to_user(context.bot, row['telegram_id'], WITHDRAW_SENT_IMAGE)
+            # Publicar solo después de enviar al usuario el comprobante fotográfico.
+            if WITHDRAWAL_CHANNEL_ID:
+                try:
+                    fee = round(float(row["monto"]) * WITHDRAWAL_FEE_RATE, 2)
+                    net = round(float(row["monto"]) - fee, 2)
+                    await context.bot.send_message(
+                        chat_id=WITHDRAWAL_CHANNEL_ID,
+                        text=(
+                            "✅ NUEVO RETIRO ENVIADO\n\n"
+                            f"🧾 Solicitud: #{wid}\n"
+                            f"💰 Monto solicitado: {money(row['monto'])} USDT\n"
+                            f"📉 Comisión: {money(fee)} USDT\n"
+                            f"💵 Neto enviado: {money(net)} USDT\n"
+                            "📸 Comprobante enviado al usuario."
+                        )
+                    )
+                except Exception as channel_error:
+                    print(f"Error publicando retiro en el canal: {channel_error}")
         except Exception as e: print(e)
         return
     if context.user_data.get("manual_flow") != "deposit_photo":
