@@ -1918,9 +1918,6 @@ def process_daily_quota(rate_decimal):
     except Exception:
         tz = timezone.utc
     local_now = datetime.now(tz)
-    # Bloqueo central: ninguna ruta (manual o automática) acredita si falta el fondo real de hoy.
-    if get_today_wallet_fund() is None:
-        return 0, 0.0, {}, False, "missing_fund"
     # Por defecto, las ganancias se acreditan de lunes a viernes.
     # El administrador puede habilitar excepcionalmente sábado y domingo
     # mediante /fin_de_semana_on.
@@ -2483,9 +2480,6 @@ async def process_quota_callback(query, context, rate_decimal):
     processed, total, credited, already, details_or_status = process_daily_quota(rate_decimal)
     if already:
         await query.edit_message_text("⚠️ *PAGO DIARIO YA REALIZADO*\n\nLa acreditación de hoy ya fue ejecutada. No se volverá a pagar una segunda vez el mismo día.", parse_mode="Markdown", reply_markup=back_inline())
-        return
-    if details_or_status == "missing_fund":
-        await show_daily_quotas(query)
         return
     if details_or_status == "weekend_disabled":
         await query.edit_message_text(
@@ -5148,7 +5142,7 @@ async def restore_lock_backup(application):
 
 
 async def automatic_profit_loop(application):
-    """A las 18:00 acredita el 0,25% solo si hay fondo diario registrado y la cuota es sostenible."""
+    """Respaldo automático diario: a las 18:00 acredita la cuota mínima si aún no se pagó hoy."""
     AUTO_QUOTA_RATE = min(DAILY_QUOTA_OPTIONS) / 100.0  # 0,25%
     while True:
         try:
@@ -5160,60 +5154,21 @@ async def automatic_profit_loop(application):
             now = datetime.now(tz)
             # Solo se acredita de lunes a viernes y nunca antes de las 18:00.
             if now.weekday() < 5 and (now.hour, now.minute) >= (18, 0):
-                today = now.date().isoformat()
-                fund = get_today_wallet_fund()
-                if fund is None:
-                    # Persistente: no enviar el mismo aviso cada 30 segundos.
-                    if get_system_value("auto_profit_alert_missing_fund_date", "") != today:
-                        if ADMIN_TELEGRAM_ID:
-                            await application.bot.send_message(
-                                chat_id=ADMIN_TELEGRAM_ID,
-                                text=(
-                                    "🚨 *PAGO AUTOMÁTICO BLOQUEADO — FALTA EL FONDO DE HOY*\n\n"
-                                    f"No se ha registrado el fondo real de la billetera para *{today}*. "
-                                    "No se ha acreditado ninguna ganancia.\n\n"
-                                    "Introduce el fondo de hoy desde *📊 Sostenibilidad Económica*. "
-                                    "Cuando lo registres, el bot comprobará la sostenibilidad y, si la cuota mínima es viable, "
-                                    "ejecutará automáticamente el pago del *0,25%*."
-                                ),
-                                parse_mode="Markdown"
-                            )
-                        set_system_value("auto_profit_alert_missing_fund_date", today)
-                else:
-                    report = sustainability_report(AUTO_QUOTA_RATE)
-                    if report is None:
-                        # Defensa adicional por si el registro cambia entre comprobaciones.
-                        pass
-                    elif float(report["active_capital"]) > 0 and float(report["available_after"]) < float(report["reserve_minimum"]) - 1e-9:
-                        if get_system_value("auto_profit_alert_unsafe_fund_date", "") != today:
-                            if ADMIN_TELEGRAM_ID:
-                                await application.bot.send_message(
-                                    chat_id=ADMIN_TELEGRAM_ID,
-                                    text=(
-                                        "🚨 *PAGO AUTOMÁTICO BLOQUEADO — SOSTENIBILIDAD INSUFICIENTE*\n\n"
-                                        f"Para *{today}*, la cuota mínima del *0,25%* no conserva la reserva económica del 3%. "
-                                        "No se ha acreditado ninguna ganancia.\n\n"
-                                        "Revisa el fondo registrado y el informe de *📊 Sostenibilidad Económica* antes de intentar un pago manual."
-                                    ),
-                                    parse_mode="Markdown"
-                                )
-                            set_system_value("auto_profit_alert_unsafe_fund_date", today)
-                    else:
-                        processed, total, credited, already, details_or_status = process_daily_quota(AUTO_QUOTA_RATE)
-                        if not already and details_or_status != "weekend_disabled":
-                            set_current_quota(AUTO_QUOTA_RATE)
-                            notified = await send_daily_quota_notifications(
-                                application, credited, AUTO_QUOTA_RATE, details_or_status
-                            ) if credited else 0
-                            await backup_after_accreditation(application, "automática de las 18:00")
-                            print(
-                                f"🤖 Acreditación automática 18:00: cuota {quota_label(AUTO_QUOTA_RATE)}, "
-                                f"inversiones={processed}, total={total:.2f}, usuarios={notified}"
-                            )
+                processed, total, credited, already, details_or_status = process_daily_quota(AUTO_QUOTA_RATE)
+                if not already and details_or_status != "weekend":
+                    set_current_quota(AUTO_QUOTA_RATE)
+                    notified = await send_daily_quota_notifications(
+                        application, credited, AUTO_QUOTA_RATE, details_or_status
+                    ) if credited else 0
+                    # Respaldo independiente de la acreditación automática de las 18:00.
+                    await backup_after_accreditation(application, "automática de las 18:00")
+                    print(
+                        f"🤖 Acreditación automática 18:00: cuota {quota_label(AUTO_QUOTA_RATE)}, "
+                        f"inversiones={processed}, total={total:.2f}, usuarios={notified}"
+                    )
         except Exception as e:
             print(f"❌ Error en acreditación automática de las 18:00: {e}")
-        # Revisa periódicamente: si se registra el fondo después de las 18:00, vuelve a validar
-        # y paga automáticamente solo cuando el fondo existe y la cuota mínima es sostenible.
+        # Revisa periódicamente para cubrir también reinicios del bot después de las 18:00.
         await asyncio.sleep(30)
 
 
